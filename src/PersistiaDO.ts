@@ -20,6 +20,8 @@ import {
 import { TriggerManager, MIN_INTERVAL_MS, MAX_INTERVAL_MS } from "./triggers";
 import { computeStateCommitment, generateStateProof, verifyProof } from "./state-proofs";
 import { type CrossShardMessage, type CrossShardReceipt, validateMessage, createCrossShardMessage } from "./cross-shard";
+import { GossipManager, type GossipEnvelope, type SyncResponsePayload } from "./gossip";
+import { AnchorManager, type AnchorConfig, type AnchorRecord } from "./anchoring";
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -42,6 +44,8 @@ export class PersistiaWorld implements DurableObject {
   nodeIdentity: NodeIdentity | null = null;
   contractExecutor!: ContractExecutor;
   triggerManager!: TriggerManager;
+  gossipManager!: GossipManager;
+  anchorManager!: AnchorManager;
   shardName: string = "global-world";
   currentRound: number = 0;
   finalizedSeq: number = 0;
@@ -266,6 +270,31 @@ export class PersistiaWorld implements DurableObject {
       submitted_at INTEGER NOT NULL,
       verified INTEGER NOT NULL DEFAULT 0
     )`);
+
+    // ─── Gossip Peers ─────────────────────────────────────────────────────
+    sql.exec(`CREATE TABLE IF NOT EXISTS gossip_peers (
+      pubkey TEXT PRIMARY KEY,
+      url TEXT NOT NULL,
+      last_seen INTEGER NOT NULL,
+      last_sync_round INTEGER NOT NULL DEFAULT 0,
+      failures INTEGER NOT NULL DEFAULT 0,
+      added_at INTEGER NOT NULL
+    )`);
+
+    // ─── State Anchors ────────────────────────────────────────────────────
+    sql.exec(`CREATE TABLE IF NOT EXISTS anchors (
+      id TEXT PRIMARY KEY,
+      bundle_json TEXT NOT NULL,
+      arweave_tx TEXT,
+      celestia_height INTEGER,
+      celestia_commitment TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      finalized_seq INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      confirmed_at INTEGER
+    )`);
+    sql.exec(`CREATE INDEX IF NOT EXISTS idx_anchors_status ON anchors(status)`);
+    sql.exec(`CREATE INDEX IF NOT EXISTS idx_anchors_seq ON anchors(finalized_seq)`);
   }
 
   private async loadState() {
@@ -287,9 +316,38 @@ export class PersistiaWorld implements DurableObject {
     this.contractExecutor = new ContractExecutor(sql);
     this.triggerManager = new TriggerManager(sql);
 
+    // Gossip + anchoring managers
+    this.gossipManager = new GossipManager(sql);
+    const anchorConfig: Partial<AnchorConfig> = {};
+    if (this.env.ARWEAVE_GATEWAY) {
+      anchorConfig.arweave = {
+        gateway_url: this.env.ARWEAVE_GATEWAY,
+        irys_url: this.env.IRYS_URL,
+        irys_token: this.env.IRYS_TOKEN,
+      };
+    }
+    if (this.env.CELESTIA_RPC) {
+      anchorConfig.celestia = {
+        rpc_url: this.env.CELESTIA_RPC,
+        auth_token: this.env.CELESTIA_TOKEN,
+        namespace: this.env.CELESTIA_NAMESPACE || "0000000000000000706572736973746961", // "persistia"
+      };
+    }
+    this.anchorManager = new AnchorManager(sql, anchorConfig);
+
     // Node identity
     if (CONSENSUS_ENABLED) {
       this.nodeIdentity = await loadOrCreateNodeIdentity(sql, this.nodeUrl);
+      this.gossipManager.setIdentity(this.nodeIdentity);
+
+      // Bootstrap from seed nodes if configured
+      if (this.env.SEED_NODES) {
+        const seeds = (this.env.SEED_NODES as string).split(",").map(s => s.trim()).filter(Boolean);
+        if (seeds.length > 0) {
+          this.gossipManager.bootstrapFromSeeds(seeds).catch(() => {});
+        }
+      }
+
       // Register self in active_nodes
       sql.exec(
         `INSERT INTO active_nodes (pubkey, url, last_vertex_round, last_seen, is_self)
@@ -347,6 +405,12 @@ export class PersistiaWorld implements DurableObject {
       }
       if (url.pathname.startsWith("/xshard/")) {
         return this.handleCrossShardRoute(req, url);
+      }
+      if (url.pathname.startsWith("/gossip/")) {
+        return this.handleGossipRoute(req, url);
+      }
+      if (url.pathname.startsWith("/anchor/")) {
+        return this.handleAnchorRoute(req, url);
       }
 
       switch (url.pathname) {
@@ -418,19 +482,53 @@ export class PersistiaWorld implements DurableObject {
           return this.json({ inventory: this.getPlayerInventory(pubkey) });
         }
 
+        case "/addNode": {
+          if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+          const { url: peerUrl, pubkey: peerPubkey } = await req.json() as any;
+          if (!peerUrl) return this.json({ error: "url required" }, 400);
+
+          if (peerPubkey) {
+            this.gossipManager.addPeer(peerPubkey, peerUrl);
+          } else {
+            // Fetch the node's identity
+            try {
+              const res = await fetch(peerUrl);
+              if (res.ok) {
+                const info = await res.json() as any;
+                if (info.node_pubkey) {
+                  this.gossipManager.addPeer(info.node_pubkey, peerUrl);
+                }
+              }
+            } catch {}
+          }
+
+          return this.json({ ok: true, peers: this.gossipManager.getPeers() });
+        }
+
         default: {
           const contractCount = [...this.state.storage.sql.exec("SELECT COUNT(*) as c FROM contracts")] as any[];
+          const gossipPeerCount = this.gossipManager.getHealthyPeers().length;
+          const latestAnchor = this.anchorManager.getLatestAnchor();
           return this.json({
             name: "Persistia Ledger Node",
-            version: "0.5.0",
+            version: "0.6.0",
             consensus: CONSENSUS_ENABLED,
             node_pubkey: this.nodeIdentity?.pubkey || null,
+            node_url: this.nodeIdentity?.url || null,
             current_round: this.currentRound,
             finalized_seq: this.finalizedSeq,
             finalized_root: this.finalizedRoot,
             active_nodes: this.getActiveNodeCount(),
+            gossip_peers: gossipPeerCount,
             pending_events: this.getPendingEventCount(),
             contracts: contractCount[0]?.c || 0,
+            latest_anchor: latestAnchor ? {
+              id: latestAnchor.id,
+              arweave_tx: latestAnchor.arweave_tx,
+              celestia_height: latestAnchor.celestia_height,
+              finalized_seq: latestAnchor.bundle.finalized_seq,
+              timestamp: latestAnchor.created_at,
+            } : null,
           });
         }
       }
@@ -449,8 +547,8 @@ export class PersistiaWorld implements DurableObject {
     await this.processPendingOracles();
 
     if (CONSENSUS_ENABLED && this.nodeIdentity) {
-      // 3. Pull from peers to catch up
-      await this.syncFromPeers();
+      // 3. Pull from gossip peers (replaces old HTTP-only syncFromPeers)
+      await this.gossipSync();
 
       // 4. Create vertex for current round if we haven't yet
       const existing = [...this.state.storage.sql.exec(
@@ -460,9 +558,12 @@ export class PersistiaWorld implements DurableObject {
       if (existing.length === 0) {
         await this.createAndBroadcastVertex();
       }
+
+      // 5. Anchor state if due
+      await this.maybeAnchorState();
     }
 
-    // 5. Re-schedule alarm
+    // 6. Re-schedule alarm
     this.scheduleAlarm();
   }
 
@@ -982,6 +1083,240 @@ export class PersistiaWorld implements DurableObject {
     }
   }
 
+  // ─── Gossip Routes ──────────────────────────────────────────────────────
+
+  private async handleGossipRoute(req: Request, url: URL): Promise<Response> {
+    switch (url.pathname) {
+      case "/gossip/push": {
+        // Receive a gossipped message (vertex or event)
+        if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+        const envelope = await req.json() as GossipEnvelope;
+
+        const valid = await this.gossipManager.verifyEnvelope(envelope);
+        if (!valid) return this.json({ error: "Invalid or duplicate gossip envelope" }, 400);
+
+        // Auto-discover the sender as a peer
+        if (envelope.sender_pubkey && envelope.sender_url) {
+          this.gossipManager.addPeer(envelope.sender_pubkey, envelope.sender_url);
+        }
+
+        switch (envelope.type) {
+          case "vertex": {
+            const vertex = envelope.payload;
+            const result = await this.receiveVertex(vertex);
+            if (result.ok) {
+              // Re-gossip to our peers (excluding sender to avoid loops)
+              const exclude = new Set([envelope.sender_pubkey]);
+              this.gossipManager.flood(envelope, exclude).catch(() => {});
+            }
+            return this.json(result, result.ok ? 200 : 400);
+          }
+          case "event": {
+            const event = envelope.payload;
+            const result = await this.receiveClientEvent(event);
+            return this.json(result);
+          }
+          default:
+            return this.json({ error: "Unknown gossip type" }, 400);
+        }
+      }
+
+      case "/gossip/sync": {
+        // Respond to sync requests from peers
+        const afterRound = parseInt(url.searchParams.get("after_round") || "0");
+        const limit = Math.min(parseInt(url.searchParams.get("limit") || "500"), 500);
+
+        const vertices = [...this.state.storage.sql.exec(
+          "SELECT hash, author, round, events_json, refs_json, signature, timestamp FROM dag_vertices WHERE round > ? ORDER BY round ASC, hash ASC LIMIT ?",
+          afterRound, limit,
+        )].map((r: any) => ({
+          hash: r.hash, author: r.author, round: r.round,
+          event_hashes: (() => { try { return JSON.parse(r.events_json).map((e: any) => e.hash).filter(Boolean); } catch { return []; } })(),
+          events: (() => { try { return JSON.parse(r.events_json); } catch { return []; } })(),
+          refs: (() => { try { return JSON.parse(r.refs_json); } catch { return []; } })(),
+          timestamp: r.timestamp,
+          signature: r.signature,
+        }));
+
+        const commits = [...this.state.storage.sql.exec(
+          "SELECT round, anchor_hash, committed_at FROM dag_commits WHERE round > ? ORDER BY round ASC",
+          afterRound,
+        )];
+
+        return this.json({
+          vertices,
+          commits,
+          latest_round: this.currentRound,
+        } as SyncResponsePayload);
+      }
+
+      case "/gossip/peers": {
+        // Peer exchange endpoint
+        if (req.method === "POST") {
+          const envelope = await req.json() as GossipEnvelope;
+          const valid = await this.gossipManager.verifyEnvelope(envelope);
+          if (valid && envelope.payload?.peers) {
+            for (const p of envelope.payload.peers) {
+              if (p.pubkey && p.url) this.gossipManager.addPeer(p.pubkey, p.url);
+            }
+          }
+          // Auto-discover sender
+          if (envelope.sender_pubkey && envelope.sender_url) {
+            this.gossipManager.addPeer(envelope.sender_pubkey, envelope.sender_url);
+          }
+        }
+        // Always return our peer list
+        const myPeers = this.gossipManager.getHealthyPeers().map(p => ({ pubkey: p.pubkey, url: p.url }));
+        // Include self
+        if (this.nodeIdentity) {
+          myPeers.push({ pubkey: this.nodeIdentity.pubkey, url: this.nodeIdentity.url });
+        }
+        return this.json({ peers: myPeers });
+      }
+
+      default:
+        return this.json({ error: "Unknown gossip endpoint" }, 404);
+    }
+  }
+
+  // ─── Anchor Routes ─────────────────────────────────────────────────────
+
+  private async handleAnchorRoute(req: Request, url: URL): Promise<Response> {
+    switch (url.pathname) {
+      case "/anchor/latest": {
+        const anchor = this.anchorManager.getLatestAnchor();
+        if (!anchor) return this.json({ error: "No anchors yet" }, 404);
+        return this.json(anchor);
+      }
+
+      case "/anchor/history": {
+        const limit = parseInt(url.searchParams.get("limit") || "20");
+        return this.json({ anchors: this.anchorManager.getAnchorHistory(limit) });
+      }
+
+      case "/anchor/submit": {
+        // Manually trigger an anchor
+        if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+        const record = await this.performAnchor();
+        return this.json(record);
+      }
+
+      case "/anchor/verify": {
+        // Verify an anchor from Arweave or Celestia
+        const arweaveTx = url.searchParams.get("arweave_tx");
+        const celestiaHeight = url.searchParams.get("celestia_height");
+
+        if (arweaveTx) {
+          const result = await this.anchorManager.verifyFromArweave(arweaveTx);
+          return this.json(result);
+        }
+        if (celestiaHeight) {
+          const result = await this.anchorManager.verifyFromCelestia(parseInt(celestiaHeight));
+          return this.json(result);
+        }
+        return this.json({ error: "arweave_tx or celestia_height required" }, 400);
+      }
+
+      case "/anchor/bootstrap": {
+        // Bootstrap from the latest anchor (for new nodes)
+        const shardName = url.searchParams.get("shard") || this.shardName;
+        const bundle = await this.anchorManager.findLatestArweaveAnchor(shardName);
+        if (!bundle) return this.json({ error: "No anchor found" }, 404);
+        return this.json({
+          bundle,
+          instructions: "Use /dag/snapshot to get the full state after syncing to this anchor's round",
+        });
+      }
+
+      default:
+        return this.json({ error: "Unknown anchor endpoint" }, 404);
+    }
+  }
+
+  // ─── Gossip Sync (called from alarm) ───────────────────────────────────
+
+  private async gossipSync() {
+    // Use gossip manager for peer sync
+    const result = await this.gossipManager.syncFromPeers(
+      this.currentRound,
+      ACTIVE_WINDOW,
+      async (v: any) => {
+        // Reconstruct DAGVertex from sync data
+        const vertex = {
+          author: v.author,
+          round: v.round,
+          event_hashes: v.event_hashes || [],
+          events: v.events || [],
+          refs: v.refs || [],
+          timestamp: v.timestamp || 0,
+          signature: v.signature,
+        };
+        await this.receiveVertex(vertex);
+      },
+    );
+
+    // Also sync from legacy active_nodes peers (backward compat)
+    await this.syncFromPeers();
+
+    if (result.synced > 0) {
+      this.broadcastToChannel("status", { type: "status.update", ...this.getConsensusStatus() });
+    }
+  }
+
+  // ─── Anchor State (called from alarm) ──────────────────────────────────
+
+  private async maybeAnchorState() {
+    const effectiveSeq = this.finalizedSeq > 0 ? this.finalizedSeq : this.latestSeq;
+    if (!this.anchorManager.shouldAnchor(effectiveSeq)) return;
+    await this.performAnchor();
+  }
+
+  private async performAnchor(): Promise<AnchorRecord> {
+    const sql = this.state.storage.sql;
+    const effectiveSeq = this.finalizedSeq > 0 ? this.finalizedSeq : this.latestSeq;
+    const effectiveRoot = this.finalizedRoot || this.currentRoot;
+
+    // Get vertex count
+    const vcRows = [...sql.exec("SELECT COUNT(*) as cnt FROM dag_vertices")] as any[];
+    const vertexCount = (vcRows[0]?.cnt || 0) as number;
+
+    // Get latest ZK proof hash if available
+    let zkProofHash: string | undefined;
+    let zkProvenBlock: number | undefined;
+    const zkRows = [...sql.exec(
+      "SELECT block_number, proof_hex FROM zk_proofs ORDER BY block_number DESC LIMIT 1",
+    )] as any[];
+    if (zkRows.length > 0) {
+      zkProvenBlock = zkRows[0].block_number;
+      // proof_hex is already a hash (we changed it to SHA-256 hash earlier)
+      zkProofHash = zkRows[0].proof_hex;
+    }
+
+    const record = await this.anchorManager.anchor({
+      stateRoot: effectiveRoot,
+      finalizedSeq: effectiveSeq,
+      lastCommittedRound: this.lastCommittedRound,
+      shardName: this.shardName,
+      nodePubkey: this.nodeIdentity?.pubkey || "",
+      activeNodes: this.getActiveNodeCount(),
+      vertexCount,
+      zkProofHash,
+      zkProvenBlock,
+    });
+
+    // Broadcast anchor event
+    this.broadcastToChannel("status", {
+      type: "anchor.submitted",
+      anchor_id: record.id,
+      arweave_tx: record.arweave_tx,
+      celestia_height: record.celestia_height,
+      state_root: effectiveRoot,
+      finalized_seq: effectiveSeq,
+    });
+
+    return record;
+  }
+
   // ─── WebSocket ───────────────────────────────────────────────────────────
 
   private handleWebSocket(ws: WebSocket) {
@@ -1261,8 +1596,9 @@ export class PersistiaWorld implements DurableObject {
     this.tryAdvanceRound();
     await this.tryCommitRounds();
 
-    // Broadcast to peers
+    // Broadcast to WS peers + gossip to remote nodes
     await this.broadcastVertexToPeers(vertex);
+    this.gossipManager.gossipVertex(vertex).catch(() => {});
   }
 
   private getStrongParents(): string[] {

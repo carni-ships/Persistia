@@ -91,10 +91,39 @@ export default {
 
     // ─── List shards ────────────────────────────────────────────────────
     if (url.pathname === "/shards") {
-      // Return known shard names (caller can enumerate, but we list common ones)
       return corsResponse(JSON.stringify({
         note: "Shards are created on demand via ?shard= parameter",
         default: "global-world",
+      }));
+    }
+
+    // ─── Network discovery ──────────────────────────────────────────────
+    // GET /network — public endpoint listing this node's identity + known peers
+    // Used by other nodes to discover and bootstrap into the network.
+    if (url.pathname === "/network") {
+      const shardName = url.searchParams.get("shard") || "global-world";
+      const id = env.PERSISTIA_WORLD.idFromName(shardName);
+      const stub = env.PERSISTIA_WORLD.get(id);
+      const infoRes = await stub.fetch(new Request(`${url.origin}/gossip/peers`));
+      const peers = await infoRes.json() as any;
+
+      const nodeRes = await stub.fetch(new Request(url.origin));
+      const nodeInfo = await nodeRes.json() as any;
+
+      return corsResponse(JSON.stringify({
+        node_pubkey: nodeInfo.node_pubkey,
+        node_url: nodeInfo.node_url,
+        version: nodeInfo.version,
+        shard: shardName,
+        gossip_peers: peers.peers || [],
+        endpoints: {
+          gossip_push: "/gossip/push",
+          gossip_sync: "/gossip/sync",
+          gossip_peers: "/gossip/peers",
+          add_node: "/addNode",
+          anchor_latest: "/anchor/latest",
+          anchor_bootstrap: "/anchor/bootstrap",
+        },
       }));
     }
 

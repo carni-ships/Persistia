@@ -14,3 +14,20 @@ class_name = "PersistiaWorld"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["PersistiaWorld"]
+
+# ─── Environment Variables ─────────────────────────────────────────────
+# Set these via `wrangler secret put` or in .dev.vars for local development.
+#
+# NODE_URL       — This node's public URL (e.g., "https://persistia.example.com")
+# SEED_NODES     — Comma-separated seed node URLs for gossip bootstrap
+#                  (e.g., "https://node1.example.com,https://node2.example.com")
+#
+# Arweave anchoring:
+# ARWEAVE_GATEWAY — Arweave gateway URL (e.g., "https://arweave.net")
+# IRYS_URL        — Irys bundler URL (e.g., "https://node2.irys.xyz")
+# IRYS_TOKEN      — Irys auth token
+#
+# Celestia anchoring:
+# CELESTIA_RPC       — Celestia node RPC URL
+# CELESTIA_TOKEN     — Celestia auth token
+# CELESTIA_NAMESPACE — Hex-encoded 8-byte namespace (default: "persistia")

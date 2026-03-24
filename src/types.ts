@@ -84,6 +84,28 @@ export interface OracleRequestInfo {
   delivered_at?: number;
 }
 
+// ─── Gossip Types ───────────────────────────────────────────────────────
+
+export interface GossipPeerInfo {
+  pubkey: string;
+  url: string;
+  last_seen: number;
+  failures: number;
+}
+
+// ─── Anchor Types ───────────────────────────────────────────────────────
+
+export interface AnchorInfo {
+  id: string;
+  state_root: string;
+  finalized_seq: number;
+  last_committed_round: number;
+  arweave_tx?: string;
+  celestia_height?: number;
+  status: string;
+  timestamp: number;
+}
+
 // ─── Trigger Types ───────────────────────────────────────────────────────────
 
 export interface TriggerInfo {
