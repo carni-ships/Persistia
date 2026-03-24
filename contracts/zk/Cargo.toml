@@ -1,0 +1,9 @@
+[workspace]
+members = ["types", "program", "prover"]
+resolver = "2"
+
+# Patches are applied during `cargo prove build` (guest compilation).
+# The ed25519-consensus patch uses SP1's Ed25519 precompile for efficient proving.
+# curve25519-dalek-ng is patched transitively via ed25519-consensus.
+[patch.crates-io]
+ed25519-consensus = { git = "https://github.com/sp1-patches/ed25519-consensus", tag = "ed25519_consensus-v2.1.0-patch-v1" }

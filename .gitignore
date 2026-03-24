@@ -1,0 +1,17 @@
+node_modules/
+.wrangler/
+dist/
+target/
+*.proof
+*.bin
+proofs/
+.env
+.dev.vars
+*.log
+
+# Rust build artifacts
+contracts/zk/target/
+
+# OS files
+.DS_Store
+Thumbs.db

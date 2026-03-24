@@ -1,0 +1,8 @@
+[package]
+name = "persistia-sdk"
+version = "0.1.0"
+edition = "2021"
+description = "SDK for writing Persistia smart contracts in Rust"
+
+[lib]
+crate-type = ["rlib"]

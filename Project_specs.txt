@@ -1,0 +1,130 @@
+**Persistia Ledger Specification**  
+**Version:** 0.2 (Ledger-only, game-agnostic)  
+**Date:** March 24, 2026  
+**Purpose:** A decentralized, Mina-style succinct ledger for persistent shared state (voxel worlds, asset ownership, transfers, and simple programmable rules). Runs across independent Cloudflare accounts with no single point of failure.
+
+### 1. High-Level Overview
+- **Goal**: Provide a ledger that is:
+  - Real-time (sub-100 ms updates via WebSockets)
+  - Succinct (entire history verifiable from one ~5–20 KB proof)
+  - Decentralized (any number of independent Cloudflare accounts can participate as nodes)
+  - Permanent (canonical state survives any Cloudflare account deletion/ban via off-platform anchoring)
+- **Core invariants**:
+  - Every state transition is cryptographically signed and verifiable.
+  - New nodes or reconnecting clients sync in milliseconds via the latest succinct root.
+  - No central operator — the ledger lives as long as ≥1 honest node is online.
+- **Not a full L1 blockchain**: No mining, no gas fees inside the ledger. Settlement/anchoring is offloaded to Arweave + cheap L2.
+
+### 2. Architecture
+```
+Clients / Game Nodes
+   ↓ WebSocket (or HTTP)
+Cloudflare Node (any account) ── gossip (HTTP + p2pcf WebRTC) ── Cloudflare Node
+   │
+   Durable Object (one per logical "shard"/zone)
+      ├── In-memory + SQLite: current state + event log
+      ├── Validator (signature + rule checks)
+      └── Periodic prover (Merkle or SP1 recursive)
+            ↓
+         Succinct Root → Arweave / Celestia (immutable anchor)
+```
+
+- **Node = one Cloudflare account** (deploy the same code via one-click Wrangler).
+- **Shard = one Durable Object** (spatial or logical partitioning; unlimited shards).
+- **Gossip network**: Any-to-any; nodes discover each other via a public list or manual `addNode()` call.
+
+### 3. Data Model (inside each Durable Object)
+Stored in DO’s built-in SQLite + in-memory cache:
+
+| Table / Map          | Key                  | Value                                      | Notes |
+|----------------------|----------------------|--------------------------------------------|-------|
+| `state`              | chunkKey (`x,z`)     | blockType (int) or full chunk blob         | Voxel or any key-value state |
+| `ownership`          | assetId (string)     | `{ownerPubkey, metadata, timestamp}`       | NFTs / items / land |
+| `inventory`          | playerPubkey         | `{itemId: count, ...}`                     | Player balances |
+| `events`             | sequenceId           | `{type, payload, signature, timestamp}`    | Append-only log (for replay) |
+| `proofs`             | proofId              | `{root, proofData}`                        | Succinct roots |
+
+- All mutations are atomic inside the DO.
+- Every write appends a signed event to `events`.
+
+### 4. APIs (exposed by every node)
+**WebSocket (real-time)**  
+- `join` → returns latest succinct root + current snapshot  
+- `submit` → signed action (place/break/transfer/craft/call)  
+- Broadcasts deltas to all connected clients + gossips to other nodes
+
+**HTTP endpoints**  
+- `POST /transfer` `{assetId, fromPubkey, toPubkey, signature}`  
+- `POST /craft` `{playerPubkey, recipeId, signature}`  
+- `POST /call` `{contractId, calldata, signature}` (future programmable)  
+- `GET /root` → returns latest Merkle/SP1 root + timestamp  
+- `POST /gossip` → internal node-to-node (signed events)
+
+**Admin (per-node)**  
+- `POST /addNode` `{url}` → add gossip peer
+
+### 5. Consensus & Gossip
+- **Simple threshold model** (PoC): Any node can propose a batch; 2/3 of known peers must echo-sign within 10 s.  
+- **Gossip protocol**:  
+  - Immediate flood on new signed event (HTTP POST).  
+  - Periodic sync every 30 s (pull missing events by sequenceId).  
+- **Conflict resolution**: Highest sequence + valid signature wins; invalid events are dropped before storage.  
+- **No fork risk for anchored state**: The canonical history is the latest Arweave-anchored root.
+
+### 6. Succinctness Layer (Mina-style)
+**Phase 1 (current PoC — already implemented in v0.1 code)**:  
+- SHA-256 Merkle root of `state + ownership + events` every 5 minutes.  
+- New nodes download root + latest snapshot → verify hash.
+
+**Phase 2 (next upgrade — 1–2 days work)**:  
+- Replace Merkle with **SP1 zkVM recursive proof**.  
+- Circuit proves: “This batch of transitions is valid given previous root (ownership rules + contract execution).”  
+- Proof size remains constant (~few KB) regardless of history length.  
+- Verification is <10 ms on any node.
+
+**Phase 3 (future)**: Full recursive composition (SP1 recursion + optional o1js/Mina bridge).
+
+### 7. Smart Contracts / Programmable Rules
+- **Current (v0.2)**: Hard-coded but verifiable rules inside DO (e.g., crafting requires exact inventory).  
+- **v0.3+**: Arbitrary RISC-V programs via SP1 (upload Rust contract once, call it in any transition).  
+- **v0.4+**: EVM compatibility via SP1-CC (prove real Solidity calls off-chain).
+
+Contracts are executed inside the proof → fully verifiable, no trust in the node.
+
+### 8. Anchoring & Persistence
+Every 5–10 min (or on major events):
+1. Compute succinct root/proof.
+2. Post `{root, proof, metadata}` to Arweave (pay-once, permanent).
+3. Optional: Mirror root hash to Celestia DA or cheap L2 for public verifiability.
+
+The ledger’s canonical state = latest valid Arweave object. Any node can bootstrap from it.
+
+### 9. Security & Attack Mitigation
+- **DDoS**: Cloudflare automatic edge mitigation + decentralization (must hit every node simultaneously).  
+- **Spam/Sybil**: Per-pubkey rate limits inside DO + optional PoW on events.  
+- **Invalid state**: Signature + rule checks reject before storage/gossip.  
+- **Eclipse**: Multiple gossip paths + periodic root pull from Arweave.  
+- **Node deletion**: Irrelevant — any other node + Arweave anchor keeps the ledger alive.  
+- **Key compromise**: Short-lived session keys recommended; full key rotation possible.
+
+### 10. Deployment & Scaling
+- **One-click node**: `wrangler deploy` (same code on any Cloudflare account).  
+- **Cost**: $0 (free tier for <10 players) → $5–20/month per active node (WebSocket hibernation keeps it cheap).  
+- **Scale**: Unlimited nodes; spatial sharding (one DO per zone) for 1000+ players.  
+- **Monitoring**: Each node logs root hashes; public dashboard can aggregate them.
+
+### 11. Upgrade Path (already planned)
+1. Replace Merkle with SP1 recursive proof (1 day).  
+2. Add Rust contract execution.  
+3. Full Godot voxel client integration.  
+4. Multi-shard + automatic node discovery.  
+5. Optional EVM bridge for true NFT settlement.
+
+This spec is complete, self-contained, and directly implementable from the v0.1 code we already dropped. The ledger side is now fully decoupled from any specific game — you can plug in Minecraft voxels, EVE-style markets, GTA vehicles, or anything else that needs persistent shared state.
+
+Want me to:
+- Update the existing code files to match this exact spec?
+- Give the full SP1 circuit skeleton (Rust)?
+- Or spec out the next phase (full recursive zk + contract upload)?
+
+Just say the word and we keep building. The ledger is ready to outlive any single account.

@@ -1,0 +1,875 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Persistia Explorer</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&display=swap');
+
+    :root {
+      --bg: #0a0a0f;
+      --surface: #12121a;
+      --surface-2: #1a1a25;
+      --border: #2a2a3a;
+      --text: #e0e0e8;
+      --text-dim: #7a7a8e;
+      --accent: #6c5ce7;
+      --accent-dim: rgba(108,92,231,0.15);
+      --green: #00d2a0;
+      --green-dim: rgba(0,210,160,0.15);
+      --yellow: #ffd166;
+      --yellow-dim: rgba(255,209,102,0.15);
+      --red: #ff6b6b;
+      --red-dim: rgba(255,107,107,0.15);
+      --blue: #48bfe3;
+      --blue-dim: rgba(72,191,227,0.15);
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 13px;
+      min-height: 100vh;
+    }
+
+    /* ─── Header ─────────────────────────────────────────── */
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 16px 24px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+    }
+
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .logo-icon {
+      width: 32px;
+      height: 32px;
+      background: var(--accent);
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+      font-size: 16px;
+    }
+
+    .logo-text {
+      font-size: 18px;
+      font-weight: 600;
+      letter-spacing: -0.5px;
+    }
+
+    .logo-tag {
+      font-size: 10px;
+      color: var(--text-dim);
+      background: var(--surface-2);
+      padding: 2px 8px;
+      border-radius: 4px;
+      margin-left: 8px;
+    }
+
+    .header-right {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--green);
+      animation: pulse 2s infinite;
+    }
+
+    .status-dot.offline { background: var(--red); animation: none; }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
+    .node-url {
+      color: var(--text-dim);
+      font-size: 11px;
+    }
+
+    /* ─── Stats Bar ──────────────────────────────────────── */
+    .stats-bar {
+      display: grid;
+      grid-template-columns: repeat(6, 1fr);
+      gap: 1px;
+      background: var(--border);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .stat-card {
+      background: var(--surface);
+      padding: 16px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .stat-label {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: var(--text-dim);
+    }
+
+    .stat-value {
+      font-size: 22px;
+      font-weight: 600;
+      letter-spacing: -1px;
+    }
+
+    .stat-sub {
+      font-size: 10px;
+      color: var(--text-dim);
+    }
+
+    /* ─── Main Layout ────────────────────────────────────── */
+    .main {
+      display: grid;
+      grid-template-columns: 1fr 340px;
+      grid-template-rows: 1fr 1fr;
+      height: calc(100vh - 130px);
+      gap: 1px;
+      background: var(--border);
+    }
+
+    .panel {
+      background: var(--surface);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    .panel-title {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: var(--text-dim);
+      font-weight: 500;
+    }
+
+    .panel-body {
+      flex: 1;
+      overflow: auto;
+      position: relative;
+    }
+
+    /* ─── DAG Visualization ──────────────────────────────── */
+    #dag-canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+
+    .dag-panel { grid-row: 1 / 3; }
+
+    /* ─── Event Log ──────────────────────────────────────── */
+    .event-list {
+      padding: 0;
+      list-style: none;
+    }
+
+    .event-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      padding: 8px 16px;
+      border-bottom: 1px solid rgba(42,42,58,0.5);
+      font-size: 11px;
+      transition: background 0.15s;
+    }
+
+    .event-item:hover { background: var(--surface-2); }
+
+    .event-time {
+      color: var(--text-dim);
+      white-space: nowrap;
+      min-width: 55px;
+    }
+
+    .event-badge {
+      padding: 1px 6px;
+      border-radius: 3px;
+      font-size: 10px;
+      font-weight: 500;
+      white-space: nowrap;
+    }
+
+    .badge-commit { background: var(--green-dim); color: var(--green); }
+    .badge-vertex { background: var(--accent-dim); color: var(--accent); }
+    .badge-event { background: var(--blue-dim); color: var(--blue); }
+    .badge-contract { background: var(--yellow-dim); color: var(--yellow); }
+    .badge-zk { background: var(--red-dim); color: var(--red); }
+
+    .event-detail {
+      color: var(--text-dim);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .event-detail .mono {
+      color: var(--text);
+      font-weight: 500;
+    }
+
+    /* ─── Node List ──────────────────────────────────────── */
+    .node-list { padding: 8px 0; }
+
+    .node-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 16px;
+      border-bottom: 1px solid rgba(42,42,58,0.3);
+    }
+
+    .node-avatar {
+      width: 28px;
+      height: 28px;
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 11px;
+      font-weight: 600;
+      flex-shrink: 0;
+    }
+
+    .node-info { flex: 1; min-width: 0; }
+    .node-pk {
+      font-size: 11px;
+      color: var(--text);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .node-meta {
+      font-size: 10px;
+      color: var(--text-dim);
+      margin-top: 2px;
+    }
+
+    .node-round {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--accent);
+    }
+
+    /* ─── ZK Status ──────────────────────────────────────── */
+    .zk-bar {
+      padding: 12px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .zk-progress {
+      height: 4px;
+      background: var(--surface-2);
+      border-radius: 2px;
+      overflow: hidden;
+    }
+
+    .zk-progress-fill {
+      height: 100%;
+      background: var(--accent);
+      border-radius: 2px;
+      transition: width 0.5s ease;
+    }
+
+    .zk-stats {
+      display: flex;
+      justify-content: space-between;
+      font-size: 10px;
+      color: var(--text-dim);
+    }
+
+    /* ─── Scrollbar ──────────────────────────────────────── */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #3a3a4a; }
+
+    /* ─── Responsive ─────────────────────────────────────── */
+    @media (max-width: 900px) {
+      .stats-bar { grid-template-columns: repeat(3, 1fr); }
+      .main { grid-template-columns: 1fr; grid-template-rows: 300px auto auto; }
+      .dag-panel { grid-row: auto; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="logo">
+      <div class="logo-icon">P</div>
+      <span class="logo-text">Persistia</span>
+      <span class="logo-tag">v0.5.0</span>
+    </div>
+    <div class="header-right" style="display:flex;align-items:center;gap:16px">
+      <a href="/game" style="color:var(--accent);text-decoration:none;font-size:12px;padding:4px 12px;border:1px solid var(--accent);border-radius:6px;transition:all 0.15s" onmouseover="this.style.background='var(--accent-dim)'" onmouseout="this.style.background='transparent'">Game World</a>
+      <div style="display:flex;align-items:center;gap:8px">
+        <div class="status-dot" id="status-dot"></div>
+        <span class="node-url" id="node-url">connecting...</span>
+      </div>
+    </div>
+  </header>
+
+  <div class="stats-bar">
+    <div class="stat-card">
+      <div class="stat-label">Round</div>
+      <div class="stat-value" id="s-round">--</div>
+      <div class="stat-sub">current consensus round</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Finalized</div>
+      <div class="stat-value" id="s-finalized">--</div>
+      <div class="stat-sub">committed round</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Events</div>
+      <div class="stat-value" id="s-events">--</div>
+      <div class="stat-sub">total finalized</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Nodes</div>
+      <div class="stat-value" id="s-nodes">--</div>
+      <div class="stat-sub">active validators</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Contracts</div>
+      <div class="stat-value" id="s-contracts">--</div>
+      <div class="stat-sub">deployed</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">ZK Proofs</div>
+      <div class="stat-value" id="s-zk">--</div>
+      <div class="stat-sub" id="s-zk-sub">chain length</div>
+    </div>
+  </div>
+
+  <div class="main">
+    <!-- DAG Visualization -->
+    <div class="panel dag-panel">
+      <div class="panel-header">
+        <span class="panel-title">DAG Consensus</span>
+        <span style="font-size:10px;color:var(--text-dim)" id="dag-info">rounds shown: 0</span>
+      </div>
+      <div class="panel-body">
+        <canvas id="dag-canvas"></canvas>
+      </div>
+    </div>
+
+    <!-- Events + Nodes -->
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">Live Events</span>
+        <span style="font-size:10px;color:var(--text-dim)" id="event-count">0</span>
+      </div>
+      <div class="panel-body">
+        <ul class="event-list" id="event-list"></ul>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">Validators</span>
+      </div>
+      <div class="panel-body">
+        <div class="node-list" id="node-list"></div>
+        <!-- ZK Progress -->
+        <div style="border-top:1px solid var(--border)">
+          <div class="panel-header">
+            <span class="panel-title">ZK Proof Coverage</span>
+          </div>
+          <div class="zk-bar">
+            <div class="zk-progress">
+              <div class="zk-progress-fill" id="zk-fill" style="width:0%"></div>
+            </div>
+            <div class="zk-stats">
+              <span id="zk-proven">0 blocks proven</span>
+              <span id="zk-gap">gap: --</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+// ─── Config ──────────────────────────────────────────────────────────────────
+const params = new URLSearchParams(location.search);
+const NODE = params.get('node') || location.origin;
+const SHARD = params.get('shard') || 'global-world';
+const POLL_MS = 3000;
+
+let connected = false;
+let dagData = { vertices: [], commits: new Set() };
+let events = [];
+let nodeColors = {};
+const COLORS = [
+  '#6c5ce7','#00d2a0','#48bfe3','#ffd166','#ff6b6b',
+  '#a29bfe','#55efc4','#74b9ff','#fdcb6e','#fab1a0',
+  '#e17055','#0984e3','#00cec9','#e84393','#636e72',
+];
+
+function nodeColor(pubkey) {
+  if (!nodeColors[pubkey]) {
+    const idx = Object.keys(nodeColors).length % COLORS.length;
+    nodeColors[pubkey] = COLORS[idx];
+  }
+  return nodeColors[pubkey];
+}
+
+function shortKey(pk) {
+  if (!pk) return '???';
+  return pk.slice(0, 6) + '..' + pk.slice(-4);
+}
+
+function timeAgo(ts) {
+  const s = Math.floor((Date.now() - ts) / 1000);
+  if (s < 60) return s + 's ago';
+  if (s < 3600) return Math.floor(s/60) + 'm ago';
+  return Math.floor(s/3600) + 'h ago';
+}
+
+// ─── API ─────────────────────────────────────────────────────────────────────
+async function api(path) {
+  const sep = path.includes('?') ? '&' : '?';
+  const res = await fetch(`${NODE}${path}${sep}shard=${SHARD}`);
+  if (!res.ok) throw new Error(`${res.status}`);
+  return res.json();
+}
+
+// ─── Polling ─────────────────────────────────────────────────────────────────
+let lastSyncRound = 0;
+let lastSyncSeq = 0;
+
+async function poll() {
+  try {
+    // Fetch all data in parallel
+    const [status, sync, zkStatus] = await Promise.all([
+      api('/dag/status'),
+      api(`/dag/sync?after_round=${lastSyncRound}&after_seq=${lastSyncSeq}&limit=200`),
+      api('/proof/zk/status').catch(() => null),
+    ]);
+
+    if (!connected) {
+      connected = true;
+      document.getElementById('status-dot').classList.remove('offline');
+      document.getElementById('node-url').textContent = NODE.replace(/^https?:\/\//, '');
+    }
+
+    // Stats bar
+    document.getElementById('s-round').textContent = status.current_round;
+    document.getElementById('s-finalized').textContent = status.last_committed_round >= 0
+      ? status.last_committed_round : '--';
+    document.getElementById('s-events').textContent = status.finalized_seq;
+    document.getElementById('s-nodes').textContent = status.active_nodes;
+
+    // Count contracts (from a separate endpoint)
+    try {
+      const root = await api('/');
+      if (root.contracts !== undefined) {
+        document.getElementById('s-contracts').textContent = root.contracts;
+      }
+    } catch {}
+
+    // Process DAG sync data
+    if (sync.vertices && sync.vertices.length > 0) {
+      for (const v of sync.vertices) {
+        dagData.vertices.push({
+          hash: v.hash,
+          author: v.author,
+          round: v.round,
+          refs: v.refs_json ? JSON.parse(v.refs_json) : [],
+          events: v.events_json ? JSON.parse(v.events_json) : [],
+          signature: v.signature,
+        });
+
+        // Add to event log
+        addEvent('vertex', `Round ${v.round}`, shortKey(v.author), nodeColor(v.author));
+      }
+
+      lastSyncRound = Math.max(lastSyncRound, ...sync.vertices.map(v => v.round));
+    }
+
+    if (sync.commits) {
+      for (const c of sync.commits) {
+        dagData.commits.add(c.anchor_hash);
+        addEvent('commit', `Round ${c.round} finalized`, shortKey(c.anchor_hash), null);
+      }
+    }
+
+    // Process direct-apply events (single-node mode)
+    if (sync.recent_events && sync.recent_events.length > 0) {
+      for (const ev of sync.recent_events) {
+        const et = ev.type || 'unknown';
+        const badge = et.startsWith('contract.') ? 'contract' : et === 'craft' ? 'event' : 'event';
+        let detail = et;
+        try {
+          const p = typeof ev.payload === 'string' ? JSON.parse(ev.payload) : ev.payload;
+          if (et === 'place') detail = `place ${p.block_type || ''} at (${p.x},${p.z})`;
+          else if (et === 'break') detail = `break at (${p.x},${p.z})`;
+          else if (et === 'craft') detail = `craft ${p.recipe}`;
+          else if (et === 'contract.deploy') detail = 'deploy contract';
+          else if (et === 'contract.call') detail = `call ${p.method}`;
+        } catch {}
+        addEvent(badge, detail, shortKey(ev.pubkey), null);
+      }
+      lastSyncSeq = Math.max(lastSyncSeq, ...sync.recent_events.map(e => e.seq));
+    }
+
+    // ZK status
+    if (zkStatus) {
+      document.getElementById('s-zk').textContent = zkStatus.max_chain_length || zkStatus.total_proofs || 0;
+      const latestProven = zkStatus.latest_proven_block || 0;
+      const lastCommitted = zkStatus.last_committed_round || 0;
+      const gap = zkStatus.proof_gap || 0;
+      const pct = lastCommitted > 0 ? Math.min(100, (latestProven / lastCommitted) * 100) : 0;
+      document.getElementById('zk-fill').style.width = pct + '%';
+      document.getElementById('zk-proven').textContent = `${latestProven} / ${lastCommitted} blocks`;
+      document.getElementById('zk-gap').textContent = gap > 0 ? `gap: ${gap}` : 'caught up';
+    }
+
+    // Update nodes panel
+    try {
+      const peers = await api('/admin/peers');
+      renderNodes(peers.peers || []);
+    } catch {}
+
+    // Render DAG
+    renderDAG();
+
+  } catch (err) {
+    if (connected) {
+      connected = false;
+      document.getElementById('status-dot').classList.add('offline');
+      document.getElementById('node-url').textContent = 'disconnected';
+    }
+  }
+}
+
+// ─── Event Log ───────────────────────────────────────────────────────────────
+function addEvent(type, detail, extra, color) {
+  events.unshift({ type, detail, extra, color, time: Date.now() });
+  if (events.length > 200) events.length = 200;
+  renderEvents();
+}
+
+function renderEvents() {
+  const list = document.getElementById('event-list');
+  const badgeClass = {
+    vertex: 'badge-vertex',
+    commit: 'badge-commit',
+    event: 'badge-event',
+    contract: 'badge-contract',
+    zk: 'badge-zk',
+  };
+
+  list.innerHTML = events.slice(0, 50).map(e => `
+    <li class="event-item">
+      <span class="event-time">${timeAgo(e.time)}</span>
+      <span class="event-badge ${badgeClass[e.type] || 'badge-event'}">${e.type}</span>
+      <span class="event-detail">${e.detail}${e.extra ? ` <span class="mono">${e.extra}</span>` : ''}</span>
+    </li>
+  `).join('');
+
+  document.getElementById('event-count').textContent = events.length;
+}
+
+// ─── Node List ───────────────────────────────────────────────────────────────
+function renderNodes(nodes) {
+  const list = document.getElementById('node-list');
+  if (!nodes.length) {
+    list.innerHTML = '<div style="padding:16px;color:var(--text-dim);font-size:11px">No peers registered yet</div>';
+    return;
+  }
+  list.innerHTML = nodes.map(n => {
+    const c = nodeColor(n.pubkey);
+    return `
+      <div class="node-item">
+        <div class="node-avatar" style="background:${c}20;color:${c}">${shortKey(n.pubkey).slice(0,2)}</div>
+        <div class="node-info">
+          <div class="node-pk">${shortKey(n.pubkey)}${n.is_self ? ' (self)' : ''}</div>
+          <div class="node-meta">${n.url || 'local'} &middot; seen ${timeAgo(n.last_seen)}</div>
+        </div>
+        <div class="node-round">R${n.last_vertex_round}</div>
+      </div>
+    `;
+  }).join('');
+}
+
+// ─── DAG Canvas ──────────────────────────────────────────────────────────────
+function renderDAG() {
+  const canvas = document.getElementById('dag-canvas');
+  const container = canvas.parentElement;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = container.clientWidth * dpr;
+  canvas.height = container.clientHeight * dpr;
+  canvas.style.width = container.clientWidth + 'px';
+  canvas.style.height = container.clientHeight + 'px';
+
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  const W = container.clientWidth;
+  const H = container.clientHeight;
+
+  ctx.clearRect(0, 0, W, H);
+
+  const vertices = dagData.vertices;
+  if (vertices.length === 0) {
+    ctx.fillStyle = '#7a7a8e';
+    ctx.font = '12px JetBrains Mono';
+    ctx.textAlign = 'center';
+    ctx.fillText('Waiting for DAG vertices...', W/2, H/2);
+    ctx.fillText('Vertices appear as rounds are produced', W/2, H/2 + 20);
+    return;
+  }
+
+  // Collect unique authors and rounds
+  const authors = [...new Set(vertices.map(v => v.author))];
+  const rounds = [...new Set(vertices.map(v => v.round))].sort((a,b) => a-b);
+
+  // Only show last N rounds that fit
+  const COL_W = 60;
+  const ROW_H = 50;
+  const PAD_L = 70;
+  const PAD_T = 40;
+  const maxCols = Math.floor((W - PAD_L - 20) / COL_W);
+  const visibleRounds = rounds.slice(-maxCols);
+  const minRound = visibleRounds[0] || 0;
+
+  document.getElementById('dag-info').textContent =
+    `rounds ${visibleRounds[0] || 0}–${visibleRounds[visibleRounds.length-1] || 0} | ${authors.length} nodes`;
+
+  // Build position map
+  const posMap = new Map(); // hash → {x, y}
+  for (const v of vertices) {
+    if (v.round < minRound) continue;
+    const col = v.round - minRound;
+    const row = authors.indexOf(v.author);
+    if (col < 0 || row < 0) continue;
+    const x = PAD_L + col * COL_W + COL_W/2;
+    const y = PAD_T + row * ROW_H + ROW_H/2;
+    posMap.set(v.hash, { x, y, v });
+  }
+
+  // Draw round labels
+  ctx.fillStyle = '#4a4a5e';
+  ctx.font = '10px JetBrains Mono';
+  ctx.textAlign = 'center';
+  for (let i = 0; i < visibleRounds.length; i++) {
+    const x = PAD_L + i * COL_W + COL_W/2;
+    ctx.fillText('R' + visibleRounds[i], x, 16);
+  }
+
+  // Draw author labels
+  ctx.textAlign = 'right';
+  for (let i = 0; i < authors.length; i++) {
+    const y = PAD_T + i * ROW_H + ROW_H/2;
+    ctx.fillStyle = nodeColor(authors[i]);
+    ctx.fillText(shortKey(authors[i]), PAD_L - 8, y + 4);
+  }
+
+  // Draw grid lines
+  ctx.strokeStyle = 'rgba(42,42,58,0.3)';
+  ctx.lineWidth = 1;
+  for (let i = 0; i < authors.length; i++) {
+    const y = PAD_T + i * ROW_H + ROW_H/2;
+    ctx.beginPath();
+    ctx.moveTo(PAD_L, y);
+    ctx.lineTo(W - 10, y);
+    ctx.stroke();
+  }
+
+  // Draw edges (references to previous round vertices)
+  ctx.lineWidth = 1;
+  for (const [hash, pos] of posMap) {
+    const v = pos.v;
+    if (!v.refs) continue;
+    for (const ref of v.refs) {
+      const refPos = posMap.get(ref);
+      if (!refPos) continue;
+      ctx.strokeStyle = 'rgba(108,92,231,0.2)';
+      ctx.beginPath();
+      ctx.moveTo(pos.x, pos.y);
+      ctx.lineTo(refPos.x, refPos.y);
+      ctx.stroke();
+    }
+  }
+
+  // Draw vertices
+  for (const [hash, pos] of posMap) {
+    const v = pos.v;
+    const isCommitted = dagData.commits.has(hash);
+    const color = nodeColor(v.author);
+    const r = isCommitted ? 10 : 7;
+
+    // Glow for committed
+    if (isCommitted) {
+      ctx.shadowColor = '#00d2a0';
+      ctx.shadowBlur = 12;
+    }
+
+    ctx.fillStyle = isCommitted ? '#00d2a0' : color;
+    ctx.beginPath();
+    if (isCommitted) {
+      // Diamond shape for committed anchors
+      ctx.moveTo(pos.x, pos.y - r);
+      ctx.lineTo(pos.x + r, pos.y);
+      ctx.lineTo(pos.x, pos.y + r);
+      ctx.lineTo(pos.x - r, pos.y);
+      ctx.closePath();
+    } else {
+      ctx.arc(pos.x, pos.y, r, 0, Math.PI * 2);
+    }
+    ctx.fill();
+    ctx.shadowBlur = 0;
+
+    // Border
+    ctx.strokeStyle = isCommitted ? '#00d2a0' : color;
+    ctx.lineWidth = isCommitted ? 2 : 1;
+    ctx.stroke();
+
+    // Event count badge
+    const evCount = v.events ? v.events.length : 0;
+    if (evCount > 0) {
+      ctx.fillStyle = '#fff';
+      ctx.font = '8px JetBrains Mono';
+      ctx.textAlign = 'center';
+      ctx.fillText(evCount, pos.x, pos.y + 3);
+    }
+  }
+}
+
+// ─── WebSocket (live updates) ────────────────────────────────────────────────
+let dashWs = null;
+function connectWS() {
+  const wsUrl = NODE.replace(/^http/, 'ws') + '/?shard=' + SHARD;
+  let ws;
+  try {
+    ws = new WebSocket(wsUrl);
+  } catch { return; }
+  dashWs = ws;
+
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ type: 'join', pubkey: 'dashboard' }));
+    // Subscribe to all push channels — eliminates HTTP polling
+    ws.send(JSON.stringify({ type: 'subscribe', channels: ['dag', 'status', 'peers', 'zk'] }));
+    // Initial sync via WS instead of HTTP
+    ws.send(JSON.stringify({ type: 'sync', after_round: lastSyncRound, limit: 500 }));
+    ws.send(JSON.stringify({ type: 'status' }));
+  };
+
+  ws.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+
+      // Server-pushed status update (replaces polling /dag/status)
+      if (msg.type === 'status.update' || msg.type === 'status.result') {
+        if (!connected) {
+          connected = true;
+          document.getElementById('status-dot').classList.remove('offline');
+          document.getElementById('node-url').textContent = NODE.replace(/^https?:\/\//, '');
+        }
+        document.getElementById('s-round').textContent = msg.current_round;
+        document.getElementById('s-finalized').textContent = msg.last_committed_round >= 0
+          ? msg.last_committed_round : '--';
+        document.getElementById('s-events').textContent = msg.finalized_seq;
+        document.getElementById('s-nodes').textContent = msg.active_nodes;
+        return;
+      }
+
+      // Server-pushed peer list (replaces polling /admin/peers)
+      if (msg.type === 'peers.update') {
+        renderNodes(msg.peers || []);
+        return;
+      }
+
+      // WS-based sync response (replaces polling /dag/sync)
+      if (msg.type === 'sync.result') {
+        if (msg.vertices && msg.vertices.length > 0) {
+          for (const v of msg.vertices) {
+            dagData.vertices.push({
+              hash: v.hash, author: v.author, round: v.round,
+              refs: v.refs_json ? JSON.parse(v.refs_json) : [],
+              events: v.events_json ? JSON.parse(v.events_json) : [],
+              signature: v.signature,
+            });
+            addEvent('vertex', `Round ${v.round}`, shortKey(v.author), nodeColor(v.author));
+          }
+          lastSyncRound = Math.max(lastSyncRound, ...msg.vertices.map(v => v.round));
+        }
+        if (msg.commits) {
+          for (const c of msg.commits) {
+            dagData.commits.add(c.anchor_hash);
+            addEvent('commit', `Round ${c.round} finalized`, shortKey(c.anchor_hash), null);
+          }
+        }
+        renderDAG();
+        return;
+      }
+
+      // Live push events
+      if (msg.type === 'vertex.new') {
+        addEvent('vertex', `Round ${msg.round}`, shortKey(msg.author), nodeColor(msg.author));
+      } else if (msg.type === 'commit') {
+        addEvent('commit', `Round ${msg.round} finalized`, '', null);
+      } else if (msg.type === 'event.finalized' || msg.type === 'event.pending') {
+        const et = msg.event?.type || 'unknown';
+        const badge = et.startsWith('contract.') ? 'contract' : 'event';
+        addEvent(badge, et, shortKey(msg.event?.pubkey), null);
+      } else if (msg.type === 'zk.proof_submitted') {
+        addEvent('zk', `Block ${msg.block_number} proved`, '', null);
+      }
+    } catch {}
+  };
+
+  ws.onclose = () => {
+    dashWs = null;
+    connected = false;
+    document.getElementById('status-dot').classList.add('offline');
+    setTimeout(connectWS, 5000);
+  };
+}
+
+// ─── Init ────────────────────────────────────────────────────────────────────
+document.getElementById('status-dot').classList.add('offline');
+
+// Handle resize
+window.addEventListener('resize', () => renderDAG());
+
+// Start WS (primary) and polling as rare fallback for ZK status
+connectWS();
+poll();
+setInterval(poll, 60000); // Fallback only — most data arrives via WS push
+</script>
+</body>
+</html>

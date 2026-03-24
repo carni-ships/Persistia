@@ -1,0 +1,2139 @@
+// ─── Persistia Durable Object ─────────────────────────────────────────────────
+// BFT consensus via DAG (Bullshark-adapted) + signed event ledger.
+
+import type { SignedEvent, StoredEvent, DAGVertex, StoredVertex, ConsensusStatus } from "./types";
+import {
+  sha256, computeVertexHash, computeEventHash,
+  getQuorumSize, isQuorumMet, selectLeader,
+  ACTIVE_WINDOW, topologicalSort, checkCommit,
+  type VertexNode,
+} from "./consensus";
+import {
+  loadOrCreateNodeIdentity, signVertex, verifyVertexSignature, verifyNodeSignature,
+  type NodeIdentity,
+} from "./node-identity";
+import { ContractExecutor, type OracleRequestEmit, type TriggerRequestEmit } from "./contract-executor";
+import {
+  aggregate, extractJsonPath, fetchWithTimeout, computeRequestId,
+  type OracleRequest, type NodeFetchResult, type AggregationStrategy,
+} from "./oracle";
+import { TriggerManager, MIN_INTERVAL_MS, MAX_INTERVAL_MS } from "./triggers";
+import { computeStateCommitment, generateStateProof, verifyProof } from "./state-proofs";
+import { type CrossShardMessage, type CrossShardReceipt, validateMessage, createCrossShardMessage } from "./cross-shard";
+
+// ─── Configuration ────────────────────────────────────────────────────────────
+
+const CONSENSUS_ENABLED = true;
+const ROUND_INTERVAL_MS = 30_000;  // 30s fallback alarm for free tier
+const MIN_NODES_FOR_CONSENSUS = 4;
+
+// ─── Durable Object ──────────────────────────────────────────────────────────
+
+export class PersistiaWorld implements DurableObject {
+  state: DurableObjectState;
+  env: any;
+  sockets: Map<WebSocket, { pubkey?: string; channels: Set<string>; isValidator: boolean }> = new Map();
+
+  // Legacy state (backward compat when consensus off)
+  currentRoot: string = "";
+  latestSeq: number = 0;
+
+  // Consensus state
+  nodeIdentity: NodeIdentity | null = null;
+  contractExecutor!: ContractExecutor;
+  triggerManager!: TriggerManager;
+  shardName: string = "global-world";
+  currentRound: number = 0;
+  finalizedSeq: number = 0;
+  finalizedRoot: string = "";
+  lastCommittedRound: number = -2;
+  nodeUrl: string = "";
+
+  constructor(state: DurableObjectState, env: any) {
+    this.state = state;
+    this.env = env;
+    this.nodeUrl = env.NODE_URL || "";
+    this.state.blockConcurrencyWhile(async () => {
+      this.initDB();
+      await this.loadState();
+    });
+  }
+
+  // ─── Schema ──────────────────────────────────────────────────────────────
+
+  private initDB() {
+    const sql = this.state.storage.sql;
+
+    // --- Legacy tables (kept for game state) ---
+
+    sql.exec(`CREATE TABLE IF NOT EXISTS events (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      type TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      pubkey TEXT NOT NULL,
+      signature TEXT NOT NULL,
+      timestamp INTEGER NOT NULL,
+      hash TEXT NOT NULL
+    )`);
+
+    sql.exec(`CREATE TABLE IF NOT EXISTS blocks (
+      x INTEGER NOT NULL,
+      z INTEGER NOT NULL,
+      block_type INTEGER NOT NULL,
+      placed_by TEXT NOT NULL,
+      PRIMARY KEY (x, z)
+    )`);
+
+    sql.exec(`CREATE TABLE IF NOT EXISTS ownership (
+      asset_id TEXT PRIMARY KEY,
+      owner_pubkey TEXT NOT NULL,
+      metadata TEXT DEFAULT '',
+      created_at INTEGER NOT NULL
+    )`);
+
+    sql.exec(`CREATE TABLE IF NOT EXISTS inventory (
+      pubkey TEXT NOT NULL,
+      item TEXT NOT NULL,
+      count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (pubkey, item)
+    )`);
+
+    sql.exec(`CREATE TABLE IF NOT EXISTS roots (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      root TEXT NOT NULL,
+      seq INTEGER NOT NULL,
+      timestamp INTEGER NOT NULL
+    )`);
+
+    sql.exec(`CREATE INDEX IF NOT EXISTS idx_events_seq ON events(seq)`);
+    sql.exec(`CREATE INDEX IF NOT EXISTS idx_events_hash ON events(hash)`);
+
+    // --- Consensus tables ---
+
+    sql.exec(`CREATE TABLE IF NOT EXISTS node_identity (
+      pubkey TEXT PRIMARY KEY,
+      privkey_encrypted TEXT NOT NULL,
+      node_url TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    )`);
+
+    sql.exec(`CREATE TABLE IF NOT EXISTS dag_vertices (
+      hash TEXT PRIMARY KEY,
+      author TEXT NOT NULL,
+      round INTEGER NOT NULL,
+      events_json TEXT NOT NULL,
+      refs_json TEXT NOT NULL,
+      signature TEXT NOT NULL,
+      received_at INTEGER NOT NULL,
+      timestamp INTEGER NOT NULL DEFAULT 0
+    )`);
+    sql.exec(`CREATE INDEX IF NOT EXISTS idx_vertices_round ON dag_vertices(round)`);
+    sql.exec(`CREATE INDEX IF NOT EXISTS idx_vertices_author_round ON dag_vertices(author, round)`);
+
+    // Migration: add timestamp column if missing (existing tables won't get new columns from CREATE TABLE IF NOT EXISTS)
+    try { sql.exec(`ALTER TABLE dag_vertices ADD COLUMN timestamp INTEGER NOT NULL DEFAULT 0`); } catch {}
+
+    sql.exec(`CREATE TABLE IF NOT EXISTS dag_edges (
+      parent_hash TEXT NOT NULL,
+      child_hash TEXT NOT NULL,
+      PRIMARY KEY (parent_hash, child_hash)
+    )`);
+
+    sql.exec(`CREATE TABLE IF NOT EXISTS dag_commits (
+      round INTEGER PRIMARY KEY,
+      anchor_hash TEXT NOT NULL,
+      committed_at INTEGER NOT NULL
+    )`);
+
+    sql.exec(`CREATE TABLE IF NOT EXISTS consensus_events (
+      consensus_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_hash TEXT NOT NULL UNIQUE,
+      vertex_hash TEXT NOT NULL,
+      round INTEGER NOT NULL,
+      finalized_at INTEGER NOT NULL
+    )`);
+
+    sql.exec(`CREATE TABLE IF NOT EXISTS pending_events (
+      hash TEXT PRIMARY KEY,
+      type TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      pubkey TEXT NOT NULL,
+      signature TEXT NOT NULL,
+      timestamp INTEGER NOT NULL
+    )`);
+
+    sql.exec(`CREATE TABLE IF NOT EXISTS active_nodes (
+      pubkey TEXT PRIMARY KEY,
+      url TEXT NOT NULL,
+      last_vertex_round INTEGER NOT NULL DEFAULT 0,
+      last_seen INTEGER NOT NULL,
+      is_self INTEGER NOT NULL DEFAULT 0
+    )`);
+
+    sql.exec(`CREATE TABLE IF NOT EXISTS consensus_state (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    )`);
+
+    // --- Contract tables ---
+
+    sql.exec(`CREATE TABLE IF NOT EXISTS contracts (
+      address TEXT PRIMARY KEY,
+      deployer TEXT NOT NULL,
+      wasm_hash TEXT NOT NULL,
+      wasm_bytes BLOB NOT NULL,
+      created_at INTEGER NOT NULL,
+      deploy_seq INTEGER NOT NULL
+    )`);
+
+    sql.exec(`CREATE TABLE IF NOT EXISTS contract_state (
+      contract_address TEXT NOT NULL,
+      key BLOB NOT NULL,
+      value BLOB NOT NULL,
+      PRIMARY KEY (contract_address, key)
+    )`);
+
+    // --- Oracle tables ---
+
+    sql.exec(`CREATE TABLE IF NOT EXISTS oracle_requests (
+      id TEXT PRIMARY KEY,
+      contract TEXT NOT NULL,
+      callback_method TEXT NOT NULL,
+      url TEXT NOT NULL,
+      json_path TEXT,
+      aggregation TEXT NOT NULL DEFAULT 'identical',
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at INTEGER NOT NULL,
+      result_value TEXT,
+      result_sources INTEGER DEFAULT 0,
+      delivered_at INTEGER
+    )`);
+    sql.exec(`CREATE INDEX IF NOT EXISTS idx_oracle_status ON oracle_requests(status)`);
+
+    sql.exec(`CREATE TABLE IF NOT EXISTS oracle_responses (
+      request_id TEXT NOT NULL,
+      node_pubkey TEXT NOT NULL,
+      value TEXT NOT NULL,
+      fetched_at INTEGER NOT NULL,
+      PRIMARY KEY (request_id, node_pubkey)
+    )`);
+
+    // --- Trigger tables ---
+
+    sql.exec(`CREATE TABLE IF NOT EXISTS triggers (
+      id TEXT PRIMARY KEY,
+      contract TEXT NOT NULL,
+      method TEXT NOT NULL,
+      args_b64 TEXT NOT NULL DEFAULT '',
+      interval_ms INTEGER NOT NULL,
+      next_fire INTEGER NOT NULL,
+      creator TEXT NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      created_at INTEGER NOT NULL,
+      last_fired INTEGER NOT NULL DEFAULT 0,
+      fire_count INTEGER NOT NULL DEFAULT 0,
+      max_fires INTEGER NOT NULL DEFAULT 0
+    )`);
+    sql.exec(`CREATE INDEX IF NOT EXISTS idx_triggers_next ON triggers(enabled, next_fire)`);
+
+    // --- Cross-shard tables ---
+
+    sql.exec(`CREATE TABLE IF NOT EXISTS xshard_outbox (
+      id TEXT PRIMARY KEY,
+      target_shard TEXT NOT NULL,
+      message_json TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at INTEGER NOT NULL,
+      delivered_at INTEGER
+    )`);
+
+    sql.exec(`CREATE TABLE IF NOT EXISTS xshard_inbox (
+      id TEXT PRIMARY KEY,
+      source_shard TEXT NOT NULL,
+      message_json TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      received_at INTEGER NOT NULL,
+      processed_at INTEGER
+    )`);
+
+    // ─── ZK Proofs ───────────────────────────────────────────────────────
+    sql.exec(`CREATE TABLE IF NOT EXISTS zk_proofs (
+      block_number INTEGER PRIMARY KEY,
+      proof_hex TEXT NOT NULL,
+      state_root TEXT NOT NULL,
+      proven_blocks INTEGER NOT NULL DEFAULT 1,
+      proof_type TEXT NOT NULL DEFAULT 'compressed',
+      submitted_at INTEGER NOT NULL,
+      verified INTEGER NOT NULL DEFAULT 0
+    )`);
+  }
+
+  private async loadState() {
+    const sql = this.state.storage.sql;
+
+    // Legacy state
+    const seqRows = [...sql.exec("SELECT MAX(seq) as max_seq FROM events")];
+    this.latestSeq = seqRows[0]?.max_seq ?? 0;
+    const rootRows = [...sql.exec("SELECT root FROM roots ORDER BY id DESC LIMIT 1")];
+    this.currentRoot = rootRows[0]?.root ?? await sha256("");
+
+    // Consensus state
+    this.currentRound = parseInt(this.getKV("current_round") || "0");
+    this.finalizedSeq = parseInt(this.getKV("finalized_seq") || "0");
+    this.finalizedRoot = this.getKV("finalized_root") || await sha256("");
+    this.lastCommittedRound = parseInt(this.getKV("last_committed_round") || "-2");
+
+    // Contract executor + trigger manager
+    this.contractExecutor = new ContractExecutor(sql);
+    this.triggerManager = new TriggerManager(sql);
+
+    // Node identity
+    if (CONSENSUS_ENABLED) {
+      this.nodeIdentity = await loadOrCreateNodeIdentity(sql, this.nodeUrl);
+      // Register self in active_nodes
+      sql.exec(
+        `INSERT INTO active_nodes (pubkey, url, last_vertex_round, last_seen, is_self)
+         VALUES (?, ?, ?, ?, 1)
+         ON CONFLICT(pubkey) DO UPDATE SET url = ?, last_seen = ?, is_self = 1`,
+        this.nodeIdentity.pubkey, this.nodeIdentity.url, this.currentRound, Date.now(),
+        this.nodeIdentity.url, Date.now(),
+      );
+    }
+  }
+
+  // ─── KV helpers for consensus_state ─────────────────────────────────────
+
+  private getKV(key: string): string | null {
+    const rows = [...this.state.storage.sql.exec("SELECT value FROM consensus_state WHERE key = ?", key)];
+    return rows.length > 0 ? (rows[0].value as string) : null;
+  }
+
+  private setKV(key: string, value: string) {
+    this.state.storage.sql.exec(
+      "INSERT INTO consensus_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = ?",
+      key, value, value,
+    );
+  }
+
+  // ─── HTTP Router ─────────────────────────────────────────────────────────
+
+  async fetch(req: Request): Promise<Response> {
+    const url = new URL(req.url);
+
+    // Pick up shard name from Worker relay header
+    const shardHeader = req.headers.get("X-Shard-Name");
+    if (shardHeader) this.shardName = shardHeader;
+
+    // WebSocket upgrade
+    if (req.headers.get("Upgrade") === "websocket") {
+      const pair = new WebSocketPair();
+      this.handleWebSocket(pair[1]);
+      return new Response(null, { status: 101, webSocket: pair[0] });
+    }
+
+    try {
+      // DAG consensus endpoints
+      if (url.pathname.startsWith("/dag/")) {
+        return this.handleDagRoute(req, url);
+      }
+      if (url.pathname.startsWith("/admin/")) {
+        return this.handleAdminRoute(req, url);
+      }
+      if (url.pathname.startsWith("/contract/")) {
+        return this.handleContractRoute(req, url);
+      }
+      if (url.pathname.startsWith("/proof/")) {
+        return this.handleProofRoute(req, url);
+      }
+      if (url.pathname.startsWith("/xshard/")) {
+        return this.handleCrossShardRoute(req, url);
+      }
+
+      switch (url.pathname) {
+        case "/root":
+          return this.json({
+            root: CONSENSUS_ENABLED ? this.finalizedRoot : this.currentRoot,
+            seq: CONSENSUS_ENABLED ? this.finalizedSeq : this.latestSeq,
+            timestamp: Date.now(),
+          });
+
+        case "/transfer": {
+          if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+          const body = await req.json() as SignedEvent;
+          body.type = "transfer";
+          return this.json(await this.receiveClientEvent(body));
+        }
+
+        case "/craft": {
+          if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+          const body = await req.json() as SignedEvent;
+          body.type = "craft";
+          return this.json(await this.receiveClientEvent(body));
+        }
+
+        case "/event": {
+          if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+          const body = await req.json() as SignedEvent;
+          if (!body.type) return this.json({ error: "Missing event type" }, 400);
+          return this.json(await this.receiveClientEvent(body));
+        }
+
+        case "/seed": {
+          if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+          const { pubkey, amount } = await req.json() as any;
+          if (!pubkey) return this.json({ error: "Missing pubkey" }, 400);
+          if (amount && typeof amount === "number") {
+            // Grant specific amount of each resource
+            for (const item of ["dirt", "stone", "wood"]) {
+              this.addToInventory(pubkey, item, amount);
+            }
+          } else {
+            this.ensureStartingInventory(pubkey);
+          }
+          return this.json({ ok: true, inventory: this.getPlayerInventory(pubkey) });
+        }
+
+        case "/sync": {
+          const afterSeq = parseInt(url.searchParams.get("after") || "0");
+          const limit = Math.min(parseInt(url.searchParams.get("limit") || "1000"), 1000);
+          const events = [...this.state.storage.sql.exec(
+            "SELECT consensus_seq, event_hash, vertex_hash, round, finalized_at FROM consensus_events WHERE consensus_seq > ? ORDER BY consensus_seq ASC LIMIT ?",
+            afterSeq, limit,
+          )];
+          return this.json({ events, finalizedSeq: this.finalizedSeq, root: this.finalizedRoot });
+        }
+
+        case "/state": {
+          const blocks = [...this.state.storage.sql.exec("SELECT x, z, block_type FROM blocks")];
+          return this.json({
+            blocks,
+            root: CONSENSUS_ENABLED ? this.finalizedRoot : this.currentRoot,
+            seq: CONSENSUS_ENABLED ? this.finalizedSeq : this.latestSeq,
+          });
+        }
+
+        case "/inventory": {
+          const pubkey = url.searchParams.get("pubkey");
+          if (!pubkey) return this.json({ error: "pubkey required" }, 400);
+          return this.json({ inventory: this.getPlayerInventory(pubkey) });
+        }
+
+        default: {
+          const contractCount = [...this.state.storage.sql.exec("SELECT COUNT(*) as c FROM contracts")] as any[];
+          return this.json({
+            name: "Persistia Ledger Node",
+            version: "0.5.0",
+            consensus: CONSENSUS_ENABLED,
+            node_pubkey: this.nodeIdentity?.pubkey || null,
+            current_round: this.currentRound,
+            finalized_seq: this.finalizedSeq,
+            finalized_root: this.finalizedRoot,
+            active_nodes: this.getActiveNodeCount(),
+            pending_events: this.getPendingEventCount(),
+            contracts: contractCount[0]?.c || 0,
+          });
+        }
+      }
+    } catch (e: any) {
+      return this.json({ error: e.message }, 500);
+    }
+  }
+
+  // ─── DO Alarm (round timer) ─────────────────────────────────────────────
+
+  async alarm() {
+    // 1. Fire due cron triggers (works regardless of consensus mode)
+    await this.fireDueTriggers();
+
+    // 2. Process pending oracle requests
+    await this.processPendingOracles();
+
+    if (CONSENSUS_ENABLED && this.nodeIdentity) {
+      // 3. Pull from peers to catch up
+      await this.syncFromPeers();
+
+      // 4. Create vertex for current round if we haven't yet
+      const existing = [...this.state.storage.sql.exec(
+        "SELECT hash FROM dag_vertices WHERE author = ? AND round = ?",
+        this.nodeIdentity.pubkey, this.currentRound,
+      )];
+      if (existing.length === 0) {
+        await this.createAndBroadcastVertex();
+      }
+    }
+
+    // 5. Re-schedule alarm
+    this.scheduleAlarm();
+  }
+
+  private scheduleAlarm() {
+    const now = Date.now();
+    // Use the sooner of: round interval or next trigger fire time
+    const nextTrigger = this.triggerManager.getNextFireTime();
+    const roundTime = now + ROUND_INTERVAL_MS;
+    const alarmTime = nextTrigger ? Math.min(roundTime, Math.max(nextTrigger, now + 1000)) : roundTime;
+    this.state.storage.setAlarm(alarmTime);
+  }
+
+  // ─── DAG Routes ─────────────────────────────────────────────────────────
+
+  private async handleDagRoute(req: Request, url: URL): Promise<Response> {
+    const sql = this.state.storage.sql;
+    switch (url.pathname) {
+      case "/dag/vertex": {
+        if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+        const vertex = await req.json() as DAGVertex;
+        const result = await this.receiveVertex(vertex);
+        return this.json(result, result.ok ? 200 : 400);
+      }
+
+      case "/dag/sync": {
+        const afterRound = parseInt(url.searchParams.get("after_round") || "0");
+        const limit = Math.min(parseInt(url.searchParams.get("limit") || "500"), 500);
+        const vertices = [...this.state.storage.sql.exec(
+          "SELECT hash, author, round, events_json, refs_json, signature, received_at FROM dag_vertices WHERE round > ? ORDER BY round ASC, hash ASC LIMIT ?",
+          afterRound, limit,
+        )].map((r: any) => ({
+          hash: r.hash,
+          author: r.author,
+          round: r.round,
+          events_json: r.events_json,
+          refs_json: r.refs_json,
+          signature: r.signature,
+        }));
+
+        const commits = [...this.state.storage.sql.exec(
+          "SELECT round, anchor_hash, committed_at FROM dag_commits WHERE round > ? ORDER BY round ASC",
+          afterRound,
+        )];
+
+        // Also include recent direct-apply events (for single-node mode)
+        const afterSeq = parseInt(url.searchParams.get("after_seq") || "0");
+        const recentEvents = [...this.state.storage.sql.exec(
+          "SELECT seq, type, payload, pubkey, timestamp FROM events WHERE seq > ? ORDER BY seq ASC LIMIT ?",
+          afterSeq, limit,
+        )].map((r: any) => ({
+          seq: r.seq,
+          type: r.type,
+          payload: typeof r.payload === "string" ? r.payload : JSON.stringify(r.payload),
+          pubkey: r.pubkey,
+          timestamp: r.timestamp,
+        }));
+
+        return this.json({
+          vertices,
+          commits,
+          recent_events: recentEvents,
+          latest_round: this.currentRound,
+          latest_seq: this.latestSeq,
+          finalized_seq: this.finalizedSeq,
+          finalized_root: this.finalizedRoot,
+        });
+      }
+
+      case "/dag/status":
+        return this.json(this.getConsensusStatus());
+
+      // Fetch a committed block by round number (used by ZK prover)
+      case "/dag/block": {
+        const round = parseInt(url.searchParams.get("round") || "0");
+        if (!round) return this.json({ error: "round parameter required" }, 400);
+
+        // Get the committed vertex for this round
+        const commits = [...sql.exec(
+          "SELECT anchor_hash, committed_at FROM dag_commits WHERE round = ?", round
+        )] as any[];
+        if (commits.length === 0) return this.json({ error: "Round not committed" }, 404);
+
+        const anchor = commits[0];
+        const vertices = [...sql.exec(
+          "SELECT hash, author, round, events_json, refs_json, signature FROM dag_vertices WHERE round = ?", round
+        )] as any[];
+
+        // Collect all signatures for this round's vertices
+        const signatures = vertices.map((v: any) => ({
+          pubkey: v.author,
+          signature: v.signature,
+        }));
+
+        // Parse events from the anchor vertex
+        const anchorVertex = vertices.find((v: any) => v.hash === anchor.anchor_hash);
+        let events: any[] = [];
+        if (anchorVertex?.events_json) {
+          try { events = JSON.parse(anchorVertex.events_json); } catch {}
+        }
+
+        return this.json({
+          round,
+          hash: anchor.anchor_hash,
+          committed_at: anchor.committed_at,
+          signatures,
+          events,
+          vertex_count: vertices.length,
+        });
+      }
+
+      // Find the next committed round after a given round (used by ZK prover to skip gaps)
+      case "/dag/next_committed": {
+        const afterRound = parseInt(url.searchParams.get("after") || "0");
+        const nextCommit = [...sql.exec(
+          "SELECT round FROM dag_commits WHERE round > ? ORDER BY round ASC LIMIT 1", afterRound
+        )] as any[];
+        if (nextCommit.length === 0) return this.json({ round: null });
+        return this.json({ round: nextCommit[0].round });
+      }
+
+      // Fetch all vertices for a round with full data (used by ZK prover for canonical JSON reconstruction)
+      case "/dag/vertices": {
+        const vRound = parseInt(url.searchParams.get("round") || "0");
+        if (!vRound) return this.json({ error: "round parameter required" }, 400);
+        const verts = [...sql.exec(
+          "SELECT hash, author, round, events_json, refs_json, signature, timestamp FROM dag_vertices WHERE round = ?", vRound
+        )] as any[];
+        return this.json(verts.map((v: any) => {
+          let event_hashes: string[] = [];
+          try {
+            const events = JSON.parse(v.events_json);
+            event_hashes = events.map((e: any) => e.hash).filter(Boolean);
+          } catch {}
+          let refs: string[] = [];
+          try { refs = JSON.parse(v.refs_json); } catch {}
+          return {
+            hash: v.hash,
+            author: v.author,
+            round: v.round,
+            event_hashes,
+            refs,
+            timestamp: v.timestamp,
+            signature: v.signature,
+          };
+        }));
+      }
+
+      case "/dag/snapshot": {
+        const blocks = [...this.state.storage.sql.exec("SELECT x, z, block_type, placed_by FROM blocks")];
+        const ownership = [...this.state.storage.sql.exec("SELECT asset_id, owner_pubkey, metadata, created_at FROM ownership")];
+        const inventory = [...this.state.storage.sql.exec("SELECT pubkey, item, count FROM inventory WHERE count > 0")];
+        return this.json({
+          finalized_root: this.finalizedRoot,
+          finalized_seq: this.finalizedSeq,
+          last_committed_round: this.lastCommittedRound,
+          state: { blocks, ownership, inventory },
+        });
+      }
+
+      default:
+        return this.json({ error: "Unknown DAG endpoint" }, 404);
+    }
+  }
+
+  // ─── Admin Routes ───────────────────────────────────────────────────────
+
+  private async handleAdminRoute(req: Request, url: URL): Promise<Response> {
+    switch (url.pathname) {
+      case "/admin/register": {
+        if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+        const { pubkey, url: peerUrl, signature } = await req.json() as any;
+
+        // Verify the registration is signed by the claimed pubkey
+        const valid = await verifyNodeSignature(pubkey, signature, JSON.stringify({ pubkey, url: peerUrl }));
+        if (!valid) return this.json({ error: "Invalid signature" }, 400);
+
+        this.state.storage.sql.exec(
+          `INSERT INTO active_nodes (pubkey, url, last_vertex_round, last_seen, is_self)
+           VALUES (?, ?, 0, ?, 0)
+           ON CONFLICT(pubkey) DO UPDATE SET url = ?, last_seen = ?`,
+          pubkey, peerUrl, Date.now(), peerUrl, Date.now(),
+        );
+
+        // Ensure alarm is running now that we have peers
+        this.scheduleAlarm();
+
+        return this.json({ ok: true, peers: this.getActiveNodes() });
+      }
+
+      case "/admin/peers":
+        return this.json({ peers: this.getActiveNodes() });
+
+      default:
+        return this.json({ error: "Unknown admin endpoint" }, 404);
+    }
+  }
+
+  // ─── Contract Routes ────────────────────────────────────────────────────
+
+  private async handleContractRoute(req: Request, url: URL): Promise<Response> {
+    switch (url.pathname) {
+      case "/contract/deploy": {
+        if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+        const body = await req.json() as SignedEvent;
+        body.type = "contract.deploy";
+        return this.json(await this.receiveClientEvent(body));
+      }
+
+      case "/contract/call": {
+        if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+        const body = await req.json() as SignedEvent;
+        body.type = "contract.call";
+        return this.json(await this.receiveClientEvent(body));
+      }
+
+      case "/contract/query": {
+        const address = url.searchParams.get("address");
+        const method = url.searchParams.get("method");
+        if (!address || !method) return this.json({ error: "address and method required" }, 400);
+        const argsB64 = url.searchParams.get("args") || "";
+        const args = argsB64 ? this.b64ToBytes(argsB64) : new Uint8Array();
+
+        const result = await this.contractExecutor.query(address, method, args);
+        return this.json({
+          ok: result.ok,
+          return_data: result.return_data ? btoa(String.fromCharCode(...result.return_data)) : null,
+          logs: result.logs,
+          error: result.error,
+        });
+      }
+
+      case "/contract/info": {
+        const address = url.searchParams.get("address");
+        if (!address) return this.json({ error: "address required" }, 400);
+        const info = this.contractExecutor.getContractInfo(address);
+        if (!info) return this.json({ error: "Contract not found" }, 404);
+        return this.json(info);
+      }
+
+      // ─── Oracle endpoints ───────────────────────────────────────────
+
+      case "/contract/oracle/request": {
+        if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+        const body = await req.json() as any;
+        body.type = "oracle.request";
+        return this.json(await this.receiveClientEvent(body));
+      }
+
+      case "/contract/oracle/status": {
+        const requestId = url.searchParams.get("id");
+        if (!requestId) return this.json({ error: "id required" }, 400);
+        const rows = [...this.state.storage.sql.exec(
+          "SELECT * FROM oracle_requests WHERE id = ?", requestId,
+        )];
+        if (rows.length === 0) return this.json({ error: "Request not found" }, 404);
+        return this.json(rows[0]);
+      }
+
+      // ─── Trigger endpoints ──────────────────────────────────────────
+
+      case "/contract/trigger/create": {
+        if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+        const body = await req.json() as any;
+        body.type = "trigger.create";
+        return this.json(await this.receiveClientEvent(body));
+      }
+
+      case "/contract/trigger/remove": {
+        if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+        const body = await req.json() as any;
+        body.type = "trigger.remove";
+        return this.json(await this.receiveClientEvent(body));
+      }
+
+      case "/contract/trigger/list": {
+        const contract = url.searchParams.get("contract");
+        if (!contract) return this.json({ error: "contract required" }, 400);
+        return this.json({ triggers: this.triggerManager.listForContract(contract) });
+      }
+
+      default:
+        return this.json({ error: "Unknown contract endpoint" }, 404);
+    }
+  }
+
+  // ─── State Proof Routes ─────────────────────────────────────────────────
+
+  private async handleProofRoute(req: Request, url: URL): Promise<Response> {
+    const sql = this.state.storage.sql;
+
+    switch (url.pathname) {
+      case "/proof/commitment": {
+        const commitment = await computeStateCommitment(sql);
+        return this.json(commitment);
+      }
+
+      case "/proof/generate": {
+        const key = url.searchParams.get("key");
+        if (!key) return this.json({ error: "key required" }, 400);
+        const proof = await generateStateProof(sql, key);
+        if (!proof) return this.json({ error: "key not found in state" }, 404);
+        return this.json(proof);
+      }
+
+      case "/proof/verify": {
+        if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+        const proof = await req.json();
+        const valid = await verifyProof(proof);
+        return this.json({ valid });
+      }
+
+      // ─── ZK Proof Endpoints ──────────────────────────────────────────
+      case "/proof/zk/submit": {
+        // Accept a ZK proof from the prover sidecar
+        if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+        const body = await req.json() as any;
+        if (!body.block_number || !body.proof || !body.state_root) {
+          return this.json({ error: "block_number, proof, and state_root required" }, 400);
+        }
+        sql.exec(
+          `INSERT OR REPLACE INTO zk_proofs (block_number, proof_hex, state_root, proven_blocks, proof_type, submitted_at, verified)
+           VALUES (?, ?, ?, ?, ?, ?, 0)`,
+          body.block_number,
+          body.proof,
+          body.state_root,
+          body.proven_blocks || 1,
+          body.proof_type || "compressed",
+          Date.now(),
+        );
+        this.broadcast({ type: "zk.proof_submitted", block_number: body.block_number });
+        return this.json({ ok: true, block_number: body.block_number });
+      }
+
+      case "/proof/zk/latest": {
+        // Get the latest ZK proof
+        const rows = [...sql.exec(
+          "SELECT block_number, state_root, proven_blocks, proof_type, submitted_at, verified FROM zk_proofs ORDER BY block_number DESC LIMIT 1"
+        )] as any[];
+        if (rows.length === 0) return this.json({ error: "No ZK proofs available" }, 404);
+        return this.json(rows[0]);
+      }
+
+      case "/proof/zk/get": {
+        // Get a specific ZK proof by block number (includes the full proof hex)
+        const blockNum = url.searchParams.get("block");
+        if (!blockNum) return this.json({ error: "block parameter required" }, 400);
+        const rows = [...sql.exec(
+          "SELECT * FROM zk_proofs WHERE block_number = ?", parseInt(blockNum)
+        )] as any[];
+        if (rows.length === 0) return this.json({ error: "Proof not found" }, 404);
+        return this.json(rows[0]);
+      }
+
+      case "/proof/zk/status": {
+        // Summary of ZK proof coverage
+        const latest = [...sql.exec(
+          "SELECT MAX(block_number) as latest_block, MAX(proven_blocks) as max_chain_length FROM zk_proofs"
+        )] as any[];
+        const count = [...sql.exec("SELECT COUNT(*) as total FROM zk_proofs")] as any[];
+        return this.json({
+          total_proofs: count[0]?.total || 0,
+          latest_proven_block: latest[0]?.latest_block || null,
+          max_chain_length: latest[0]?.max_chain_length || 0,
+          last_committed_round: this.lastCommittedRound,
+          proof_gap: (this.lastCommittedRound || 0) - (latest[0]?.latest_block || 0),
+        });
+      }
+
+      default:
+        return this.json({ error: "Unknown proof endpoint" }, 404);
+    }
+  }
+
+  // ─── Cross-Shard Routes ─────────────────────────────────────────────────
+
+  private async handleCrossShardRoute(req: Request, url: URL): Promise<Response> {
+    const sql = this.state.storage.sql;
+
+    switch (url.pathname) {
+      case "/xshard/send": {
+        // Send a cross-shard message (queued in outbox for Worker to relay)
+        if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+        const body = await req.json() as any;
+
+        const stateRoot = CONSENSUS_ENABLED ? this.finalizedRoot : this.currentRoot;
+        const msg = await createCrossShardMessage(
+          this.shardName, body.target_shard, body.type, body.payload,
+          stateRoot, body.sender_pubkey || "",
+        );
+
+        const validation = validateMessage(msg);
+        if (!validation.ok) return this.json(validation, 400);
+
+        sql.exec(
+          `INSERT INTO xshard_outbox (id, target_shard, message_json, status, created_at)
+           VALUES (?, ?, ?, 'pending', ?)`,
+          msg.id, msg.target_shard, JSON.stringify(msg), Date.now(),
+        );
+
+        this.broadcast({ type: "xshard.queued", message_id: msg.id, target: msg.target_shard });
+        return this.json({ ok: true, message_id: msg.id });
+      }
+
+      case "/xshard/receive": {
+        // Receive a cross-shard message (called by Worker relay)
+        if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+        const msg = await req.json() as CrossShardMessage;
+
+        const validation = validateMessage(msg);
+        if (!validation.ok) return this.json(validation, 400);
+
+        // Deduplicate
+        const existing = [...sql.exec("SELECT id FROM xshard_inbox WHERE id = ?", msg.id)];
+        if (existing.length > 0) return this.json({ ok: true, status: "already_received" });
+
+        sql.exec(
+          `INSERT INTO xshard_inbox (id, source_shard, message_json, status, received_at)
+           VALUES (?, ?, ?, 'pending', ?)`,
+          msg.id, msg.source_shard, JSON.stringify(msg), Date.now(),
+        );
+
+        // Process the message
+        const receipt = await this.processInboundMessage(msg);
+        return this.json(receipt);
+      }
+
+      case "/xshard/outbox": {
+        // List pending outbound messages (for Worker relay to pick up)
+        const status = url.searchParams.get("status") || "pending";
+        const rows = [...sql.exec(
+          "SELECT id, target_shard, message_json, status, created_at FROM xshard_outbox WHERE status = ? ORDER BY created_at ASC LIMIT 50",
+          status,
+        )];
+        return this.json({ messages: rows });
+      }
+
+      case "/xshard/inbox": {
+        const rows = [...sql.exec(
+          "SELECT id, source_shard, status, received_at, processed_at FROM xshard_inbox ORDER BY received_at DESC LIMIT 50",
+        )];
+        return this.json({ messages: rows });
+      }
+
+      case "/xshard/ack": {
+        // Mark outbox message as delivered (Worker confirms delivery)
+        if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+        const { message_id, status } = await req.json() as any;
+        sql.exec(
+          "UPDATE xshard_outbox SET status = ?, delivered_at = ? WHERE id = ?",
+          status || "delivered", Date.now(), message_id,
+        );
+        return this.json({ ok: true });
+      }
+
+      default:
+        return this.json({ error: "Unknown xshard endpoint" }, 404);
+    }
+  }
+
+  private async processInboundMessage(msg: CrossShardMessage): Promise<CrossShardReceipt> {
+    const stateRoot = CONSENSUS_ENABLED ? this.finalizedRoot : this.currentRoot;
+
+    try {
+      switch (msg.type) {
+        case "token.transfer": {
+          // Cross-shard token transfer: credit tokens on this shard
+          // payload: { token_contract, token_id, to, amount }
+          const { token_contract, token_id, to, amount } = msg.payload;
+          if (token_contract) {
+            const args = JSON.stringify({ token_id, to, amount: String(amount) });
+            const argsBytes = new TextEncoder().encode(args);
+            await this.contractExecutor.call(token_contract, "mint", argsBytes, `xshard:${msg.source_shard}`, 1_000_000);
+          }
+          break;
+        }
+
+        case "contract.call": {
+          // Cross-shard contract call
+          const { contract, method, args_b64 } = msg.payload;
+          const args = args_b64 ? this.b64ToBytes(args_b64) : new Uint8Array();
+          await this.contractExecutor.call(contract, method, args, `xshard:${msg.source_shard}`, 1_000_000);
+          break;
+        }
+
+        case "state.sync": {
+          // State synchronization request — respond with current state
+          break;
+        }
+      }
+
+      this.state.storage.sql.exec(
+        "UPDATE xshard_inbox SET status = 'processed', processed_at = ? WHERE id = ?",
+        Date.now(), msg.id,
+      );
+
+      this.broadcast({ type: "xshard.processed", message_id: msg.id, source: msg.source_shard });
+
+      return {
+        message_id: msg.id,
+        status: "delivered",
+        target_state_root: stateRoot,
+        timestamp: Date.now(),
+      };
+    } catch (e: any) {
+      this.state.storage.sql.exec(
+        "UPDATE xshard_inbox SET status = 'failed', processed_at = ? WHERE id = ?",
+        Date.now(), msg.id,
+      );
+
+      return {
+        message_id: msg.id,
+        status: "failed",
+        error: e.message,
+        target_state_root: stateRoot,
+        timestamp: Date.now(),
+      };
+    }
+  }
+
+  // ─── WebSocket ───────────────────────────────────────────────────────────
+
+  private handleWebSocket(ws: WebSocket) {
+    ws.accept();
+    this.sockets.set(ws, { channels: new Set(), isValidator: false });
+
+    ws.addEventListener("message", async (event) => {
+      try {
+        const msg = JSON.parse(event.data as string);
+        await this.handleWsMessage(ws, msg);
+      } catch (e: any) {
+        ws.send(JSON.stringify({ type: "error", message: e.message }));
+      }
+    });
+
+    ws.addEventListener("close", () => this.sockets.delete(ws));
+    ws.addEventListener("error", () => this.sockets.delete(ws));
+  }
+
+  private async handleWsMessage(ws: WebSocket, msg: any) {
+    const meta = this.sockets.get(ws);
+
+    if (msg.type === "join") {
+      if (msg.pubkey && meta) meta.pubkey = msg.pubkey;
+      if (msg.pubkey) this.ensureStartingInventory(msg.pubkey);
+      const blocks = [...this.state.storage.sql.exec("SELECT x, z, block_type FROM blocks")];
+      const inventory = msg.pubkey ? this.getPlayerInventory(msg.pubkey) : {};
+
+      ws.send(JSON.stringify({
+        type: "state",
+        blocks,
+        inventory,
+        root: CONSENSUS_ENABLED ? this.finalizedRoot : this.currentRoot,
+        seq: CONSENSUS_ENABLED ? this.finalizedSeq : this.latestSeq,
+        consensus: CONSENSUS_ENABLED ? {
+          round: this.currentRound,
+          active_nodes: this.getActiveNodeCount(),
+          node_pubkey: this.nodeIdentity?.pubkey,
+        } : undefined,
+      }));
+
+      if (CONSENSUS_ENABLED) this.scheduleAlarm();
+      return;
+    }
+
+    if (msg.type === "submit") {
+      const result = await this.receiveClientEvent(msg.event as SignedEvent);
+      ws.send(JSON.stringify({ type: "result", ...result }));
+      return;
+    }
+
+    // Subscribe to push channels: dag, status, peers, zk
+    if (msg.type === "subscribe") {
+      if (meta && Array.isArray(msg.channels)) {
+        for (const ch of msg.channels) meta.channels.add(ch);
+      }
+      ws.send(JSON.stringify({ type: "subscribed", channels: Array.from(meta?.channels || []) }));
+      return;
+    }
+
+    // Validator registration via WS
+    if (msg.type === "register") {
+      const valid = await verifyNodeSignature(msg.pubkey, msg.signature, JSON.stringify({ pubkey: msg.pubkey, url: msg.url || "" }));
+      if (!valid) {
+        ws.send(JSON.stringify({ type: "register.result", ok: false, error: "Invalid signature" }));
+        return;
+      }
+      this.state.storage.sql.exec(
+        `INSERT INTO active_nodes (pubkey, url, last_vertex_round, last_seen, is_self)
+         VALUES (?, ?, 0, ?, 0)
+         ON CONFLICT(pubkey) DO UPDATE SET url = ?, last_seen = ?`,
+        msg.pubkey, msg.url || "", Date.now(), msg.url || "", Date.now(),
+      );
+      if (meta) { meta.isValidator = true; meta.pubkey = msg.pubkey; }
+      this.scheduleAlarm();
+      const peers = this.getActiveNodes();
+      ws.send(JSON.stringify({ type: "register.result", ok: true, peers }));
+      this.broadcastToChannel("peers", { type: "peers.update", peers });
+      return;
+    }
+
+    // Submit vertex via WS (replaces POST /dag/vertex)
+    if (msg.type === "vertex") {
+      const vertex = msg as DAGVertex;
+      const result = await this.receiveVertex(vertex);
+      ws.send(JSON.stringify({ type: "vertex.result", ...result }));
+      return;
+    }
+
+    // Request DAG sync (one-time pull, replaces GET /dag/sync)
+    if (msg.type === "sync") {
+      const sql = this.state.storage.sql;
+      const afterRound = msg.after_round || 0;
+      const limit = Math.min(msg.limit || 500, 500);
+      const vertices = [...sql.exec(
+        "SELECT hash, author, round, events_json, refs_json, signature, received_at FROM dag_vertices WHERE round > ? ORDER BY round ASC, hash ASC LIMIT ?",
+        afterRound, limit,
+      )].map((r: any) => ({
+        hash: r.hash, author: r.author, round: r.round,
+        events_json: r.events_json, refs_json: r.refs_json, signature: r.signature,
+      }));
+      const commits = [...sql.exec(
+        "SELECT round, anchor_hash, committed_at FROM dag_commits WHERE round > ? ORDER BY round ASC",
+        afterRound,
+      )];
+      ws.send(JSON.stringify({
+        type: "sync.result", vertices, commits,
+        latest_round: this.currentRound, finalized_seq: this.finalizedSeq,
+      }));
+      return;
+    }
+
+    // Request status (one-time, replaces GET /dag/status)
+    if (msg.type === "status") {
+      ws.send(JSON.stringify({ type: "status.result", ...this.getConsensusStatus() }));
+      return;
+    }
+
+    ws.send(JSON.stringify({ type: "error", message: "Unknown message type" }));
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // CONSENSUS ENGINE
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // ─── Receive Client Event (→ pending pool) ──────────────────────────────
+
+  private async receiveClientEvent(
+    event: SignedEvent,
+  ): Promise<{ ok: boolean; seq?: number; pending?: boolean; error?: string }> {
+    // 1. Verify signature
+    const valid = await this.verifySignature(event);
+    if (!valid) return { ok: false, error: "Invalid signature" };
+
+    // 2. Compute event hash
+    const eventHash = await computeEventHash(event);
+
+    // 3. Check if already finalized
+    const finalized = [...this.state.storage.sql.exec(
+      "SELECT consensus_seq FROM consensus_events WHERE event_hash = ?", eventHash,
+    )];
+    if (finalized.length > 0) return { ok: true, seq: finalized[0].consensus_seq as number };
+
+    // 4. Check if already pending
+    const pending = [...this.state.storage.sql.exec(
+      "SELECT hash FROM pending_events WHERE hash = ?", eventHash,
+    )];
+    if (pending.length > 0) return { ok: true, pending: true };
+
+    if (CONSENSUS_ENABLED && this.getActiveNodeCount() >= MIN_NODES_FOR_CONSENSUS) {
+      // Consensus mode: validate rules optimistically, add to pending pool
+      const ruleCheck = this.validateRules(event);
+      if (!ruleCheck.ok) return ruleCheck;
+
+      this.state.storage.sql.exec(
+        "INSERT OR IGNORE INTO pending_events (hash, type, payload, pubkey, signature, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+        eventHash,
+        event.type,
+        typeof event.payload === "string" ? event.payload : JSON.stringify(event.payload),
+        event.pubkey,
+        event.signature,
+        event.timestamp,
+      );
+
+      // Broadcast optimistic update to clients
+      const payload = typeof event.payload === "string" ? JSON.parse(event.payload) : event.payload;
+      this.broadcast({
+        type: "pending",
+        event: { type: event.type, payload, pubkey: event.pubkey, hash: eventHash },
+      });
+
+      // Try to create a vertex immediately if we have pending events
+      await this.maybeCreateVertex();
+
+      return { ok: true, pending: true };
+    } else {
+      // Fallback: direct apply (no consensus, legacy mode)
+      return this.directApplyEvent(event, eventHash);
+    }
+  }
+
+  // ─── Direct Apply (legacy / single-node mode) ──────────────────────────
+
+  private async directApplyEvent(
+    event: SignedEvent,
+    eventHash: string,
+  ): Promise<{ ok: boolean; seq?: number; error?: string }> {
+    const ruleCheck = this.validateRules(event);
+    if (!ruleCheck.ok) return ruleCheck;
+
+    // Deduplicate
+    const existing = [...this.state.storage.sql.exec("SELECT seq FROM events WHERE hash = ?", eventHash)];
+    if (existing.length > 0) return { ok: true, seq: existing[0].seq as number };
+
+    // Append to legacy events table
+    this.state.storage.sql.exec(
+      "INSERT INTO events (type, payload, pubkey, signature, timestamp, hash) VALUES (?, ?, ?, ?, ?, ?)",
+      event.type,
+      typeof event.payload === "string" ? event.payload : JSON.stringify(event.payload),
+      event.pubkey, event.signature, event.timestamp, eventHash,
+    );
+
+    const seqRows = [...this.state.storage.sql.exec("SELECT MAX(seq) as seq FROM events")];
+    const newSeq = seqRows[0].seq as number;
+    this.latestSeq = newSeq;
+
+    const payload = typeof event.payload === "string" ? JSON.parse(event.payload) : event.payload;
+    await this.applyEvent(event.type, payload, event.pubkey);
+    this.currentRoot = await sha256(this.currentRoot + eventHash);
+
+    this.broadcast({
+      type: "event.finalized",
+      event: { type: event.type, payload, pubkey: event.pubkey, seq: newSeq, hash: eventHash },
+    });
+    this.broadcastToChannel("status", { type: "status.update", ...this.getConsensusStatus() });
+
+    return { ok: true, seq: newSeq };
+  }
+
+  // ─── Vertex Creation ────────────────────────────────────────────────────
+
+  private async maybeCreateVertex() {
+    if (!this.nodeIdentity) return;
+
+    // Don't create if we already have a vertex this round
+    const existing = [...this.state.storage.sql.exec(
+      "SELECT hash FROM dag_vertices WHERE author = ? AND round = ?",
+      this.nodeIdentity.pubkey, this.currentRound,
+    )];
+    if (existing.length > 0) return;
+
+    await this.createAndBroadcastVertex();
+  }
+
+  private async createAndBroadcastVertex() {
+    if (!this.nodeIdentity) return;
+
+    // Gather pending events
+    const pendingRows = [...this.state.storage.sql.exec(
+      "SELECT hash, type, payload, pubkey, signature, timestamp FROM pending_events ORDER BY timestamp ASC LIMIT 100",
+    )];
+
+    const events: SignedEvent[] = pendingRows.map((r: any) => ({
+      type: r.type,
+      payload: JSON.parse(r.payload),
+      pubkey: r.pubkey,
+      signature: r.signature,
+      timestamp: r.timestamp,
+    }));
+    const eventHashes: string[] = pendingRows.map((r: any) => r.hash);
+
+    // Get strong parents: vertices from previous round
+    const refs = this.getStrongParents();
+
+    const vertex: DAGVertex = {
+      author: this.nodeIdentity.pubkey,
+      round: this.currentRound,
+      event_hashes: eventHashes,
+      events,
+      refs,
+      timestamp: Date.now(),
+      signature: "",
+    };
+
+    vertex.signature = await signVertex(this.nodeIdentity, vertex);
+    const vHash = await computeVertexHash(vertex);
+
+    // Store locally
+    this.storeVertex(vHash, vertex);
+
+    // Clear pending events that were included
+    for (const h of eventHashes) {
+      this.state.storage.sql.exec("DELETE FROM pending_events WHERE hash = ?", h);
+    }
+
+    // Try round advancement + commits
+    this.tryAdvanceRound();
+    await this.tryCommitRounds();
+
+    // Broadcast to peers
+    await this.broadcastVertexToPeers(vertex);
+  }
+
+  private getStrongParents(): string[] {
+    if (this.currentRound === 0) return [];
+    const prevVertices = [...this.state.storage.sql.exec(
+      "SELECT hash FROM dag_vertices WHERE round = ? ORDER BY hash ASC",
+      this.currentRound - 1,
+    )];
+    return prevVertices.map((r: any) => r.hash as string);
+  }
+
+  // ─── Vertex Reception ───────────────────────────────────────────────────
+
+  private async receiveVertex(vertex: DAGVertex): Promise<{ ok: boolean; error?: string }> {
+    // 1. Verify vertex signature
+    const validSig = await verifyVertexSignature(vertex);
+    if (!validSig) return { ok: false, error: "Invalid vertex signature" };
+
+    // 2. Verify all contained events' signatures
+    for (const event of vertex.events) {
+      const validEvent = await this.verifySignature(event);
+      if (!validEvent) return { ok: false, error: "Invalid event signature in vertex" };
+    }
+
+    // 3. Reject if too far ahead
+    if (vertex.round > this.currentRound + 5) {
+      return { ok: false, error: "Vertex round too far ahead" };
+    }
+
+    // 4. Compute hash and check for duplicate
+    const vHash = await computeVertexHash(vertex);
+    const existing = [...this.state.storage.sql.exec(
+      "SELECT hash FROM dag_vertices WHERE hash = ?", vHash,
+    )];
+    if (existing.length > 0) return { ok: true }; // idempotent
+
+    // 5. Check for equivocation (same author, same round)
+    const equivocation = [...this.state.storage.sql.exec(
+      "SELECT hash FROM dag_vertices WHERE author = ? AND round = ?",
+      vertex.author, vertex.round,
+    )];
+    if (equivocation.length > 0) {
+      console.warn(`Equivocation detected: ${vertex.author} at round ${vertex.round}`);
+      return { ok: false, error: "Equivocation: duplicate vertex for same round" };
+    }
+
+    // 6. Store
+    this.storeVertex(vHash, vertex);
+
+    // 6b. Broadcast vertex to all WS clients (with hash for ref tracking)
+    this.broadcast({
+      type: "vertex.new",
+      hash: vHash,
+      author: vertex.author,
+      round: vertex.round,
+      event_hashes: vertex.event_hashes,
+      refs: vertex.refs,
+      timestamp: vertex.timestamp,
+    });
+
+    // 7. Update active_nodes
+    this.state.storage.sql.exec(
+      `INSERT INTO active_nodes (pubkey, url, last_vertex_round, last_seen, is_self)
+       VALUES (?, '', ?, ?, 0)
+       ON CONFLICT(pubkey) DO UPDATE SET last_vertex_round = MAX(last_vertex_round, ?), last_seen = ?`,
+      vertex.author, vertex.round, Date.now(), vertex.round, Date.now(),
+    );
+
+    // 8. Try round advancement + commits
+    this.tryAdvanceRound();
+    await this.tryCommitRounds();
+
+    // 9. DO should also produce a vertex if it hasn't for this round
+    await this.maybeCreateVertex();
+
+    // Push status update to subscribers (replaces client polling)
+    this.broadcastToChannel("status", { type: "status.update", ...this.getConsensusStatus() });
+
+    return { ok: true };
+  }
+
+  private storeVertex(hash: string, vertex: DAGVertex) {
+    const sql = this.state.storage.sql;
+
+    sql.exec(
+      "INSERT OR IGNORE INTO dag_vertices (hash, author, round, events_json, refs_json, signature, received_at, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      hash,
+      vertex.author,
+      vertex.round,
+      JSON.stringify(vertex.events.map((e, i) => ({ ...e, hash: vertex.event_hashes[i] }))),
+      JSON.stringify(vertex.refs),
+      vertex.signature,
+      Date.now(),
+      vertex.timestamp,
+    );
+
+    // Materialized edges
+    for (const ref of vertex.refs) {
+      sql.exec(
+        "INSERT OR IGNORE INTO dag_edges (parent_hash, child_hash) VALUES (?, ?)",
+        ref, hash,
+      );
+    }
+  }
+
+  // ─── Round Advancement ──────────────────────────────────────────────────
+
+  private tryAdvanceRound() {
+    const activeCount = this.getActiveNodeCount();
+    if (activeCount < MIN_NODES_FOR_CONSENSUS) return;
+
+    const quorum = getQuorumSize(activeCount);
+
+    // Count distinct authors with vertices at current round
+    const countRows = [...this.state.storage.sql.exec(
+      "SELECT COUNT(DISTINCT author) as cnt FROM dag_vertices WHERE round = ?",
+      this.currentRound,
+    )];
+    const count = (countRows[0]?.cnt ?? 0) as number;
+
+    if (count >= quorum) {
+      this.currentRound++;
+      this.setKV("current_round", this.currentRound.toString());
+    }
+  }
+
+  // ─── Commit Rule ────────────────────────────────────────────────────────
+
+  private async tryCommitRounds() {
+    const activeCount = this.getActiveNodeCount();
+    if (activeCount < MIN_NODES_FOR_CONSENSUS) return;
+
+    // Check all uncommitted even rounds
+    for (let r = this.lastCommittedRound + 2; r <= this.currentRound - 1; r += 2) {
+      // Already committed?
+      const existing = [...this.state.storage.sql.exec(
+        "SELECT round FROM dag_commits WHERE round = ?", r,
+      )];
+      if (existing.length > 0) continue;
+
+      // Build vertex data for this round and next
+      const verticesByRound = new Map<number, VertexNode[]>();
+      for (const roundNum of [r, r + 1]) {
+        const rows = [...this.state.storage.sql.exec(
+          "SELECT hash, author, round, events_json, refs_json FROM dag_vertices WHERE round = ?",
+          roundNum,
+        )];
+        verticesByRound.set(roundNum, rows.map((row: any) => ({
+          hash: row.hash,
+          author: row.author,
+          round: row.round,
+          event_hashes: JSON.parse(row.events_json).map((e: any) => e.hash),
+          refs: JSON.parse(row.refs_json),
+        })));
+      }
+
+      // Get active pubkeys for leader selection
+      const activePubkeys = this.getActivePubkeys();
+      const leader = await selectLeader(r, activePubkeys);
+
+      const result = checkCommit(r, leader, verticesByRound, activeCount);
+      if (result.committed && result.anchorHash) {
+        await this.commitAnchor(r, result.anchorHash);
+      }
+    }
+  }
+
+  private async commitAnchor(round: number, anchorHash: string) {
+    const sql = this.state.storage.sql;
+
+    // Record commit
+    sql.exec(
+      "INSERT OR IGNORE INTO dag_commits (round, anchor_hash, committed_at) VALUES (?, ?, ?)",
+      round, anchorHash, Date.now(),
+    );
+
+    // Build vertex map for topological sort
+    const allVertices = [...sql.exec(
+      "SELECT hash, author, round, events_json, refs_json FROM dag_vertices WHERE round <= ?",
+      round,
+    )];
+    const vertexMap = new Map<string, VertexNode>();
+    for (const row of allVertices as any[]) {
+      const events = JSON.parse(row.events_json);
+      vertexMap.set(row.hash, {
+        hash: row.hash,
+        author: row.author,
+        round: row.round,
+        event_hashes: events.map((e: any) => e.hash),
+        refs: JSON.parse(row.refs_json),
+      });
+    }
+
+    // Get already-finalized vertex hashes
+    const finalizedVertices = new Set<string>(
+      [...sql.exec("SELECT DISTINCT vertex_hash FROM consensus_events")].map((r: any) => r.vertex_hash),
+    );
+
+    // Topological sort from anchor
+    const orderedVertices = topologicalSort(anchorHash, vertexMap, finalizedVertices);
+
+    // Extract and apply events in order
+    for (const vNode of orderedVertices) {
+      const vRow = [...sql.exec("SELECT events_json FROM dag_vertices WHERE hash = ?", vNode.hash)];
+      if (vRow.length === 0) continue;
+      const events = JSON.parse((vRow[0] as any).events_json);
+
+      for (const event of events) {
+        const eventHash = event.hash || await computeEventHash(event);
+
+        // Skip already finalized
+        const alreadyFinal = [...sql.exec(
+          "SELECT consensus_seq FROM consensus_events WHERE event_hash = ?", eventHash,
+        )];
+        if (alreadyFinal.length > 0) continue;
+
+        // Validate rules against current finalized state
+        const ruleCheck = this.validateRules(event);
+        if (!ruleCheck.ok) continue; // skip invalid
+
+        // Apply to state
+        const payload = typeof event.payload === "string" ? JSON.parse(event.payload) : event.payload;
+        await this.applyEvent(event.type, payload, event.pubkey);
+
+        // Record in consensus log
+        this.finalizedSeq++;
+        sql.exec(
+          "INSERT OR IGNORE INTO consensus_events (event_hash, vertex_hash, round, finalized_at) VALUES (?, ?, ?, ?)",
+          eventHash, vNode.hash, round, Date.now(),
+        );
+
+        // Also append to legacy events table
+        sql.exec(
+          "INSERT OR IGNORE INTO events (type, payload, pubkey, signature, timestamp, hash) VALUES (?, ?, ?, ?, ?, ?)",
+          event.type,
+          typeof event.payload === "string" ? event.payload : JSON.stringify(event.payload),
+          event.pubkey, event.signature, event.timestamp, eventHash,
+        );
+        this.latestSeq++;
+
+        // Advance finalized root
+        this.finalizedRoot = await sha256(this.finalizedRoot + eventHash);
+
+        // Broadcast finality to clients
+        this.broadcast({
+          type: "finalized",
+          event: { type: event.type, payload, pubkey: event.pubkey, hash: eventHash, consensus_seq: this.finalizedSeq },
+        });
+      }
+    }
+
+    // Remove finalized events from pending pool
+    sql.exec(
+      "DELETE FROM pending_events WHERE hash IN (SELECT event_hash FROM consensus_events)",
+    );
+
+    // Update state
+    this.lastCommittedRound = round;
+    this.setKV("last_committed_round", round.toString());
+    this.setKV("finalized_seq", this.finalizedSeq.toString());
+    this.setKV("finalized_root", this.finalizedRoot);
+
+    // Anchor root periodically
+    if (this.finalizedSeq > 0 && this.finalizedSeq % 100 === 0) {
+      sql.exec(
+        "INSERT INTO roots (root, seq, timestamp) VALUES (?, ?, ?)",
+        this.finalizedRoot, this.finalizedSeq, Date.now(),
+      );
+    }
+
+    // Broadcast commit notification
+    this.broadcast({
+      type: "commit",
+      round,
+      finalized_seq: this.finalizedSeq,
+      root: this.finalizedRoot,
+    });
+
+    console.log(`Committed round=${round} anchor=${anchorHash.slice(0, 12)} seq=${this.finalizedSeq}`);
+  }
+
+  // ─── Peer Communication ─────────────────────────────────────────────────
+
+  private async broadcastVertexToPeers(vertex: DAGVertex) {
+    // First, push to all validators connected via WebSocket
+    const wsPeers = new Set<string>();
+    for (const [ws, meta] of this.sockets) {
+      if (meta.isValidator && meta.pubkey !== vertex.author) {
+        try {
+          ws.send(JSON.stringify({ type: "vertex.new", ...vertex }));
+          if (meta.pubkey) wsPeers.add(meta.pubkey);
+        } catch { this.sockets.delete(ws); }
+      }
+    }
+
+    // Fall back to HTTP for peers with URLs but no active WS connection
+    const peers = this.getActiveNodes().filter(n => !n.is_self && n.url && !wsPeers.has(n.pubkey));
+    for (const peer of peers) {
+      try {
+        await fetch(`${peer.url}/dag/vertex`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(vertex),
+        });
+      } catch {
+        // peer unreachable
+      }
+    }
+  }
+
+  private async syncFromPeers() {
+    const peers = this.getActiveNodes().filter(n => !n.is_self && n.url);
+    for (const peer of peers) {
+      try {
+        const res = await fetch(
+          `${peer.url}/dag/sync?after_round=${Math.max(0, this.currentRound - ACTIVE_WINDOW)}`,
+        );
+        if (!res.ok) continue;
+        const data = await res.json() as any;
+
+        for (const v of data.vertices || []) {
+          // Reconstruct DAGVertex from sync data
+          const vertex: DAGVertex = {
+            author: v.author,
+            round: v.round,
+            event_hashes: JSON.parse(v.events_json).map((e: any) => e.hash || ""),
+            events: JSON.parse(v.events_json),
+            refs: JSON.parse(v.refs_json),
+            timestamp: 0,
+            signature: v.signature,
+          };
+          await this.receiveVertex(vertex);
+        }
+        break; // synced from one peer is enough
+      } catch {
+        // try next peer
+      }
+    }
+  }
+
+  // ─── Active Node Tracking ───────────────────────────────────────────────
+
+  private getActiveNodeCount(): number {
+    const minRound = Math.max(0, this.currentRound - ACTIVE_WINDOW);
+    const rows = [...this.state.storage.sql.exec(
+      "SELECT COUNT(*) as cnt FROM active_nodes WHERE last_vertex_round >= ? OR is_self = 1",
+      minRound,
+    )];
+    return Math.max((rows[0]?.cnt ?? 0) as number, 1);
+  }
+
+  private getActivePubkeys(): string[] {
+    const minRound = Math.max(0, this.currentRound - ACTIVE_WINDOW);
+    return [...this.state.storage.sql.exec(
+      "SELECT pubkey FROM active_nodes WHERE last_vertex_round >= ? OR is_self = 1 ORDER BY pubkey",
+      minRound,
+    )].map((r: any) => r.pubkey as string);
+  }
+
+  private getActiveNodes(): { pubkey: string; url: string; last_vertex_round: number; is_self: boolean }[] {
+    return [...this.state.storage.sql.exec(
+      "SELECT pubkey, url, last_vertex_round, is_self FROM active_nodes ORDER BY pubkey",
+    )].map((r: any) => ({
+      pubkey: r.pubkey,
+      url: r.url,
+      last_vertex_round: r.last_vertex_round,
+      is_self: !!r.is_self,
+    }));
+  }
+
+  private getConsensusStatus(): ConsensusStatus {
+    // In single-node / direct-apply mode, report latestSeq as finalized
+    const effectiveSeq = this.finalizedSeq > 0 ? this.finalizedSeq : this.latestSeq;
+    const effectiveRoot = this.finalizedRoot || this.currentRoot;
+    return {
+      node_pubkey: this.nodeIdentity?.pubkey || "",
+      current_round: this.currentRound,
+      finalized_seq: effectiveSeq,
+      finalized_root: effectiveRoot,
+      last_committed_round: this.lastCommittedRound,
+      active_nodes: this.getActiveNodeCount(),
+      pending_events: this.getPendingEventCount(),
+    };
+  }
+
+  private getPendingEventCount(): number {
+    const rows = [...this.state.storage.sql.exec("SELECT COUNT(*) as cnt FROM pending_events")];
+    return (rows[0]?.cnt ?? 0) as number;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // GAME LOGIC (unchanged from v0.2)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // ─── Signature Verification (player events) ─────────────────────────────
+
+  private async verifySignature(event: SignedEvent): Promise<boolean> {
+    try {
+      const pubKeyBytes = this.b64ToBytes(event.pubkey);
+      const signatureBytes = this.b64ToBytes(event.signature);
+      const dataToVerify = JSON.stringify({
+        type: event.type,
+        payload: typeof event.payload === "string" ? JSON.parse(event.payload) : event.payload,
+        timestamp: event.timestamp,
+      });
+      const dataBytes = new TextEncoder().encode(dataToVerify);
+      const key = await crypto.subtle.importKey("raw", pubKeyBytes, "Ed25519", false, ["verify"]);
+      return await crypto.subtle.verify("Ed25519", key, signatureBytes, dataBytes);
+    } catch {
+      return false;
+    }
+  }
+
+  // ─── Rule Validation ────────────────────────────────────────────────────
+
+  private validateRules(event: SignedEvent): { ok: boolean; error?: string } {
+    const payload = typeof event.payload === "string" ? JSON.parse(event.payload) : event.payload;
+    const pubkey = event.pubkey;
+
+    switch (event.type) {
+      case "place": {
+        const item = this.blockTypeToItem(payload.block);
+        if (this.getItemCount(pubkey, item) <= 0) {
+          return { ok: false, error: `Not enough ${item} in inventory` };
+        }
+        return { ok: true };
+      }
+      case "break": {
+        const block = [...this.state.storage.sql.exec(
+          "SELECT block_type FROM blocks WHERE x = ? AND z = ?", payload.x, payload.z,
+        )];
+        if (block.length === 0) return { ok: false, error: "No block at position" };
+        return { ok: true };
+      }
+      case "transfer": {
+        const owner = [...this.state.storage.sql.exec(
+          "SELECT owner_pubkey FROM ownership WHERE asset_id = ?", payload.assetId,
+        )];
+        if (owner.length === 0 || owner[0].owner_pubkey !== pubkey) {
+          return { ok: false, error: "Not the owner of this asset" };
+        }
+        return { ok: true };
+      }
+      case "craft":
+        return this.validateCraftRecipe(pubkey, payload.recipe);
+      case "contract.deploy": {
+        if (!payload.wasm_b64) return { ok: false, error: "Missing wasm_b64" };
+        const wasmBytes = this.b64ToBytes(payload.wasm_b64);
+        if (wasmBytes.length > 1_048_576) return { ok: false, error: "WASM too large (max 1MB)" };
+        return { ok: true };
+      }
+      case "contract.call": {
+        if (!payload.contract || !payload.method) return { ok: false, error: "Missing contract/method" };
+        const rows = [...this.state.storage.sql.exec("SELECT 1 FROM contracts WHERE address = ?", payload.contract)];
+        if (rows.length === 0) return { ok: false, error: "Contract not found" };
+        return { ok: true };
+      }
+      case "oracle.request": {
+        if (!payload.contract || !payload.callback_method || !payload.url) {
+          return { ok: false, error: "Missing contract, callback_method, or url" };
+        }
+        const agg = payload.aggregation || "identical";
+        if (!["identical", "median", "majority"].includes(agg)) {
+          return { ok: false, error: `Invalid aggregation: ${agg}` };
+        }
+        // Verify the contract exists
+        const cRows = [...this.state.storage.sql.exec("SELECT 1 FROM contracts WHERE address = ?", payload.contract)];
+        if (cRows.length === 0) return { ok: false, error: "Contract not found" };
+        return { ok: true };
+      }
+      case "trigger.create": {
+        if (!payload.contract || !payload.method || !payload.interval_ms) {
+          return { ok: false, error: "Missing contract, method, or interval_ms" };
+        }
+        if (payload.interval_ms < MIN_INTERVAL_MS || payload.interval_ms > MAX_INTERVAL_MS) {
+          return { ok: false, error: `interval_ms must be between ${MIN_INTERVAL_MS} and ${MAX_INTERVAL_MS}` };
+        }
+        const tRows = [...this.state.storage.sql.exec("SELECT 1 FROM contracts WHERE address = ?", payload.contract)];
+        if (tRows.length === 0) return { ok: false, error: "Contract not found" };
+        return { ok: true };
+      }
+      case "trigger.remove": {
+        if (!payload.trigger_id) return { ok: false, error: "Missing trigger_id" };
+        return { ok: true };
+      }
+      case "oracle.response":
+        // System-generated — always valid if it reaches here
+        return { ok: true };
+      default:
+        return { ok: false, error: `Unknown event type: ${event.type}` };
+    }
+  }
+
+  // ─── State Mutation ─────────────────────────────────────────────────────
+
+  private async applyEvent(type: string, payload: any, pubkey: string) {
+    const sql = this.state.storage.sql;
+    switch (type) {
+      case "place":
+        sql.exec("INSERT OR REPLACE INTO blocks (x, z, block_type, placed_by) VALUES (?, ?, ?, ?)",
+          payload.x, payload.z, payload.block, pubkey);
+        this.addToInventory(pubkey, this.blockTypeToItem(payload.block), -1);
+        break;
+      case "break": {
+        const rows = [...sql.exec("SELECT block_type FROM blocks WHERE x = ? AND z = ?", payload.x, payload.z)];
+        if (rows.length > 0) {
+          sql.exec("DELETE FROM blocks WHERE x = ? AND z = ?", payload.x, payload.z);
+          this.addToInventory(pubkey, this.blockTypeToItem(rows[0].block_type as number), 1);
+        }
+        break;
+      }
+      case "transfer":
+        sql.exec("UPDATE ownership SET owner_pubkey = ? WHERE asset_id = ?", payload.toPubkey, payload.assetId);
+        break;
+      case "craft":
+        this.applyCraft(pubkey, payload.recipe);
+        break;
+      case "contract.deploy": {
+        const wasmBytes = this.b64ToBytes(payload.wasm_b64);
+        const address = await this.contractExecutor.deploy(wasmBytes, pubkey, this.latestSeq);
+        // Log the deployed address for clients
+        this.broadcast({ type: "contract.deployed", address, deployer: pubkey });
+        break;
+      }
+      case "contract.call": {
+        const args = payload.args_b64 ? this.b64ToBytes(payload.args_b64) : new Uint8Array();
+        const result = await this.contractExecutor.call(
+          payload.contract, payload.method, args, pubkey, payload.gas || 1_000_000,
+        );
+        if (!result.ok) {
+          console.warn(`Contract call failed: ${result.error}`);
+        }
+        // Process any oracle/trigger requests emitted by the contract
+        if (result.oracle_requests) {
+          await this.processOracleEmits(payload.contract, result.oracle_requests);
+        }
+        if (result.trigger_requests) {
+          await this.processTriggerEmits(payload.contract, pubkey, result.trigger_requests);
+        }
+        break;
+      }
+      case "oracle.request": {
+        const reqId = await computeRequestId(
+          payload.contract, payload.callback_method, payload.url, Date.now(),
+        );
+        this.state.storage.sql.exec(
+          `INSERT OR IGNORE INTO oracle_requests (id, contract, callback_method, url, json_path, aggregation, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)`,
+          reqId, payload.contract, payload.callback_method, payload.url,
+          payload.json_path || null, payload.aggregation || "identical", Date.now(),
+        );
+        // Ensure alarm is scheduled to process this
+        this.scheduleAlarm();
+        break;
+      }
+      case "oracle.response": {
+        // Deliver oracle result to the contract's callback
+        const contract = payload.contract;
+        const method = payload.callback_method;
+        const resultBytes = new TextEncoder().encode(JSON.stringify({
+          request_id: payload.request_id,
+          value: payload.value,
+          sources: payload.sources,
+        }));
+        const callResult = await this.contractExecutor.call(
+          contract, method, resultBytes, "oracle:system", 1_000_000,
+        );
+        if (!callResult.ok) {
+          console.warn(`Oracle callback failed: ${callResult.error}`);
+        }
+        // Process any nested emits from the callback
+        if (callResult.oracle_requests) {
+          await this.processOracleEmits(contract, callResult.oracle_requests);
+        }
+        if (callResult.trigger_requests) {
+          await this.processTriggerEmits(contract, "oracle:system", callResult.trigger_requests);
+        }
+        break;
+      }
+      case "trigger.create": {
+        const triggerId = await this.triggerManager.create(
+          payload.contract, payload.method, payload.args_b64 || "",
+          payload.interval_ms, pubkey, payload.max_fires || 0,
+        );
+        this.broadcast({ type: "trigger.created", trigger_id: triggerId, contract: payload.contract });
+        // Re-schedule alarm to account for new trigger
+        this.scheduleAlarm();
+        break;
+      }
+      case "trigger.remove": {
+        this.triggerManager.remove(payload.trigger_id, pubkey);
+        this.broadcast({ type: "trigger.removed", trigger_id: payload.trigger_id });
+        break;
+      }
+    }
+  }
+
+  // ─── Oracle Processing ──────────────────────────────────────────────────
+
+  /**
+   * Process oracle requests emitted by a contract during execution.
+   * Creates oracle_requests records for later fetching.
+   */
+  private async processOracleEmits(fallbackContract: string, requests: OracleRequestEmit[]) {
+    for (const req of requests) {
+      const contract = req.contract || fallbackContract;
+      const reqId = await computeRequestId(contract, req.callback_method, req.url, Date.now());
+      this.state.storage.sql.exec(
+        `INSERT OR IGNORE INTO oracle_requests (id, contract, callback_method, url, json_path, aggregation, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)`,
+        reqId, contract, req.callback_method, req.url,
+        req.json_path || null, req.aggregation, Date.now(),
+      );
+    }
+    this.scheduleAlarm();
+  }
+
+  /**
+   * Process trigger management requests emitted by a contract during execution.
+   */
+  private async processTriggerEmits(fallbackContract: string, creator: string, requests: TriggerRequestEmit[]) {
+    for (const req of requests) {
+      const contract = req.contract || fallbackContract;
+      if (req.action === "create" && req.method && req.interval_ms) {
+        await this.triggerManager.create(
+          contract, req.method, req.args_b64 || "",
+          req.interval_ms, creator, req.max_fires || 0,
+        );
+      } else if (req.action === "remove" && req.trigger_id) {
+        this.triggerManager.remove(req.trigger_id, creator);
+      }
+    }
+    this.scheduleAlarm();
+  }
+
+  /**
+   * Fetch pending oracle requests and deliver results.
+   * In single-node mode: fetch directly and deliver.
+   * In multi-node mode: each node fetches, results aggregated via consensus.
+   */
+  private async processPendingOracles() {
+    const pending = [...this.state.storage.sql.exec(
+      "SELECT * FROM oracle_requests WHERE status = 'pending' ORDER BY created_at ASC LIMIT 10",
+    )] as any[];
+
+    for (const req of pending) {
+      try {
+        // Mark as fetching
+        this.state.storage.sql.exec(
+          "UPDATE oracle_requests SET status = 'fetching' WHERE id = ?", req.id,
+        );
+
+        // Fetch the data
+        const rawResponse = await fetchWithTimeout(req.url);
+        const extracted = extractJsonPath(rawResponse, req.json_path);
+
+        if (this.getActiveNodeCount() < MIN_NODES_FOR_CONSENSUS) {
+          // Single-node mode: deliver directly
+          this.state.storage.sql.exec(
+            "UPDATE oracle_requests SET status = 'delivered', result_value = ?, result_sources = 1, delivered_at = ? WHERE id = ?",
+            extracted, Date.now(), req.id,
+          );
+
+          // Call the contract's callback
+          await this.applyEvent("oracle.response", {
+            contract: req.contract,
+            callback_method: req.callback_method,
+            request_id: req.id,
+            value: extracted,
+            sources: 1,
+          }, "oracle:system");
+
+          this.broadcast({
+            type: "oracle.delivered",
+            request_id: req.id,
+            contract: req.contract,
+          });
+        } else {
+          // Multi-node mode: store our result, wait for peer results
+          const nodePubkey = this.nodeIdentity?.pubkey || "self";
+          this.state.storage.sql.exec(
+            `INSERT OR REPLACE INTO oracle_responses (request_id, node_pubkey, value, fetched_at)
+             VALUES (?, ?, ?, ?)`,
+            req.id, nodePubkey, extracted, Date.now(),
+          );
+
+          // Check if we have enough responses for consensus
+          const responses = [...this.state.storage.sql.exec(
+            "SELECT * FROM oracle_responses WHERE request_id = ?", req.id,
+          )] as any[];
+
+          const quorum = Math.ceil((this.getActiveNodeCount() * 2) / 3) + 1;
+          const aggregated = aggregate(
+            responses.map(r => ({
+              node_pubkey: r.node_pubkey,
+              request_id: r.request_id,
+              value: r.value,
+              fetched_at: r.fetched_at,
+            })),
+            req.aggregation as AggregationStrategy,
+            quorum,
+          );
+
+          if (aggregated) {
+            this.state.storage.sql.exec(
+              "UPDATE oracle_requests SET status = 'delivered', result_value = ?, result_sources = ?, delivered_at = ? WHERE id = ?",
+              aggregated.value, aggregated.sources, Date.now(), req.id,
+            );
+
+            await this.applyEvent("oracle.response", {
+              contract: req.contract,
+              callback_method: req.callback_method,
+              request_id: req.id,
+              value: aggregated.value,
+              sources: aggregated.sources,
+            }, "oracle:system");
+
+            this.broadcast({
+              type: "oracle.delivered",
+              request_id: req.id,
+              contract: req.contract,
+            });
+          } else {
+            // Not enough responses yet — mark as aggregating
+            this.state.storage.sql.exec(
+              "UPDATE oracle_requests SET status = 'aggregating' WHERE id = ?", req.id,
+            );
+          }
+        }
+      } catch (e: any) {
+        console.warn(`Oracle fetch failed for ${req.id}: ${e.message}`);
+        this.state.storage.sql.exec(
+          "UPDATE oracle_requests SET status = 'failed' WHERE id = ?", req.id,
+        );
+      }
+    }
+  }
+
+  /**
+   * Fire all cron triggers that are due.
+   */
+  private async fireDueTriggers() {
+    const due = this.triggerManager.getDueTriggers();
+
+    for (const trigger of due) {
+      try {
+        const args = trigger.args_b64 ? this.b64ToBytes(trigger.args_b64) : new Uint8Array();
+        const result = await this.contractExecutor.call(
+          trigger.contract, trigger.method, args, `trigger:${trigger.id}`, 1_000_000,
+        );
+
+        this.triggerManager.markFired(trigger.id);
+
+        if (!result.ok) {
+          console.warn(`Trigger ${trigger.id} call failed: ${result.error}`);
+        } else {
+          // Process any emits from the triggered call
+          if (result.oracle_requests) {
+            await this.processOracleEmits(trigger.contract, result.oracle_requests);
+          }
+          if (result.trigger_requests) {
+            await this.processTriggerEmits(trigger.contract, trigger.creator, result.trigger_requests);
+          }
+        }
+
+        this.broadcast({
+          type: "trigger.fired",
+          trigger_id: trigger.id,
+          contract: trigger.contract,
+          method: trigger.method,
+          ok: result.ok,
+        });
+      } catch (e: any) {
+        console.warn(`Trigger ${trigger.id} error: ${e.message}`);
+        this.triggerManager.markFired(trigger.id); // Advance even on error to avoid stuck triggers
+      }
+    }
+  }
+
+  // ─── Inventory ──────────────────────────────────────────────────────────
+
+  private ensureStartingInventory(pubkey: string) {
+    const existing = [...this.state.storage.sql.exec("SELECT COUNT(*) as cnt FROM inventory WHERE pubkey = ?", pubkey)];
+    if ((existing[0]?.cnt ?? 0) === 0) {
+      for (const [item, count] of [["dirt", 20], ["stone", 10], ["wood", 10]] as [string, number][]) {
+        this.state.storage.sql.exec("INSERT OR IGNORE INTO inventory (pubkey, item, count) VALUES (?, ?, ?)", pubkey, item, count);
+      }
+    }
+  }
+
+  private getPlayerInventory(pubkey: string): Record<string, number> {
+    const rows = [...this.state.storage.sql.exec("SELECT item, count FROM inventory WHERE pubkey = ? AND count > 0", pubkey)];
+    return Object.fromEntries(rows.map((r: any) => [r.item, r.count]));
+  }
+
+  private getItemCount(pubkey: string, item: string): number {
+    const rows = [...this.state.storage.sql.exec("SELECT count FROM inventory WHERE pubkey = ? AND item = ?", pubkey, item)];
+    return rows.length > 0 ? (rows[0].count as number) : 0;
+  }
+
+  private addToInventory(pubkey: string, item: string, delta: number) {
+    const current = this.getItemCount(pubkey, item);
+    this.state.storage.sql.exec(
+      "INSERT INTO inventory (pubkey, item, count) VALUES (?, ?, ?) ON CONFLICT(pubkey, item) DO UPDATE SET count = ?",
+      pubkey, item, current + delta, current + delta,
+    );
+  }
+
+  // ─── Crafting ───────────────────────────────────────────────────────────
+
+  private static readonly RECIPES: Record<string, Record<string, number>> = {
+    house: { dirt: 5, wood: 5 },
+    wall: { stone: 3 },
+    bridge: { wood: 8 },
+  };
+
+  private validateCraftRecipe(pubkey: string, recipe: string): { ok: boolean; error?: string } {
+    const cost = PersistiaWorld.RECIPES[recipe];
+    if (!cost) return { ok: false, error: `Unknown recipe: ${recipe}` };
+    for (const [item, needed] of Object.entries(cost)) {
+      if (this.getItemCount(pubkey, item) < needed) {
+        return { ok: false, error: `Not enough ${item} (need ${needed}, have ${this.getItemCount(pubkey, item)})` };
+      }
+    }
+    return { ok: true };
+  }
+
+  private applyCraft(pubkey: string, recipe: string) {
+    const cost = PersistiaWorld.RECIPES[recipe];
+    if (!cost) return;
+    for (const [item, needed] of Object.entries(cost)) this.addToInventory(pubkey, item, -needed);
+    this.addToInventory(pubkey, recipe, 1);
+  }
+
+  private blockTypeToItem(blockType: number): string {
+    return { 1: "dirt", 2: "stone", 3: "wood", 4: "grass" }[blockType] || "unknown";
+  }
+
+  // ─── Broadcast ──────────────────────────────────────────────────────────
+
+  private broadcast(msg: any, channel?: string) {
+    const str = JSON.stringify(msg);
+    for (const [ws, meta] of this.sockets) {
+      try {
+        // If channel specified, only send to subscribers; otherwise send to all
+        if (!channel || meta.channels.has(channel) || meta.channels.size === 0) {
+          ws.send(str);
+        }
+      } catch { this.sockets.delete(ws); }
+    }
+  }
+
+  private broadcastToChannel(channel: string, msg: any) {
+    const str = JSON.stringify(msg);
+    for (const [ws, meta] of this.sockets) {
+      try {
+        if (meta.channels.has(channel)) ws.send(str);
+      } catch { this.sockets.delete(ws); }
+    }
+  }
+
+  // ─── Helpers ────────────────────────────────────────────────────────────
+
+  private json(data: any, status = 200): Response {
+    return new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json" } });
+  }
+
+  private b64ToBytes(b64: string): Uint8Array {
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  }
+}
