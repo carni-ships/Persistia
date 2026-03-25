@@ -163,7 +163,7 @@
 <p class="subtitle">Ed25519 key management + Bech32 addresses</p>
 
 <div class="node-selector">
-  <input type="text" id="nodeUrl" placeholder="Node URL (e.g. https://persistia.example.workers.dev/?shard=node-1)">
+  <input type="text" id="nodeUrl" value="https://persistia.carnation-903.workers.dev/?shard=node-1" placeholder="Node URL">
   <button class="secondary" onclick="connectNode()">Connect</button>
 </div>
 
@@ -491,7 +491,11 @@ function copyField(el) {
     const saved = localStorage.getItem("persistia_wallet_node");
     if (saved) {
       document.getElementById("nodeUrl").value = saved;
-      nodeBase = saved;
+    }
+    // Auto-connect using saved value or the default in the input
+    nodeBase = document.getElementById("nodeUrl").value;
+    if (nodeBase) {
+      localStorage.setItem("persistia_wallet_node", nodeBase);
       refreshBalances();
     }
   } catch (e) {
