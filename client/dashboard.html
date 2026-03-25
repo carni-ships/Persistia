@@ -966,8 +966,11 @@ function drawDAGFrame() {
   // ─── Legend ───────────────────────────────────────────────────────────────
   const legendX = W - 210, legendY = 6;
   const lw = 200, lh = 148;
+  // Fully opaque clear to prevent ghosting from semi-transparent canvas clear
+  ctx.fillStyle = '#0d1117';
+  ctx.fillRect(legendX, legendY, lw, lh);
   // Background
-  ctx.fillStyle = 'rgba(18,18,28,0.88)';
+  ctx.fillStyle = 'rgba(18,18,28,1)';
   ctx.strokeStyle = 'rgba(108,92,231,0.2)';
   ctx.lineWidth = 1;
   ctx.beginPath();
