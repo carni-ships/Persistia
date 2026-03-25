@@ -715,8 +715,11 @@ function drawDAGFrame() {
     return;
   }
 
-  const authors = [...new Set(vertices.map(v => v.author))];
   const rounds = [...new Set(vertices.map(v => v.round))].sort((a,b) => a-b);
+  // Only show authors active in the last 20 rounds (hide dead/inactive nodes)
+  const recentCutoff = rounds.length > 0 ? rounds[rounds.length - 1] - 20 : 0;
+  const recentAuthors = new Set(vertices.filter(v => v.round >= recentCutoff).map(v => v.author));
+  const authors = [...recentAuthors];
 
   const COL_W = 60;
   const ROW_H = 50;
