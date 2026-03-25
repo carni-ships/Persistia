@@ -1373,6 +1373,25 @@ export class PersistiaWorldV4 implements DurableObject {
           proven_blocks: body.proven_blocks || 1,
           genesis_root: body.genesis_root || null,
         });
+
+        // Fan out proof to sibling shards (skip if this is already a relay)
+        if (!body._relayed && this.env.PERSISTIA_WORLD) {
+          const relayBody = { ...body, _relayed: true };
+          const siblings = ["node-1", "node-2", "node-3", "global-world"]
+            .filter(s => s !== this.shardName);
+          for (const shard of siblings) {
+            try {
+              const id = this.env.PERSISTIA_WORLD.idFromName(shard);
+              const stub = this.env.PERSISTIA_WORLD.get(id);
+              stub.fetch(new Request(`${url.origin}/proof/zk/submit`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json", "X-Shard-Name": shard },
+                body: JSON.stringify(relayBody),
+              })).catch(() => {}); // fire-and-forget
+            } catch {}
+          }
+        }
+
         return this.json({ ok: true, block_number: body.block_number });
       }
 
