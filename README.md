@@ -40,6 +40,10 @@ Consensus activates automatically when 3+ nodes are registered and producing ver
 
 Visit `https://your-worker.workers.dev/dashboard?shard=node-1` for real-time DAG visualization, validator status, ZK proof progress, and contract deployments.
 
+### Verifier
+
+Visit `https://your-worker.workers.dev/verifier?shard=node-1` to verify the ZK proof chain — validates IVC continuity, state root linking, and proof coverage.
+
 ### Wallet
 
 Visit `https://your-worker.workers.dev/wallet` to manage Ed25519 keys, view balances, and send token transfers. Use the faucet endpoint to get test tokens.
@@ -70,9 +74,14 @@ src/
 
 client/
   dashboard.html          # Real-time DAG explorer and chain monitor
+  verifier.html           # ZK proof chain verifier
   wallet.html             # Key management, balances, and transfers
   game.html               # Minecraft-lite game client
   script.js               # Game client library
+
+scripts/
+  generate-events.ts      # Procedural world builder (villages, roads, trees)
+  run-validators.ts       # Multi-node local dev runner
 
 contracts/
   persistia-sdk/          # Rust SDK for writing smart contracts
@@ -120,7 +129,13 @@ blog/
 | `/validator/list` | GET | Active validators and quorum info |
 | `/mpp/info` | GET | Payment requirements for protected routes |
 | `/mpp/receipts?payer=X` | GET | Payment receipts for an address |
-| `/headers/latest` | GET | Latest light client block header |
+| `/headers/latest` | GET | Latest block header with BFT commit certificate |
+| `/headers?after=N` | GET | Block headers after block N (light client sync) |
+| `/proof/generate?key=X` | GET | Merkle inclusion/non-inclusion proof for a state key |
+| `/proof/verify` | POST | Verify a Merkle proof client-side |
+| `/proof/commitment` | GET | Current state root and entry count |
+| `/proof/zk/chain` | GET | Full IVC proof chain with public values |
+| `/proof/zk/download?block=N` | GET | Download raw proof bytes |
 | `/notes/create` | POST | Create a cross-shard note |
 | `/notes/consume` | POST | Consume a note (with nullifier) |
 | `/covenant/create` | POST | Create a covenant state machine |

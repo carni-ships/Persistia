@@ -533,6 +533,11 @@ async function poll() {
       }
     }
 
+    // Mark initial sync complete after first HTTP poll
+    if (!dagAnim.initialSyncDone) {
+      setTimeout(() => { dagAnim.initialSyncDone = true; }, 500);
+    }
+
     // Process direct-apply events (single-node mode)
     if (sync.recent_events && sync.recent_events.length > 0) {
       for (const ev of sync.recent_events) {
@@ -641,6 +646,7 @@ const dagAnim = {
   knownCommits: new Set(),
   time: 0,
   running: false,
+  initialSyncDone: false, // suppress effects during initial bulk sync
 };
 
 function spawnPulse(x, y, color) {
@@ -730,23 +736,26 @@ function drawDAGFrame() {
     const y = PAD_T + row * ROW_H + ROW_H/2;
     posMap.set(v.hash, { x, y, v });
 
-    // Spawn effects for new vertices
+    // Spawn effects only for vertices arriving after initial sync
     if (!dagAnim.knownHashes.has(v.hash)) {
       dagAnim.knownHashes.add(v.hash);
-      spawnPulse(x, y, nodeColor(v.author));
-      // Spawn particles along each edge
-      if (v.refs) {
-        for (const ref of v.refs) {
-          const rp = posMap.get(ref);
-          if (rp) spawnEdgeParticle(rp.x, rp.y, x, y, nodeColor(v.author));
+      if (dagAnim.initialSyncDone) {
+        spawnPulse(x, y, nodeColor(v.author));
+        if (v.refs) {
+          for (const ref of v.refs) {
+            const rp = posMap.get(ref);
+            if (rp) spawnEdgeParticle(rp.x, rp.y, x, y, nodeColor(v.author));
+          }
         }
       }
     }
 
-    // Spawn commit flash
+    // Commit flash only after initial sync
     if (dagData.commits.has(v.hash) && !dagAnim.knownCommits.has(v.hash)) {
       dagAnim.knownCommits.add(v.hash);
-      spawnCommitFlash(x, y);
+      if (dagAnim.initialSyncDone) {
+        spawnCommitFlash(x, y);
+      }
     }
   }
 
@@ -1020,6 +1029,10 @@ function connectWS() {
           }
         }
         renderDAG();
+        // Mark initial sync complete — future vertices will trigger animations
+        if (!dagAnim.initialSyncDone) {
+          setTimeout(() => { dagAnim.initialSyncDone = true; }, 500);
+        }
         return;
       }
 
