@@ -228,6 +228,20 @@ export class PersistiaWorldV4 implements DurableObject {
         if (exists.length === 0) sql.exec(ddl);
       } catch {}
     }
+
+    // Migration: add proof_bytes and public_values columns to zk_proofs
+    try {
+      const cols = [...sql.exec("PRAGMA table_info(zk_proofs)")] as any[];
+      if (!cols.some((c: any) => c.name === "proof_bytes")) {
+        sql.exec("ALTER TABLE zk_proofs ADD COLUMN proof_bytes BLOB");
+      }
+      if (!cols.some((c: any) => c.name === "public_values")) {
+        sql.exec("ALTER TABLE zk_proofs ADD COLUMN public_values TEXT");
+      }
+      if (!cols.some((c: any) => c.name === "genesis_root")) {
+        sql.exec("ALTER TABLE zk_proofs ADD COLUMN genesis_root TEXT");
+      }
+    } catch {}
   }
 
   private async loadState() {
@@ -1316,17 +1330,34 @@ export class PersistiaWorldV4 implements DurableObject {
         if (!body.block_number || !body.proof || !body.state_root) {
           return this.json({ error: "block_number, proof, and state_root required" }, 400);
         }
+        // Decode proof bytes if provided (base64-encoded)
+        let proofBytes: ArrayBuffer | null = null;
+        if (body.proof_bytes_b64) {
+          const raw = atob(body.proof_bytes_b64);
+          const arr = new Uint8Array(raw.length);
+          for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+          proofBytes = arr.buffer;
+        }
         sql.exec(
-          `INSERT OR REPLACE INTO zk_proofs (block_number, proof_hex, state_root, proven_blocks, proof_type, submitted_at, verified)
-           VALUES (?, ?, ?, ?, ?, ?, 0)`,
+          `INSERT OR REPLACE INTO zk_proofs (block_number, proof_hex, state_root, proven_blocks, proof_type, submitted_at, verified, proof_bytes, public_values, genesis_root)
+           VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
           body.block_number,
           body.proof,
           body.state_root,
           body.proven_blocks || 1,
           body.proof_type || "compressed",
           Date.now(),
+          proofBytes,
+          body.public_values ? JSON.stringify(body.public_values) : null,
+          body.genesis_root || null,
         );
-        this.broadcast({ type: "zk.proof_submitted", block_number: body.block_number });
+        this.broadcast({
+          type: "zk.proof_submitted",
+          block_number: body.block_number,
+          state_root: body.state_root,
+          proven_blocks: body.proven_blocks || 1,
+          genesis_root: body.genesis_root || null,
+        });
         return this.json({ ok: true, block_number: body.block_number });
       }
 
@@ -1362,6 +1393,51 @@ export class PersistiaWorldV4 implements DurableObject {
           max_chain_length: latest[0]?.max_chain_length || 0,
           last_committed_round: this.lastCommittedRound,
           proof_gap: (this.lastCommittedRound || 0) - (latest[0]?.latest_block || 0),
+        });
+      }
+
+      case "/proof/zk/chain": {
+        // Return the full IVC proof chain for browser verification.
+        // Each entry includes public values (state_root, block_number, proven_blocks, genesis_root)
+        // but NOT the full proof bytes (too large). Use /proof/zk/download for that.
+        const rows = [...sql.exec(
+          `SELECT block_number, proof_hex, state_root, proven_blocks, proof_type,
+                  submitted_at, verified, public_values, genesis_root
+           FROM zk_proofs ORDER BY block_number ASC`
+        )] as any[];
+        // Parse public_values JSON if available
+        const chain = rows.map((r: any) => ({
+          block_number: r.block_number,
+          proof_hash: r.proof_hex,
+          state_root: r.state_root,
+          proven_blocks: r.proven_blocks,
+          proof_type: r.proof_type,
+          submitted_at: r.submitted_at,
+          verified: r.verified,
+          genesis_root: r.genesis_root,
+          public_values: r.public_values ? JSON.parse(r.public_values) : null,
+          has_proof_bytes: r.proof_bytes != null,
+        }));
+        return this.json({ chain, count: chain.length });
+      }
+
+      case "/proof/zk/download": {
+        // Download raw proof bytes for a specific block (for offline verification)
+        const blockNum = url.searchParams.get("block");
+        if (!blockNum) return this.json({ error: "block parameter required" }, 400);
+        const rows = [...sql.exec(
+          "SELECT proof_bytes, proof_type, block_number FROM zk_proofs WHERE block_number = ?",
+          parseInt(blockNum),
+        )] as any[];
+        if (rows.length === 0 || !rows[0].proof_bytes) {
+          return this.json({ error: "Proof bytes not available" }, 404);
+        }
+        return new Response(rows[0].proof_bytes as ArrayBuffer, {
+          headers: {
+            "Content-Type": "application/octet-stream",
+            "Content-Disposition": `attachment; filename="proof_block_${blockNum}.bin"`,
+            "X-Proof-Type": rows[0].proof_type,
+          },
         });
       }
 

@@ -541,7 +541,7 @@ fn compute_proof_hash(proof: &SP1ProofWithPublicValues) -> String {
     hex::encode(sha2::Sha256::digest(&bytes))
 }
 
-/// Post proof metadata to the Persistia node.
+/// Post proof metadata + bytes to the Persistia node.
 async fn submit_proof_to_node(
     http: &reqwest::Client,
     node: &str,
@@ -550,22 +550,47 @@ async fn submit_proof_to_node(
     state_root: &[u8; 32],
     proven_blocks: u64,
     proof_type: &str,
+    proof: &SP1ProofWithPublicValues,
 ) {
+    // Serialize proof bytes and encode as base64
+    let proof_bytes = bincode::serialize(proof).unwrap_or_default();
+    let proof_bytes_b64 = base64::engine::general_purpose::STANDARD.encode(&proof_bytes);
+
+    // Decode public values for browser-friendly JSON
+    let public_values: Option<StateTransitionOutput> =
+        bincode::deserialize(proof.public_values.as_slice()).ok();
+
+    let mut body = serde_json::json!({
+        "block_number": block,
+        "proof": proof_hash,
+        "state_root": hex::encode(state_root),
+        "proven_blocks": proven_blocks,
+        "proof_type": proof_type,
+        "proof_bytes_b64": proof_bytes_b64,
+    });
+
+    if let Some(ref pv) = public_values {
+        body["public_values"] = serde_json::json!({
+            "state_root": hex::encode(pv.state_root),
+            "block_number": pv.block_number,
+            "proven_blocks": pv.proven_blocks,
+            "genesis_root": hex::encode(pv.genesis_root),
+        });
+        body["genesis_root"] = serde_json::json!(hex::encode(pv.genesis_root));
+    }
+
     match http
         .post(node_url(node, "/proof/zk/submit"))
-        .json(&serde_json::json!({
-            "block_number": block,
-            "proof": proof_hash,
-            "state_root": hex::encode(state_root),
-            "proven_blocks": proven_blocks,
-            "proof_type": proof_type,
-        }))
+        .json(&body)
         .send()
         .await
     {
         Ok(resp) => {
             if !resp.status().is_success() {
                 eprintln!("  Warning: proof submit HTTP {}", resp.status());
+            } else {
+                let bytes_kb = proof_bytes.len() / 1024;
+                println!("  Proof uploaded to node ({} KB)", bytes_kb);
             }
         }
         Err(e) => eprintln!("  Warning: proof submit failed: {}", e),
@@ -843,6 +868,7 @@ async fn main() -> anyhow::Result<()> {
                                 submit_proof_to_node(
                                     &http, &node, last_block, &proof_hash,
                                     &result.state_root, result.proven_blocks, "compressed-batch",
+                                    &proof,
                                 ).await;
 
                                 last_proof = Some(proof);
@@ -917,6 +943,7 @@ async fn main() -> anyhow::Result<()> {
                                         submit_proof_to_node(
                                             &http, &node, target, &proof_hash,
                                             &result.state_root, result.proven_blocks, "compressed",
+                                            &proof,
                                         ).await;
 
                                         last_proof = Some(proof);
@@ -1285,6 +1312,7 @@ async fn main() -> anyhow::Result<()> {
                         submit_proof_to_node(
                             &http, &node, *block_num, &proof_hash,
                             &result.state_root, result.proven_blocks, "compressed-stitched",
+                            &proof,
                         ).await;
 
                         chain_proof = Some(proof);
@@ -1476,6 +1504,7 @@ async fn main() -> anyhow::Result<()> {
                         submit_proof_to_node(
                             &http, &node, block_end, &proof_hash,
                             &result.state_root, result.proven_blocks, "compressed-claimed",
+                            &proof,
                         ).await;
 
                         let _ = http.post(node_url(&node, "/proof/release"))
@@ -1710,6 +1739,7 @@ async fn main() -> anyhow::Result<()> {
                 submit_proof_to_node(
                     &http, &node, *final_end, &proof_hash,
                     &result.state_root, result.proven_blocks, "compressed-tree",
+                    &final_proof,
                 ).await;
             }
         }
