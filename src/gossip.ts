@@ -55,6 +55,7 @@ const MAX_FAILURES = 5;          // remove peer after this many consecutive fail
 const GOSSIP_TIMEOUT_MS = 5000;
 const DEDUP_WINDOW = 1000;       // keep last N nonces for dedup
 const PEER_EXCHANGE_INTERVAL = 3; // exchange peers every N sync cycles
+const FLOOD_CONCURRENCY = 6;     // max parallel outbound connections per flood
 
 // ─── GossipManager ───────────────────────────────────────────────────────────
 
@@ -170,16 +171,20 @@ export class GossipManager {
     // Check freshness (reject messages older than 5 minutes)
     if (Date.now() - envelope.timestamp > 300_000) return false;
 
+    // Proactively trim nonce set regardless of validity (prevents invalid-message leak)
+    if (this.seenNonces.size >= DEDUP_WINDOW) {
+      const iter = this.seenNonces.values();
+      const toRemove = this.seenNonces.size - (DEDUP_WINDOW / 2);
+      for (let i = 0; i < toRemove; i++) {
+        this.seenNonces.delete(iter.next().value!);
+      }
+    }
+
     const sigData = `${envelope.type}:${JSON.stringify(envelope.payload)}:${envelope.timestamp}:${envelope.nonce}`;
     const valid = await verifyNodeSignature(envelope.sender_pubkey, envelope.signature, sigData);
 
     if (valid) {
       this.seenNonces.add(envelope.nonce);
-      // Trim dedup window
-      if (this.seenNonces.size > DEDUP_WINDOW) {
-        const arr = [...this.seenNonces];
-        this.seenNonces = new Set(arr.slice(-DEDUP_WINDOW / 2));
-      }
     }
 
     return valid;
@@ -188,33 +193,36 @@ export class GossipManager {
   // ─── Gossip Flooding ────────────────────────────────────────────────────
 
   /**
-   * Flood a message to all healthy peers.
-   * Used for vertex and event propagation.
+   * Flood a message to all healthy peers with bounded concurrency.
+   * Limits parallel outbound connections to avoid exhausting CF Workers' connection pool.
    */
   async flood(envelope: GossipEnvelope, excludePubkeys: Set<string> = new Set()): Promise<number> {
     const peers = this.getHealthyPeers().filter(p => !excludePubkeys.has(p.pubkey));
     let delivered = 0;
+    const body = JSON.stringify(envelope); // serialize once
 
-    const promises = peers.map(async (peer) => {
-      try {
-        const res = await fetchWithTimeout(`${peer.url}/gossip/push`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(envelope),
-        }, GOSSIP_TIMEOUT_MS);
+    // Process peers in batches of FLOOD_CONCURRENCY
+    for (let i = 0; i < peers.length; i += FLOOD_CONCURRENCY) {
+      const batch = peers.slice(i, i + FLOOD_CONCURRENCY);
+      const results = await Promise.allSettled(batch.map(async (peer) => {
+        try {
+          const res = await fetchWithTimeout(`${peer.url}/gossip/push`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body,
+          }, GOSSIP_TIMEOUT_MS);
 
-        if (res.ok) {
-          this.markPeerSuccess(peer.pubkey);
-          delivered++;
-        } else {
+          if (res.ok) {
+            this.markPeerSuccess(peer.pubkey);
+            delivered++;
+          } else {
+            this.markPeerFailure(peer.pubkey);
+          }
+        } catch {
           this.markPeerFailure(peer.pubkey);
         }
-      } catch {
-        this.markPeerFailure(peer.pubkey);
-      }
-    });
-
-    await Promise.allSettled(promises);
+      }));
+    }
     return delivered;
   }
 

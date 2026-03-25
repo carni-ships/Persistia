@@ -253,20 +253,15 @@ export function injectFuelMetering(wasmBytes: Uint8Array): Uint8Array {
     ]);
   }
 
-  // Now rebuild the WASM binary with the new import + metered code section.
-  // This is done by:
-  // 1. Copy header (magic + version)
-  // 2. For each section:
-  //    - Import section: append our global import and increment count
-  //    - Code section: prepend fuel prologue to each function body
-  //    - All other sections: copy as-is (but shift global indices in global section)
-
-  const output: number[] = [];
+  // Rebuild the WASM binary using chunk collector (avoids byte-by-byte push).
+  // Collect Uint8Array chunks, then concatenate once at the end.
+  const chunks: Uint8Array[] = [];
+  let totalLen = 0;
+  const emit = (data: Uint8Array) => { chunks.push(data); totalLen += data.length; };
 
   // Copy header
-  for (let i = 0; i < 8; i++) output.push(wasmBytes[i]);
+  emit(wasmBytes.slice(0, 8));
 
-  // Track if we've injected the import
   let importInjected = false;
 
   for (const section of sections) {
@@ -276,24 +271,14 @@ export function injectFuelMetering(wasmBytes: Uint8Array): Uint8Array {
       const { value: numImports, bytesRead } = decodeLEB128(wasmBytes, pos);
       pos += bytesRead;
 
-      // New count
       const newCount = encodeLEB128(numImports + 1);
-
-      // Copy existing import entries (raw bytes from pos to end of section)
       const existingImports = wasmBytes.slice(pos, section.contentOffset + section.size);
 
-      // Build new section content
-      const newContent = new Uint8Array([
-        ...newCount,
-        ...existingImports,
-        ...importEntry,
-      ]);
+      const newContent = concat([newCount, existingImports, importEntry]);
 
-      // Write section
-      output.push(2); // section id
-      const sizeBytes = encodeLEB128(newContent.length);
-      for (const b of sizeBytes) output.push(b);
-      for (const b of newContent) output.push(b);
+      emit(new Uint8Array([2])); // section id
+      emit(encodeLEB128(newContent.length));
+      emit(newContent);
 
       importInjected = true;
     } else if (section.id === 10) {
@@ -310,7 +295,6 @@ export function injectFuelMetering(wasmBytes: Uint8Array): Uint8Array {
         const bodyStart = pos;
         const bodyEnd = pos + bodySize;
 
-        // Parse locals to estimate cost
         let localPos = bodyStart;
         const { value: numLocalDecls, bytesRead: nlRead } = decodeLEB128(wasmBytes, localPos);
         localPos += nlRead;
@@ -318,77 +302,66 @@ export function injectFuelMetering(wasmBytes: Uint8Array): Uint8Array {
         for (let j = 0; j < numLocalDecls; j++) {
           const { value: count, bytesRead: cRead } = decodeLEB128(wasmBytes, localPos);
           localPos += cRead;
-          localPos++; // skip valtype
+          localPos++;
           totalLocals += count;
         }
 
         const cost = FUEL_COSTS.function_base + totalLocals * FUEL_COSTS.per_local;
         const prologue = buildFuelPrologue(cost);
 
-        // New body: locals declaration + prologue + original code (after locals)
-        const localsSection = wasmBytes.slice(bodyStart, localPos);
-        const codeAfterLocals = wasmBytes.slice(localPos, bodyEnd);
-
-        const newBody = new Uint8Array([
-          ...localsSection,
-          ...prologue,
-          ...codeAfterLocals,
+        const newBody = concat([
+          wasmBytes.slice(bodyStart, localPos),
+          prologue,
+          wasmBytes.slice(localPos, bodyEnd),
         ]);
 
-        // Encode new body with size prefix
         const newBodySize = encodeLEB128(newBody.length);
-        const fullBody = new Uint8Array([...newBodySize, ...newBody]);
-        newBodies.push(fullBody);
-
+        newBodies.push(concat([newBodySize, newBody]));
         pos = bodyEnd;
       }
 
-      // Build new code section
       const funcCountBytes = encodeLEB128(numFuncs);
-      let totalSize = funcCountBytes.length;
-      for (const b of newBodies) totalSize += b.length;
+      let codeSize = funcCountBytes.length;
+      for (const b of newBodies) codeSize += b.length;
 
-      output.push(10); // section id
-      const sizeBytes = encodeLEB128(totalSize);
-      for (const b of sizeBytes) output.push(b);
-      for (const b of funcCountBytes) output.push(b);
-      for (const body of newBodies) {
-        for (const b of body) output.push(b);
-      }
+      emit(new Uint8Array([10])); // section id
+      emit(encodeLEB128(codeSize));
+      emit(funcCountBytes);
+      for (const body of newBodies) emit(body);
     } else if (section.id === 6 && !importInjected) {
-      // If there was no import section, we need to inject one BEFORE the global section
-      // Import section comes before global section (id 6) in WASM ordering
-
-      // Create new import section with just our fuel global
-      const newImportContent = new Uint8Array([
-        ...encodeLEB128(1), // 1 import
-        ...importEntry,
-      ]);
-      output.push(2); // import section id
-      const importSizeBytes = encodeLEB128(newImportContent.length);
-      for (const b of importSizeBytes) output.push(b);
-      for (const b of newImportContent) output.push(b);
+      // Inject import section before global section
+      const newImportContent = concat([encodeLEB128(1), importEntry]);
+      emit(new Uint8Array([2]));
+      emit(encodeLEB128(newImportContent.length));
+      emit(newImportContent);
       importInjected = true;
 
-      // Then copy the global section as-is
-      const sectionData = wasmBytes.slice(section.offset, section.contentOffset + section.size);
-      for (const b of sectionData) output.push(b);
+      // Copy global section as-is
+      emit(wasmBytes.slice(section.offset, section.contentOffset + section.size));
     } else {
       // Copy section as-is
-      const sectionData = wasmBytes.slice(section.offset, section.contentOffset + section.size);
-      for (const b of sectionData) output.push(b);
+      emit(wasmBytes.slice(section.offset, section.contentOffset + section.size));
     }
   }
 
-  // If we never encountered an import section or global section, inject import section now
-  // This shouldn't happen for valid WASM with our host imports, but handle it
-  if (!importInjected) {
-    // We need to insert the import section. For simplicity, just prepend it after the header.
-    // This requires rebuilding, but in practice all our WASM modules have import sections
-    // because they import host functions.
+  // Concatenate all chunks into final output
+  const result = new Uint8Array(totalLen);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.length;
   }
+  return result;
+}
 
-  return new Uint8Array(output);
+/** Concatenate Uint8Arrays without byte-by-byte push */
+function concat(arrays: Uint8Array[]): Uint8Array {
+  let len = 0;
+  for (const a of arrays) len += a.length;
+  const result = new Uint8Array(len);
+  let off = 0;
+  for (const a of arrays) { result.set(a, off); off += a.length; }
+  return result;
 }
 
 // ─── Fuel Tracker (host-side) ─────────────────────────────────────────────────

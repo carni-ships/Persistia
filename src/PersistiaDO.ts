@@ -55,6 +55,14 @@ export class PersistiaWorld implements DurableObject {
   lastCommittedRound: number = -2;
   nodeUrl: string = "";
 
+  // ─── Cached queries (invalidated on round change / node join) ──────
+  private _activeCache: {
+    round: number;
+    count: number;
+    pubkeys: string[];
+    nodes: { pubkey: string; url: string; last_vertex_round: number; is_self: boolean }[];
+  } | null = null;
+
   constructor(state: DurableObjectState, env: any) {
     this.state = state;
     this.env = env;
@@ -402,6 +410,7 @@ export class PersistiaWorld implements DurableObject {
         this.nodeIdentity.pubkey, this.nodeIdentity.url, this.currentRound, Date.now(),
         this.nodeIdentity.url, Date.now(),
       );
+      this.invalidateActiveCache();
     }
   }
 
@@ -616,7 +625,11 @@ export class PersistiaWorld implements DurableObject {
       await this.maybeAnchorState();
     }
 
-    // 6. Re-schedule alarm
+    // 6. Housekeeping: prune stale rate-limit entries + old anchor bundles
+    this.validatorRegistry.pruneRateLimitLog();
+    this.anchorManager.pruneOldAnchors();
+
+    // 7. Re-schedule alarm
     this.scheduleAlarm();
   }
 
@@ -803,6 +816,7 @@ export class PersistiaWorld implements DurableObject {
            ON CONFLICT(pubkey) DO UPDATE SET url = ?, last_seen = ?`,
           pubkey, peerUrl, Date.now(), peerUrl, Date.now(),
         );
+        this.invalidateActiveCache();
 
         // Ensure alarm is running now that we have peers
         this.scheduleAlarm();
@@ -1164,6 +1178,7 @@ export class PersistiaWorld implements DurableObject {
            ON CONFLICT(pubkey) DO UPDATE SET url = ?, last_seen = ?`,
           pubkey, peerUrl || "", Date.now(), peerUrl || "", Date.now(),
         );
+        this.invalidateActiveCache();
 
         this.scheduleAlarm();
         return this.json(result);
@@ -1573,6 +1588,7 @@ export class PersistiaWorld implements DurableObject {
          ON CONFLICT(pubkey) DO UPDATE SET url = ?, last_seen = ?`,
         msg.pubkey, msg.url || "", Date.now(), msg.url || "", Date.now(),
       );
+      this.invalidateActiveCache();
       if (meta) { meta.isValidator = true; meta.pubkey = msg.pubkey; }
       this.scheduleAlarm();
       const peers = this.getActiveNodes();
@@ -1872,6 +1888,7 @@ export class PersistiaWorld implements DurableObject {
        ON CONFLICT(pubkey) DO UPDATE SET last_vertex_round = MAX(last_vertex_round, ?), last_seen = ?`,
       vertex.author, vertex.round, Date.now(), vertex.round, Date.now(),
     );
+    this.invalidateActiveCache();
 
     // 8. Try round advancement + commits
     this.tryAdvanceRound();
@@ -1901,12 +1918,11 @@ export class PersistiaWorld implements DurableObject {
       vertex.timestamp,
     );
 
-    // Materialized edges
-    for (const ref of vertex.refs) {
-      sql.exec(
-        "INSERT OR IGNORE INTO dag_edges (parent_hash, child_hash) VALUES (?, ?)",
-        ref, hash,
-      );
+    // Materialized edges — batch insert
+    if (vertex.refs.length > 0) {
+      const placeholders = vertex.refs.map(() => "(?, ?)").join(", ");
+      const params = vertex.refs.flatMap(ref => [ref, hash]);
+      sql.exec(`INSERT OR IGNORE INTO dag_edges (parent_hash, child_hash) VALUES ${placeholders}`, ...params);
     }
   }
 
@@ -1928,6 +1944,7 @@ export class PersistiaWorld implements DurableObject {
     if (count >= quorum) {
       this.currentRound++;
       this.setKV("current_round", this.currentRound.toString());
+      this.invalidateActiveCache();
     }
   }
 
@@ -1981,45 +1998,47 @@ export class PersistiaWorld implements DurableObject {
       round, anchorHash, Date.now(),
     );
 
-    // Build vertex map for topological sort
+    // Build vertex map for topological sort — single load, parse once, keep events
     const allVertices = [...sql.exec(
       "SELECT hash, author, round, events_json, refs_json FROM dag_vertices WHERE round <= ?",
       round,
     )];
     const vertexMap = new Map<string, VertexNode>();
+    const eventsMap = new Map<string, any[]>(); // hash → parsed events (avoid re-query + re-parse)
     for (const row of allVertices as any[]) {
       const events = JSON.parse(row.events_json);
+      const refs = JSON.parse(row.refs_json);
       vertexMap.set(row.hash, {
         hash: row.hash,
         author: row.author,
         round: row.round,
         event_hashes: events.map((e: any) => e.hash),
-        refs: JSON.parse(row.refs_json),
+        refs,
       });
+      eventsMap.set(row.hash, events);
     }
 
-    // Get already-finalized vertex hashes
+    // Get already-finalized event hashes in one query (not per-event)
     const finalizedVertices = new Set<string>(
       [...sql.exec("SELECT DISTINCT vertex_hash FROM consensus_events")].map((r: any) => r.vertex_hash),
+    );
+    const finalizedEventHashes = new Set<string>(
+      [...sql.exec("SELECT event_hash FROM consensus_events")].map((r: any) => r.event_hash),
     );
 
     // Topological sort from anchor
     const orderedVertices = topologicalSort(anchorHash, vertexMap, finalizedVertices);
 
-    // Extract and apply events in order
+    // Extract and apply events in order — use pre-loaded eventsMap instead of re-querying
     for (const vNode of orderedVertices) {
-      const vRow = [...sql.exec("SELECT events_json FROM dag_vertices WHERE hash = ?", vNode.hash)];
-      if (vRow.length === 0) continue;
-      const events = JSON.parse((vRow[0] as any).events_json);
+      const events = eventsMap.get(vNode.hash);
+      if (!events) continue;
 
       for (const event of events) {
         const eventHash = event.hash || await computeEventHash(event);
 
-        // Skip already finalized
-        const alreadyFinal = [...sql.exec(
-          "SELECT consensus_seq FROM consensus_events WHERE event_hash = ?", eventHash,
-        )];
-        if (alreadyFinal.length > 0) continue;
+        // Skip already finalized (in-memory set lookup, not DB query)
+        if (finalizedEventHashes.has(eventHash)) continue;
 
         // Validate rules against current finalized state
         const ruleCheck = this.validateRules(event);
@@ -2151,34 +2170,45 @@ export class PersistiaWorld implements DurableObject {
     }
   }
 
-  // ─── Active Node Tracking ───────────────────────────────────────────────
+  // ─── Active Node Tracking (cached per round) ────────────────────────────
 
-  private getActiveNodeCount(): number {
+  private invalidateActiveCache() {
+    this._activeCache = null;
+  }
+
+  private ensureActiveCache() {
+    if (this._activeCache && this._activeCache.round === this.currentRound) return;
     const minRound = Math.max(0, this.currentRound - ACTIVE_WINDOW);
     const rows = [...this.state.storage.sql.exec(
-      "SELECT COUNT(*) as cnt FROM active_nodes WHERE last_vertex_round >= ? OR is_self = 1",
+      "SELECT pubkey, url, last_vertex_round, is_self FROM active_nodes WHERE last_vertex_round >= ? OR is_self = 1 ORDER BY pubkey",
       minRound,
-    )];
-    return Math.max((rows[0]?.cnt ?? 0) as number, 1);
+    )].map((r: any) => ({
+      pubkey: r.pubkey as string,
+      url: r.url as string,
+      last_vertex_round: r.last_vertex_round as number,
+      is_self: !!r.is_self,
+    }));
+    this._activeCache = {
+      round: this.currentRound,
+      count: Math.max(rows.length, 1),
+      pubkeys: rows.map(r => r.pubkey),
+      nodes: rows,
+    };
+  }
+
+  private getActiveNodeCount(): number {
+    this.ensureActiveCache();
+    return this._activeCache!.count;
   }
 
   private getActivePubkeys(): string[] {
-    const minRound = Math.max(0, this.currentRound - ACTIVE_WINDOW);
-    return [...this.state.storage.sql.exec(
-      "SELECT pubkey FROM active_nodes WHERE last_vertex_round >= ? OR is_self = 1 ORDER BY pubkey",
-      minRound,
-    )].map((r: any) => r.pubkey as string);
+    this.ensureActiveCache();
+    return this._activeCache!.pubkeys;
   }
 
   private getActiveNodes(): { pubkey: string; url: string; last_vertex_round: number; is_self: boolean }[] {
-    return [...this.state.storage.sql.exec(
-      "SELECT pubkey, url, last_vertex_round, is_self FROM active_nodes ORDER BY pubkey",
-    )].map((r: any) => ({
-      pubkey: r.pubkey,
-      url: r.url,
-      last_vertex_round: r.last_vertex_round,
-      is_self: !!r.is_self,
-    }));
+    this.ensureActiveCache();
+    return this._activeCache!.nodes;
   }
 
   private getConsensusStatus(): ConsensusStatus {
@@ -2655,8 +2685,8 @@ export class PersistiaWorld implements DurableObject {
     const str = JSON.stringify(msg);
     for (const [ws, meta] of this.sockets) {
       try {
-        // If channel specified, only send to subscribers; otherwise send to all
-        if (!channel || meta.channels.has(channel) || meta.channels.size === 0) {
+        // No channel: broadcast to all. With channel: only to explicit subscribers.
+        if (!channel || meta.channels.has(channel)) {
           ws.send(str);
         }
       } catch { this.sockets.delete(ws); }

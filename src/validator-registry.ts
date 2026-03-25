@@ -119,6 +119,8 @@ function countLeadingZeroBits(hexHash: string): number {
 export class ValidatorRegistry {
   private sql: any;
   private powDifficulty: number;
+  private _quorumCache: { eligible: ValidatorRecord[]; threshold: number; ts: number } | null = null;
+  private static readonly QUORUM_CACHE_TTL = 5_000; // 5s TTL
 
   constructor(sql: any, difficulty?: number) {
     this.sql = sql;
@@ -131,6 +133,17 @@ export class ValidatorRegistry {
     if (rows.length > 0) {
       this.powDifficulty = parseInt(rows[0].value) || DEFAULT_POW_DIFFICULTY;
     }
+  }
+
+  /** Invalidate quorum cache after mutations (register, reputation change, governance) */
+  private invalidateQuorumCache() { this._quorumCache = null; }
+
+  private ensureQuorumCache() {
+    const now = Date.now();
+    if (this._quorumCache && (now - this._quorumCache.ts) < ValidatorRegistry.QUORUM_CACHE_TTL) return;
+    const eligible = this.getActiveValidators();
+    const totalReputation = eligible.reduce((sum, v) => sum + v.reputation, 0);
+    this._quorumCache = { eligible, threshold: Math.ceil(totalReputation * 2 / 3), ts: now };
   }
 
   // ─── Registration ───────────────────────────────────────────────────────
@@ -181,6 +194,7 @@ export class ValidatorRegistry {
       url, INITIAL_REPUTATION, powNonce, hash, now,
     );
 
+    this.invalidateQuorumCache();
     const validator = this.getValidator(pubkey)!;
     return { ok: true, validator };
   }
@@ -207,7 +221,8 @@ export class ValidatorRegistry {
    * Get validators eligible for quorum (active + sufficient reputation).
    */
   getQuorumEligible(): ValidatorRecord[] {
-    return this.getActiveValidators().filter(v => v.reputation >= MIN_REPUTATION_FOR_QUORUM);
+    this.ensureQuorumCache();
+    return this._quorumCache!.eligible;
   }
 
   private rowToRecord(row: any): ValidatorRecord {
@@ -233,25 +248,21 @@ export class ValidatorRegistry {
    * Quorum = 2/3 of total active reputation (BFT standard).
    */
   getQuorumThreshold(): number {
-    const validators = this.getQuorumEligible();
-    const totalReputation = validators.reduce((sum, v) => sum + v.reputation, 0);
-    return Math.ceil(totalReputation * 2 / 3);
+    this.ensureQuorumCache();
+    return this._quorumCache!.threshold;
   }
 
   /**
    * Check if a set of validator pubkeys meets the reputation-weighted quorum.
+   * Uses cached eligible set — no per-voter DB lookups.
    */
   isQuorumMet(voterPubkeys: Set<string>): boolean {
-    const threshold = this.getQuorumThreshold();
+    this.ensureQuorumCache();
+    const { threshold, eligible } = this._quorumCache!;
     let totalVoteWeight = 0;
-
-    for (const pubkey of voterPubkeys) {
-      const v = this.getValidator(pubkey);
-      if (v && v.status === "active" && v.reputation >= MIN_REPUTATION_FOR_QUORUM) {
-        totalVoteWeight += v.reputation;
-      }
+    for (const v of eligible) {
+      if (voterPubkeys.has(v.pubkey)) totalVoteWeight += v.reputation;
     }
-
     return totalVoteWeight >= threshold;
   }
 
@@ -330,6 +341,7 @@ export class ValidatorRegistry {
     if (newRep < MIN_REPUTATION_FOR_QUORUM) {
       this.sql.exec("UPDATE validators SET status = 'suspended' WHERE pubkey = ? AND status = 'active'", pubkey);
     }
+    this.invalidateQuorumCache();
   }
 
   // ─── Equivocation Detection & Slashing ──────────────────────────────────
@@ -436,6 +448,7 @@ export class ValidatorRegistry {
     if (totalVoteWeight >= threshold) {
       // Execute the governance action
       await this.executeGovernance(action, target);
+      this.invalidateQuorumCache();
 
       // Clean up votes for this action
       this.sql.exec("DELETE FROM governance_votes WHERE action = ? AND target = ?", action, target);
@@ -516,12 +529,14 @@ export class ValidatorRegistry {
       pubkey, Date.now(),
     );
 
-    // Periodic cleanup (every 100th event, clean old entries)
-    if (count % 100 === 0) {
-      this.sql.exec("DELETE FROM rate_limit_log WHERE timestamp < ?", Date.now() - windowMs * 2);
-    }
-
     return true;
+  }
+
+  /**
+   * Prune stale rate-limit entries. Call from alarm handler (not per-request).
+   */
+  pruneRateLimitLog(maxAgeMs: number = 120_000) {
+    this.sql.exec("DELETE FROM rate_limit_log WHERE timestamp < ?", Date.now() - maxAgeMs);
   }
 
   /**

@@ -196,12 +196,36 @@ function readLEB128(bytes: Uint8Array, offset: number): { value: number; bytesRe
 // Fuel-based metering replaces timeout-based execution.
 // Fuel is cosmetic (no token) but deterministic — all nodes agree on execution bounds.
 
+const MODULE_CACHE_MAX = 64;
+
 export class ContractExecutor {
+  // LRU module cache: Map iteration order = insertion order; most-recent at end
   private moduleCache: Map<string, WebAssembly.Module> = new Map();
   private sql: any;
 
   constructor(sql: any) {
     this.sql = sql;
+  }
+
+  /** Touch a cache entry (move to end for LRU), evict oldest if over limit */
+  private cacheSet(address: string, module: WebAssembly.Module) {
+    if (this.moduleCache.has(address)) this.moduleCache.delete(address);
+    this.cacheSet(address, module);
+    if (this.moduleCache.size > MODULE_CACHE_MAX) {
+      // Evict the least recently used (first key in Map)
+      const oldest = this.moduleCache.keys().next().value!;
+      this.moduleCache.delete(oldest);
+    }
+  }
+
+  private cacheGet(address: string): WebAssembly.Module | undefined {
+    const mod = this.moduleCache.get(address);
+    if (mod) {
+      // Move to end (most recently used)
+      this.moduleCache.delete(address);
+      this.moduleCache.set(address, mod);
+    }
+    return mod;
   }
 
   // ─── Deploy ───────────────────────────────────────────────────────────
@@ -232,7 +256,7 @@ export class ContractExecutor {
       address, deployer, wasmHash, wasmBytes, Date.now(), seq,
     );
 
-    this.moduleCache.set(address, module);
+    this.cacheSet(address, module);
     return address;
   }
 
@@ -466,7 +490,7 @@ export class ContractExecutor {
         const targetMethod = new TextDecoder().decode(methodBytes);
 
         try {
-          const cachedModule = this.moduleCache.get(targetAddr);
+          const cachedModule = this.cacheGet(targetAddr);
           if (!cachedModule) {
             registers.set(0, new TextEncoder().encode("contract not found: " + targetAddr));
             return 0;
@@ -759,7 +783,7 @@ export class ContractExecutor {
         const targetMethod = new TextDecoder().decode(methodBytes);
 
         try {
-          const cachedModule = this.moduleCache.get(targetAddr);
+          const cachedModule = this.cacheGet(targetAddr);
           if (!cachedModule) {
             registers.set(0, new TextEncoder().encode("contract not found"));
             return 0;
@@ -860,18 +884,19 @@ export class ContractExecutor {
   // ─── Pre-cache modules for cross-contract calls ──────────────────────
 
   async ensureModuleCached(address: string): Promise<boolean> {
-    if (this.moduleCache.has(address)) return true;
+    if (this.cacheGet(address)) return true;
     return (await this.getModule(address)) !== null;
   }
 
   // ─── Module Cache ─────────────────────────────────────────────────────
 
   private async getModule(address: string): Promise<WebAssembly.Module | null> {
-    if (this.moduleCache.has(address)) return this.moduleCache.get(address)!;
+    const cached = this.cacheGet(address);
+    if (cached) return cached;
     const rows = [...this.sql.exec("SELECT wasm_bytes FROM contracts WHERE address = ?", address)];
     if (rows.length === 0) return null;
     const module = await WebAssembly.compile(rows[0].wasm_bytes as Uint8Array);
-    this.moduleCache.set(address, module);
+    this.cacheSet(address, module);
     return module;
   }
 

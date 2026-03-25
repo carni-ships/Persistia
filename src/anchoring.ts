@@ -559,4 +559,18 @@ export class AnchorManager {
       return null;
     }
   }
+
+  /**
+   * Prune old confirmed anchors, keeping the most recent `keep` entries.
+   * Removes bundle_json from older confirmed anchors to reclaim storage.
+   */
+  pruneOldAnchors(keep: number = 100) {
+    // Null out bundle_json for old confirmed anchors beyond the retention window.
+    // We keep the metadata (tx IDs, heights) for auditability but free the large payload.
+    this.sql.exec(
+      `UPDATE anchors SET bundle_json = '{}' WHERE status = 'confirmed'
+       AND id NOT IN (SELECT id FROM anchors WHERE status = 'confirmed' ORDER BY created_at DESC LIMIT ?)`,
+      keep,
+    );
+  }
 }
