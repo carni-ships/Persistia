@@ -999,6 +999,10 @@ export class PersistiaWorldV4 implements DurableObject {
           try { events = JSON.parse(anchorVertex.events_json); } catch {}
         }
 
+        // Compute active_nodes at commit time from the signature/vertex count
+        // This is more accurate than the current live count for historical blocks
+        const commitActiveNodes = Math.max(signatures.length, vertices.length, 1);
+
         return this.json({
           round,
           hash: anchor.anchor_hash,
@@ -1006,6 +1010,7 @@ export class PersistiaWorldV4 implements DurableObject {
           signatures,
           events,
           vertex_count: vertices.length,
+          active_nodes: commitActiveNodes,
         });
       }
 

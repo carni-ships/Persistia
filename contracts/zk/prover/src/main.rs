@@ -292,8 +292,7 @@ async fn fetch_block_input(
     let (status_resp, block_resp, vertices_resp, commitment_resp) =
         tokio::try_join!(status_fut, block_fut, vertices_fut, commitment_fut)?;
 
-    let status: serde_json::Value = status_resp.json().await?;
-    let active_nodes = status["active_nodes"].as_u64().unwrap_or(1) as u32;
+    let _status: serde_json::Value = status_resp.json().await?;
 
     if !block_resp.status().is_success() {
         anyhow::bail!("Block {} not committed yet (HTTP {})", block_number, block_resp.status());
@@ -302,6 +301,10 @@ async fn fetch_block_input(
     if block.get("error").is_some() {
         anyhow::bail!("Block {} error: {}", block_number, block["error"]);
     }
+
+    // Use block-level active_nodes (reflects actual validator count at commit time)
+    // rather than current live count — prevents quorum mismatch on historical blocks
+    let active_nodes = block["active_nodes"].as_u64().unwrap_or(1) as u32;
 
     let commitment: serde_json::Value = commitment_resp.json().await?;
     let state_root_hex = commitment["root"]
@@ -431,8 +434,7 @@ async fn fetch_block_evidence(
     let (block_resp, vertices_resp, status_resp, commitment_resp) =
         tokio::try_join!(block_fut, vertices_fut, status_fut, commitment_fut)?;
 
-    let status: serde_json::Value = status_resp.json().await?;
-    let active_nodes = status["active_nodes"].as_u64().unwrap_or(1) as u32;
+    let _status: serde_json::Value = status_resp.json().await?;
 
     if !block_resp.status().is_success() {
         anyhow::bail!("Block {} not committed yet", block_number);
@@ -441,6 +443,9 @@ async fn fetch_block_evidence(
     if block.get("error").is_some() {
         anyhow::bail!("Block {} error: {}", block_number, block["error"]);
     }
+
+    // Use block-level active_nodes (actual validator count at commit time)
+    let active_nodes = block["active_nodes"].as_u64().unwrap_or(1) as u32;
 
     let commitment: serde_json::Value = commitment_resp.json().await?;
     let state_root_hex = commitment["root"].as_str()
