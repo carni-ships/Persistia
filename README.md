@@ -59,7 +59,7 @@ src/
   wallet.ts               # Bech32 addresses, account model, token transfers
   contract-executor.ts    # WASM smart contract runtime
   state-proofs.ts         # Incremental Merkle tree and state commitments
-  anchoring.ts            # Arweave + Celestia state anchoring
+  anchoring.ts            # Arweave + Berachain state anchoring
   cross-shard.ts          # Cross-shard message relay (notes + nullifiers)
   mpp.ts                  # Machine Payment Protocol (HTTP 402)
   oracle.ts               # Decentralized oracle with multi-node aggregation
@@ -168,5 +168,5 @@ The prover watches for new committed rounds, generates SP1 STARK proofs, and sub
 - **No native token**: Validators participate based on reputation, not stake
 - **Bech32 addresses**: Compatible with Cosmos ecosystem address format (`persistia1...`)
 - **Deterministic execution**: No floats, no WASI, fuel-metered WASM
-- **Dual anchoring**: Arweave (permanent) + Celestia (DA sampling) for redundancy
+- **Dual anchoring**: Arweave (permanent) + Berachain (EVM L1) for redundancy
 - **Edge-native**: Runs entirely on Cloudflare's free tier
