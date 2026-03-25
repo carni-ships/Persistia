@@ -1,6 +1,7 @@
 import { PersistiaWorldV4 } from "./PersistiaDO";
 import DASHBOARD_HTML from "../client/dashboard.html";
 import GAME_HTML from "../client/game.html";
+import VERIFIER_HTML from "../client/verifier.html";
 export { PersistiaWorldV4 };
 
 const CORS_HEADERS: Record<string, string> = {
@@ -93,6 +94,13 @@ export default {
     // ─── Dashboard ─────────────────────────────────────────────────────
     if (url.pathname === "/dashboard" || url.pathname === "/dashboard.html") {
       return new Response(DASHBOARD_HTML, {
+        headers: { "Content-Type": "text/html;charset=utf-8", ...CORS_HEADERS },
+      });
+    }
+
+    // ─── Verifier ─────────────────────────────────────────────────────
+    if (url.pathname === "/verifier" || url.pathname === "/verifier.html") {
+      return new Response(VERIFIER_HTML, {
         headers: { "Content-Type": "text/html;charset=utf-8", ...CORS_HEADERS },
       });
     }
