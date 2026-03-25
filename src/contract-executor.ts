@@ -161,6 +161,7 @@ function getMutations(ctx: ExecutionContext, address: string): Map<string, Uint8
 // ─── WASM Validation ──────────────────────────────────────────────────────────
 
 const MAX_WASM_SIZE = 1_048_576; // 1MB
+const MAX_CONTRACT_STATE_BYTES = 2_097_152; // 2MB per contract — prevents single contract from exhausting DO storage
 const WASM_MAGIC = new Uint8Array([0x00, 0x61, 0x73, 0x6d]);
 const SECTION_IMPORT = 2;
 
@@ -1022,6 +1023,13 @@ export class ContractExecutor {
   private flushAllMutations(ctx: ExecutionContext): { contract: string; key: string; deleted: boolean }[] {
     const flushed: { contract: string; key: string; deleted: boolean }[] = [];
     for (const [contractAddr, mutations] of ctx.mutations) {
+      // Enforce per-contract storage quota before writing
+      const sizeRows = [...this.sql.exec(
+        "SELECT SUM(LENGTH(key) + LENGTH(value)) as total FROM contract_state WHERE contract_address = ?",
+        contractAddr,
+      )] as any[];
+      let currentSize = (sizeRows[0]?.total ?? 0) as number;
+
       for (const [keyHex, value] of mutations) {
         const keyBytes = hexToBytes(keyHex);
         if (value === null) {
@@ -1031,11 +1039,16 @@ export class ContractExecutor {
           );
           flushed.push({ contract: contractAddr, key: keyHex, deleted: true });
         } else {
+          const writeSize = keyBytes.length + value.length;
+          if (currentSize + writeSize > MAX_CONTRACT_STATE_BYTES) {
+            throw new Error(`Contract ${contractAddr} exceeded storage quota (${MAX_CONTRACT_STATE_BYTES} bytes)`);
+          }
           this.sql.exec(
             `INSERT INTO contract_state (contract_address, key, value) VALUES (?, ?, ?)
              ON CONFLICT(contract_address, key) DO UPDATE SET value = ?`,
             contractAddr, keyBytes, value, value,
           );
+          currentSize += writeSize;
           flushed.push({ contract: contractAddr, key: keyHex, deleted: false });
         }
       }

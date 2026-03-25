@@ -865,6 +865,59 @@ export class PersistiaWorldV4 implements DurableObject {
       sql.exec("DELETE FROM oracle_requests WHERE status = 'delivered' AND delivered_at < ? LIMIT 50", oneHourAgo);
       sql.exec("DELETE FROM oracle_responses WHERE request_id NOT IN (SELECT id FROM oracle_requests) LIMIT 50");
 
+      // 7d. Prune old ZK proofs — recursive IVC means the latest proof subsumes all previous.
+      // Keep only the last 5 proofs for redundancy; older ones are cryptographically unnecessary.
+      const zkKeep = 5;
+      sql.exec(
+        `DELETE FROM zk_proofs WHERE block_number NOT IN (
+           SELECT block_number FROM zk_proofs ORDER BY block_number DESC LIMIT ?
+         )`, zkKeep,
+      );
+
+      // 7e. Prune old block headers — keep last 1000 for light client sync
+      if (this.currentRound > 1200) {
+        sql.exec(
+          "DELETE FROM block_headers WHERE block_number < ? LIMIT 200",
+          this.currentRound - 1000,
+        );
+      }
+
+      // 7f. Prune cross-shard messages: expire undelivered outbox after 100 rounds,
+      // delete processed inbox older than 1 hour
+      const xshardExpireRound = Math.max(0, this.currentRound - 100);
+      sql.exec(
+        "UPDATE xshard_outbox SET status = 'expired' WHERE status = 'pending' AND created_at < ?",
+        Date.now() - 100 * ROUND_INTERVAL_MS,
+      );
+      sql.exec("DELETE FROM xshard_outbox WHERE status IN ('delivered', 'expired') AND created_at < ? LIMIT 100", oneHourAgo);
+      sql.exec("DELETE FROM xshard_inbox WHERE status IN ('processed', 'failed') AND processed_at < ? LIMIT 100", oneHourAgo);
+
+      // 7g. Prune consumed notes older than 1000 rounds (nullifiers must stay forever)
+      if (this.currentRound > 1200) {
+        sql.exec(
+          "DELETE FROM notes WHERE consumed = 1 AND created_round < ? LIMIT 100",
+          this.currentRound - 1000,
+        );
+      }
+
+      // 7h. Prune expired MPP challenges (unconsumed + expired)
+      sql.exec("DELETE FROM mpp_challenges WHERE consumed = 0 AND expires_at < ? LIMIT 100", Date.now());
+
+      // 7i. Prune old governance votes (keep last 90 days)
+      const ninetyDaysAgo = Date.now() - 90 * 86_400_000;
+      sql.exec("DELETE FROM governance_votes WHERE created_at < ? LIMIT 50", ninetyDaysAgo);
+
+      // 7j. Prune old equivocation evidence (keep last 30 days)
+      const thirtyDaysAgo = Date.now() - 30 * 86_400_000;
+      sql.exec("DELETE FROM equivocation_evidence WHERE detected_at < ? LIMIT 50", thirtyDaysAgo);
+
+      // 7k. Prune stale private_state entries not updated in 90 days
+      sql.exec("DELETE FROM private_state WHERE updated_at < ? LIMIT 50", ninetyDaysAgo);
+
+      // 7l. Prune expired proof_claims (completed or expired older than 1 day)
+      const oneDayAgo = Date.now() - 86_400_000;
+      sql.exec("DELETE FROM proof_claims WHERE status IN ('completed', 'expired') AND claimed_at < ? LIMIT 50", oneDayAgo);
+
       // 8. Periodically reprobe failed peers (every ~5 min)
       if (CONSENSUS_ENABLED && this.currentRound % 10 === 0) {
         this.gossipManager.reprobeFailedPeers().catch(() => {});
