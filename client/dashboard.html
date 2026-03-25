@@ -1196,10 +1196,16 @@ function renderChain(chain, results) {
   for (let i = 0; i < chain.length; i++) {
     const p = chain[i];
     const status = results ? results[i] : 'unchecked';
-    const dotClass = status === true ? 'verified' : status === false ? 'failed' : 'unchecked';
-    if (i > 0) html += '<div class="chain-arrow">\u2192</div>';
+    const dotClass = status === true ? 'verified' : status === false ? 'failed' : status === 'old' ? 'unchecked' : 'unchecked';
+    // Show segment break marker
+    if (i > 0 && p.proven_blocks <= chain[i-1].proven_blocks) {
+      html += '<div class="chain-arrow" style="color:var(--yellow);font-size:10px;padding:0 4px" title="Prover restart — new IVC segment">|</div>';
+    } else if (i > 0) {
+      html += '<div class="chain-arrow">\u2192</div>';
+    }
+    const opacity = status === 'old' ? 'opacity:0.4' : '';
     html += `
-      <div class="chain-block" title="Block ${p.block_number}\nRoot: ${p.state_root}\nProven: ${p.proven_blocks} blocks">
+      <div class="chain-block" title="Block ${p.block_number}\nRoot: ${p.state_root}\nProven: ${p.proven_blocks} blocks" style="${opacity}">
         <div class="chain-block-num">B${p.block_number}</div>
         <div class="chain-block-root">${(p.state_root || '').slice(0, 8)}..</div>
         <div class="chain-block-dot ${dotClass}"></div>
@@ -1247,15 +1253,37 @@ async function runVerification() {
       vlog(`Current consensus: round ${dagStatus.current_round}, committed ${dagStatus.last_committed_round}`, 'info');
     } catch {}
 
-    // ─── Verification Checks ─────────────────────────────────
+    // ─── Segment Detection ─────────────────────────────────
+    // The prover may have been restarted without chaining to the previous proof,
+    // creating multiple independent IVC segments. Detect boundaries where
+    // proven_blocks drops (new genesis) and validate each segment independently.
+
+    const segments = [];
+    let segStart = 0;
+    for (let i = 1; i < chain.length; i++) {
+      if (chain[i].proven_blocks <= chain[i - 1].proven_blocks) {
+        segments.push(chain.slice(segStart, i));
+        segStart = i;
+      }
+    }
+    segments.push(chain.slice(segStart));
+
+    vlog(`Detected ${segments.length} IVC segment(s)`, 'info');
+    for (let s = 0; s < segments.length; s++) {
+      const seg = segments[s];
+      vlog(`  Segment ${s + 1}: B${seg[0].block_number}..B${seg[seg.length-1].block_number} (${seg.length} proofs, ${seg[seg.length-1].proven_blocks} blocks proven)`, 'info');
+    }
+
+    // The canonical segment is the latest (longest continuous IVC chain)
+    const canonical = segments[segments.length - 1];
 
     let allPassed = true;
     const results = new Array(chain.length).fill(null);
 
     // Check 1: Chain is non-empty
-    addCheck('Proof chain exists', true, `${chain.length} proof(s) in chain`);
+    addCheck('Proof chain exists', true, `${chain.length} proof(s) across ${segments.length} segment(s)`);
 
-    // Check 2: Block numbers are monotonically increasing
+    // Check 2: Block numbers are monotonically increasing (across all proofs)
     let blocksOrdered = true;
     for (let i = 1; i < chain.length; i++) {
       if (chain[i].block_number <= chain[i - 1].block_number) {
@@ -1269,23 +1297,37 @@ async function runVerification() {
     if (!blocksOrdered) allPassed = false;
     vlog(blocksOrdered ? 'Block ordering: OK' : 'Block ordering: FAILED', blocksOrdered ? 'pass' : 'fail');
 
-    // Check 3: proven_blocks accumulates correctly
-    let accumulationOK = true;
-    for (let i = 1; i < chain.length; i++) {
-      if (chain[i].proven_blocks <= chain[i - 1].proven_blocks) {
-        accumulationOK = false;
-        vlog(`Accumulation violation at B${chain[i].block_number}: ${chain[i].proven_blocks} <= ${chain[i-1].proven_blocks}`, 'fail');
-        break;
+    // Check 3: IVC segments — each segment's proven_blocks accumulates correctly
+    let segmentsValid = true;
+    for (let s = 0; s < segments.length; s++) {
+      const seg = segments[s];
+      for (let i = 1; i < seg.length; i++) {
+        if (seg[i].proven_blocks <= seg[i - 1].proven_blocks) {
+          segmentsValid = false;
+          vlog(`Segment ${s+1} accumulation break at B${seg[i].block_number}: ${seg[i].proven_blocks} <= ${seg[i-1].proven_blocks}`, 'fail');
+          break;
+        }
       }
     }
-    addCheck('Proven block count accumulates', accumulationOK,
-      accumulationOK ? `Chain length: ${chain[chain.length-1].proven_blocks} blocks` : 'Accumulation violation');
-    if (!accumulationOK) allPassed = false;
-    vlog(accumulationOK ? `Accumulation: OK (${chain[chain.length-1].proven_blocks} total)` : 'Accumulation: FAILED', accumulationOK ? 'pass' : 'fail');
+    addCheck('IVC segments internally consistent', segmentsValid,
+      segmentsValid
+        ? `${segments.length} segment(s), canonical: ${canonical.length} proofs (${canonical[canonical.length-1].proven_blocks} blocks)`
+        : 'Internal accumulation violation in a segment');
+    if (!segmentsValid) allPassed = false;
+    vlog(segmentsValid ? `Segment integrity: all ${segments.length} segments valid` : 'Segment integrity: FAILED', segmentsValid ? 'pass' : 'fail');
 
-    // Check 4: Genesis root consistency
+    // Check 4: Prover restart awareness
+    if (segments.length > 1) {
+      addCheck('Prover restarts detected', null,
+        `${segments.length - 1} restart(s) detected \u2014 prover was restarted without chaining to previous proof. Only the latest segment (${canonical.length} proofs) forms a continuous IVC chain.`);
+      vlog(`Note: ${segments.length - 1} prover restart(s) created separate IVC segments`, 'info');
+    } else {
+      addCheck('Single continuous IVC chain', true, `All ${chain.length} proofs form one unbroken chain`);
+    }
+
+    // Check 5: Genesis root consistency (within canonical segment)
     let genesisConsistent = true;
-    const genesisRoots = chain.filter(p => p.genesis_root).map(p => p.genesis_root);
+    const genesisRoots = canonical.filter(p => p.genesis_root).map(p => p.genesis_root);
     if (genesisRoots.length > 1) {
       const first = genesisRoots[0];
       for (const gr of genesisRoots) {
@@ -1293,12 +1335,12 @@ async function runVerification() {
       }
     }
     const hasGenesis = genesisRoots.length > 0;
-    addCheck('Genesis root consistent', hasGenesis ? genesisConsistent : null,
-      hasGenesis ? (genesisConsistent ? `All proofs share genesis ${genesisRoots[0].slice(0,16)}..` : 'Genesis root mismatch!') : 'No genesis root data available');
+    addCheck('Genesis root consistent (canonical)', hasGenesis ? genesisConsistent : null,
+      hasGenesis ? (genesisConsistent ? `All proofs share genesis ${genesisRoots[0].slice(0,16)}..` : 'Genesis root mismatch!') : 'No genesis root data (legacy proofs)');
     if (hasGenesis && !genesisConsistent) allPassed = false;
     vlog(hasGenesis ? (genesisConsistent ? 'Genesis root: consistent' : 'Genesis root: MISMATCH') : 'Genesis root: not available (legacy proofs)', hasGenesis ? (genesisConsistent ? 'pass' : 'fail') : 'info');
 
-    // Check 5: State roots are non-zero
+    // Check 6: State roots are non-zero
     let rootsValid = true;
     for (const p of chain) {
       if (!p.state_root || p.state_root === '0'.repeat(64)) {
@@ -1312,13 +1354,13 @@ async function runVerification() {
     if (!rootsValid) allPassed = false;
     vlog(rootsValid ? 'State roots: all non-zero' : 'State roots: ZERO ROOT FOUND', rootsValid ? 'pass' : 'fail');
 
-    // Check 6: Public values available (for deeper verification)
+    // Check 7: Public values available
     const withPV = chain.filter(p => p.public_values);
     addCheck('Public values available', withPV.length > 0 ? true : null,
-      withPV.length > 0 ? `${withPV.length}/${chain.length} proofs have decoded public values` : 'No decoded public values (legacy proofs)');
+      withPV.length > 0 ? `${withPV.length}/${chain.length} proofs have decoded public values` : 'Legacy proofs \u2014 new proofs will include decoded values');
     vlog(`Public values: ${withPV.length}/${chain.length} available`, withPV.length > 0 ? 'pass' : 'info');
 
-    // Check 7: Public values chain integrity
+    // Check 8: Public values chain integrity
     if (withPV.length >= 2) {
       let pvChainOK = true;
       for (let i = 0; i < withPV.length; i++) {
@@ -1335,18 +1377,20 @@ async function runVerification() {
       vlog(pvChainOK ? 'PV \u2194 stored root: match' : 'PV \u2194 stored root: MISMATCH', pvChainOK ? 'pass' : 'fail');
     }
 
-    // Check 8: Proof bytes available for download
+    // Check 9: Proof bytes available for download
     const withBytes = chain.filter(p => p.has_proof_bytes);
     addCheck('Proof bytes stored', withBytes.length > 0 ? true : null,
-      `${withBytes.length}/${chain.length} proofs have downloadable bytes`);
+      withBytes.length > 0
+        ? `${withBytes.length}/${chain.length} proofs have downloadable bytes`
+        : 'Legacy proofs \u2014 new proofs will include downloadable bytes');
     vlog(`Proof bytes: ${withBytes.length}/${chain.length} downloadable`, withBytes.length > 0 ? 'pass' : 'info');
 
-    // Check 9: Proof hash is present and non-empty
+    // Check 10: Proof hashes present
     const withHash = chain.filter(p => p.proof_hash && p.proof_hash.length > 0);
     addCheck('Proof hashes present', withHash.length === chain.length,
       `${withHash.length}/${chain.length} have SHA-256 hashes`);
 
-    // Check 10: Cross-reference with consensus
+    // Check 11: Cross-reference with consensus
     if (dagStatus) {
       const lastProven = chain[chain.length - 1].block_number;
       const lastCommitted = dagStatus.last_committed_round;
@@ -1357,10 +1401,15 @@ async function runVerification() {
       vlog(`Consensus: proven B${lastProven} / committed B${lastCommitted} (gap: ${gap})`, gap >= 0 ? 'pass' : 'fail');
     }
 
-    // Mark chain blocks
+    // Mark chain blocks — color by segment membership
+    let segIdx = 0;
+    let segPos = 0;
     for (let i = 0; i < chain.length; i++) {
-      results[i] = true;
+      if (segPos >= segments[segIdx].length) { segIdx++; segPos = 0; }
+      // Canonical segment = green, older segments = neutral
+      results[i] = segIdx === segments.length - 1 ? true : 'old';
       if (!chain[i].state_root || chain[i].state_root === '0'.repeat(64)) results[i] = false;
+      segPos++;
     }
     renderChain(chain, results);
 
@@ -1380,9 +1429,12 @@ async function runVerification() {
     document.getElementById('v-time').textContent = `verified in ${elapsed}s`;
 
     if (allPassed) {
+      const segNote = segments.length > 1
+        ? ` (${segments.length} segments, canonical: ${canonical[canonical.length-1].proven_blocks} blocks)`
+        : ` \u2014 ${canonical[canonical.length-1].proven_blocks} blocks proven back to genesis`;
       setVerifyStatus('\u2713', 'pass', 'Chain Verified',
-        `${chain.length} proofs verified \u2014 ${chain[chain.length-1].proven_blocks} blocks proven back to genesis`);
-      vlog(`\nVerification PASSED in ${elapsed}s \u2014 IVC chain intact`, 'pass');
+        `${chain.length} proofs verified${segNote}`);
+      vlog(`\nVerification PASSED in ${elapsed}s \u2014 all IVC segments intact`, 'pass');
     } else {
       setVerifyStatus('\u2717', 'fail', 'Verification Failed', 'One or more checks failed');
       vlog(`\nVerification FAILED in ${elapsed}s`, 'fail');
