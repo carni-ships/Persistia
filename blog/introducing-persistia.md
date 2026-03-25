@@ -71,9 +71,23 @@ This is BFT-safe finality — the same guarantee as Tendermint or HotStuff. The 
 
 ### Level 3: ZK Proven — minutes
 
-The SP1 prover watches committed rounds and generates STARK proofs that attest to three properties: BFT quorum signatures were valid, the Merkle state root transition is correct, and the previous proof in the chain verifies (recursive IVC). Any third party can verify the proof without trusting the validators. The proof chain is continuous back to genesis.
+The SP1 prover watches committed rounds and generates **STARK proofs** that attest to three properties: BFT quorum signatures were valid, the Merkle state root transition is correct, and the previous proof in the chain verifies. Any third party can verify the proof without trusting the validators.
 
-With batch proving (up to 32 blocks per proof), the amortized proving cost drops to ~1–3 minutes per block on consumer hardware.
+#### Recursive Proofs (IVC)
+
+The key design choice is **Incrementally Verifiable Computation (IVC)**: each proof includes a verification of the *previous* proof as part of its circuit. This creates a cryptographic chain stretching back to genesis — proof N attests to the validity of all state transitions from block 0 through block N.
+
+This recursion has three major benefits:
+
+1. **Constant verification cost.** A verifier only needs to check the latest proof. It doesn't matter whether the chain has 100 blocks or 10 million — the verification time and proof size are the same (~200ms, ~few KB). This is what makes the light client practical: verify one proof, trust the entire history.
+
+2. **No trusted checkpoints.** Traditional light clients bootstrap from a trusted recent state (Ethereum's sync committees, Cosmos's trusted height). With a recursive proof chain, the genesis block *is* the trust root, and the latest proof cryptographically covers every state transition since then. There's nothing to trust except math.
+
+3. **Composable bridging.** A Berachain smart contract that can verify one SP1 proof can verify the entire Persistia chain. This makes the anchoring bridge trustless: the contract checks the proof, extracts the state root, and knows it's valid without relying on any multisig, oracle, or committee.
+
+#### Batch Proving
+
+The prover supports batch mode (up to 32 blocks per proof), amortizing the fixed overhead of proof generation. On consumer hardware, this brings the amortized cost to ~1–3 minutes per block. The batch boundary is also the IVC step boundary — each batch proof verifies the previous batch proof, maintaining the recursive chain.
 
 ### Level 4: DA Anchored — minutes
 
@@ -350,6 +364,69 @@ This means:
 - **CI/CD pipelines** can assert on-chain state as part of deployment verification
 
 No library to install. No protocol to implement. No peers to discover. Just `fetch()`, `sha256()`, and `ed25519.verify()`.
+
+## Fully On-Chain Applications
+
+Most "decentralized apps" aren't. The smart contract runs on-chain, but the frontend is hosted on Vercel, the backend talks to a centralized API, and the governance is a Discord vote. The app isn't on-chain — just the settlement layer is.
+
+Persistia is different because the consensus network **is** an HTTP server. Cloudflare Workers serve web requests at the edge, and Durable Objects provide persistent state. This means a Persistia node can serve a complete web application — HTML, CSS, JavaScript — directly from contract state, with no external hosting.
+
+### How It Works
+
+1. **Deploy a WASM contract** with your business logic (storage, token mechanics, access control)
+2. **Upload frontend files** to the contract's state via `app.upload` events — HTML, CSS, JS stored as key-value pairs under the `_app/` prefix
+3. **Visit `/app/{contract_address}/`** — the node reads frontend files from contract state and serves them with proper MIME types
+4. **The frontend calls its own contract** via `/contract/query` and `/contract/call` endpoints, signing transactions with Ed25519 keys
+
+The entire application — frontend, backend logic, state, payments, governance — lives on the consensus network.
+
+### The Full Stack
+
+Every layer of a traditional web application has an on-chain equivalent in Persistia:
+
+| Layer | Traditional | Persistia On-Chain |
+|-------|------------|-------------------|
+| **Frontend** | Vercel, Netlify, S3 | Contract state served at `/app/{addr}/` |
+| **Backend Logic** | Express, Django, Rails | WASM smart contracts with cross-contract calls |
+| **Database** | PostgreSQL, MongoDB | Contract KV storage + SQL over the chain |
+| **Authentication** | OAuth, JWT, sessions | Ed25519 signatures on every request |
+| **Payments** | Stripe, PayPal | MPP (HTTP 402) with on-chain token transfers |
+| **Cron Jobs** | AWS Lambda, crontab | Triggers (DO alarms with configurable intervals) |
+| **External Data** | API calls, webhooks | Oracles (multi-node consensus on off-chain data) |
+| **CDN / Hosting** | Cloudflare, AWS | Consensus network IS the CDN (300+ edge locations) |
+| **Governance** | Discord votes, multisig | Reputation-weighted on-chain voting |
+| **State Proofs** | Trust the server | Merkle proofs + recursive ZK proof chain |
+| **Cross-Service** | REST APIs, gRPC | Cross-shard messaging with nullifier-based atomicity |
+| **Privacy** | Hope the DB isn't leaked | Commitment-based private state, notes + nullifiers |
+
+### Developer Experience
+
+The `PersistiaApp` SDK (served at `/app/sdk.js`) provides a client-side library:
+
+```javascript
+const app = new PersistiaApp({ contract: "abc123..." });
+
+// Read state (no signature needed)
+const count = await app.query("get_count");
+
+// Mutate state (requires Ed25519 keypair)
+const keypair = await PersistiaApp.generateKeypair();
+await app.call("increment", new Uint8Array(), keypair);
+
+// Real-time updates via WebSocket
+app.connect();
+app.on("contract.called", (msg) => console.log("State changed:", msg));
+```
+
+### Why This Matters
+
+When your frontend, contracts, payments, governance, and data all live on the same consensus network, you get properties that are impossible with the typical dApp architecture:
+
+- **Atomic deploys**: Frontend + contract upgrade in one signed event
+- **No DNS dependency**: Apps are addressable by contract address
+- **MPP-gated apps**: The entire app can be behind a paywall, verified on-chain
+- **Provable state**: Every piece of data the UI shows is backed by a Merkle proof
+- **No vendor lock-in**: Any Persistia node can serve the app — there's no single hosting provider to depend on
 
 ## What's Novel
 

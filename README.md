@@ -139,6 +139,11 @@ blog/
 | `/notes/create` | POST | Create a cross-shard note |
 | `/notes/consume` | POST | Consume a note (with nullifier) |
 | `/covenant/create` | POST | Create a covenant state machine |
+| `/app/{address}/` | GET | Serve on-chain app frontend |
+| `/app/sdk.js` | GET | Persistia App SDK (JavaScript) |
+| `/apps` | GET | List deployed on-chain apps |
+| `/contract/app/upload` | POST | Upload frontend files to a contract |
+| `/contract/app/files` | GET | List uploaded app files |
 
 ## Smart Contracts
 

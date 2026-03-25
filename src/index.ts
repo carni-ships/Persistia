@@ -3,6 +3,7 @@ import DASHBOARD_HTML from "../client/dashboard.html";
 import GAME_HTML from "../client/game.html";
 import VERIFIER_HTML from "../client/verifier.html";
 import WALLET_HTML from "../client/wallet.html";
+import { APP_SDK_JS } from "./app-sdk";
 export { PersistiaWorldV4 };
 
 const CORS_HEADERS: Record<string, string> = {
@@ -191,6 +192,54 @@ export default {
           anchor_bootstrap: "/anchor/bootstrap",
         },
       }));
+    }
+
+    // ─── App SDK ──────────────────────────────────────────────────────
+    if (url.pathname === "/app/sdk.js") {
+      return new Response(APP_SDK_JS, {
+        headers: { "Content-Type": "application/javascript;charset=utf-8", "Cache-Control": "public, max-age=300", ...CORS_HEADERS },
+      });
+    }
+
+    // ─── On-Chain App Serving ────────────────────────────────────────
+    // Routes: /app/{contract_address}/...filepath
+    // Serves frontend files stored in contract state under _app/ prefix
+    const appMatch = url.pathname.match(/^\/app\/([a-f0-9]{16,64})(\/.*)?$/);
+    if (appMatch) {
+      const contractAddress = appMatch[1];
+      const filePath = appMatch[2] || "/index.html";
+      const appShardName = url.searchParams.get("shard") || "global-world";
+      const appId = env.PERSISTIA_WORLD.idFromName(appShardName);
+      const appStub = env.PERSISTIA_WORLD.get(appId);
+
+      // Proxy to DO's /app-serve endpoint
+      const appHeaders = new Headers(request.headers);
+      appHeaders.set("X-Shard-Name", appShardName);
+      const appRes = await appStub.fetch(new Request(
+        `${url.origin}/app-serve?contract=${contractAddress}&path=${encodeURIComponent(filePath)}`,
+        { method: "GET", headers: appHeaders },
+      ));
+
+      const appResponse = new Response(appRes.body, appRes);
+      for (const [k, v] of Object.entries(CORS_HEADERS)) {
+        appResponse.headers.set(k, v);
+      }
+      return appResponse;
+    }
+
+    // ─── App Registry ────────────────────────────────────────────────
+    if (url.pathname === "/apps") {
+      const appsShardName = url.searchParams.get("shard") || "global-world";
+      const appsId = env.PERSISTIA_WORLD.idFromName(appsShardName);
+      const appsStub = env.PERSISTIA_WORLD.get(appsId);
+      const appsHeaders = new Headers(request.headers);
+      appsHeaders.set("X-Shard-Name", appsShardName);
+      const appsRes = await appsStub.fetch(new Request(`${url.origin}/app-serve?list=1`, { headers: appsHeaders }));
+      const appsResponse = new Response(appsRes.body, appsRes);
+      for (const [k, v] of Object.entries(CORS_HEADERS)) {
+        appsResponse.headers.set(k, v);
+      }
+      return appsResponse;
     }
 
     // ─── Standard routing to shard DO ───────────────────────────────────

@@ -415,6 +415,9 @@ export class PersistiaWorldV4 implements DurableObject {
       if (url.pathname.startsWith("/mpp/")) {
         return this.handleMPPRoute(req, url);
       }
+      if (url.pathname === "/app-serve") {
+        return this.handleAppServe(req, url);
+      }
 
       // MPP middleware: check if route requires payment
       const mppResult = await this.mppHandler.middleware(req);
@@ -1295,9 +1298,137 @@ export class PersistiaWorldV4 implements DurableObject {
         return this.json({ triggers: this.triggerManager.listForContract(contract) });
       }
 
+      // ─── App upload endpoint ──────────────────────────────────────
+      case "/contract/app/upload": {
+        if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+        const body = await req.json() as SignedEvent;
+        body.type = "app.upload";
+        return this.json(await this.receiveClientEvent(body));
+      }
+
+      case "/contract/app/files": {
+        const contract = url.searchParams.get("contract");
+        if (!contract) return this.json({ error: "contract required" }, 400);
+        const prefix = new TextEncoder().encode("_app/");
+        const rows = [...this.state.storage.sql.exec(
+          "SELECT key FROM contract_state WHERE contract_address = ? AND key >= ? AND key < ?",
+          contract, prefix, new Uint8Array([...prefix.slice(0, -1), prefix[prefix.length - 1] + 1]),
+        )];
+        const files = rows.map((r: any) => {
+          const keyBytes = r.key instanceof Uint8Array ? r.key : new Uint8Array(r.key);
+          return new TextDecoder().decode(keyBytes).replace("_app/", "");
+        });
+        return this.json({ contract, files });
+      }
+
       default:
         return this.json({ error: "Unknown contract endpoint" }, 404);
     }
+  }
+
+  // ─── On-Chain App Serving ──────────────────────────────────────────────
+
+  private handleAppServe(_req: Request, url: URL): Response {
+    const sql = this.state.storage.sql;
+
+    // App registry listing
+    if (url.searchParams.get("list")) {
+      // Find all contracts that have _app/ keys
+      const prefix = new TextEncoder().encode("_app/index.html");
+      const rows = [...sql.exec(
+        "SELECT DISTINCT contract_address FROM contract_state WHERE key = ?", prefix,
+      )];
+      const apps = rows.map((r: any) => {
+        const info = this.contractExecutor.getContractInfo(r.contract_address);
+        return {
+          contract: r.contract_address,
+          deployer: info?.deployer,
+          url: `/app/${r.contract_address}/`,
+        };
+      });
+      return this.json({ apps });
+    }
+
+    const contract = url.searchParams.get("contract");
+    const rawPath = decodeURIComponent(url.searchParams.get("path") || "/index.html");
+
+    if (!contract) return this.json({ error: "contract required" }, 400);
+
+    // Sanitize path
+    let filePath = rawPath.replace(/^\/+/, "") || "index.html";
+    if (filePath === "" || filePath.endsWith("/")) filePath += "index.html";
+    if (filePath.includes("..")) return this.json({ error: "Invalid path" }, 400);
+
+    // Manifest request
+    if (filePath === "_manifest") {
+      const prefix = new TextEncoder().encode("_app/");
+      const rows = [...sql.exec(
+        "SELECT key, length(value) as size FROM contract_state WHERE contract_address = ? AND key >= ? AND key < ?",
+        contract, prefix, new Uint8Array([...prefix.slice(0, -1), prefix[prefix.length - 1] + 1]),
+      )];
+      const files = rows.map((r: any) => {
+        const keyBytes = r.key instanceof Uint8Array ? r.key : new Uint8Array(r.key);
+        return { path: new TextDecoder().decode(keyBytes).replace("_app/", ""), size: r.size };
+      });
+      return this.json({ contract, files });
+    }
+
+    // Look up the file in contract state
+    const stateKey = new TextEncoder().encode(`_app/${filePath}`);
+    const rows = [...sql.exec(
+      "SELECT value FROM contract_state WHERE contract_address = ? AND key = ?",
+      contract, stateKey,
+    )];
+
+    if (rows.length === 0) {
+      // SPA fallback: try index.html if specific path not found
+      const indexKey = new TextEncoder().encode("_app/index.html");
+      const indexRows = [...sql.exec(
+        "SELECT value FROM contract_state WHERE contract_address = ? AND key = ?",
+        contract, indexKey,
+      )];
+      if (indexRows.length > 0 && !filePath.includes(".")) {
+        const data = (indexRows[0] as any).value;
+        const body = data instanceof Uint8Array ? data : new Uint8Array(data);
+        return new Response(body, {
+          headers: { "Content-Type": "text/html;charset=utf-8", "Cache-Control": "public, max-age=60" },
+        });
+      }
+      return new Response("Not Found", { status: 404 });
+    }
+
+    const data = (rows[0] as any).value;
+    const body = data instanceof Uint8Array ? data : new Uint8Array(data);
+    const contentType = this.mimeFromPath(filePath);
+
+    return new Response(body, {
+      headers: { "Content-Type": contentType, "Cache-Control": "public, max-age=60" },
+    });
+  }
+
+  private mimeFromPath(path: string): string {
+    const ext = path.split(".").pop()?.toLowerCase() || "";
+    const mimeMap: Record<string, string> = {
+      html: "text/html;charset=utf-8",
+      css: "text/css;charset=utf-8",
+      js: "application/javascript;charset=utf-8",
+      mjs: "application/javascript;charset=utf-8",
+      json: "application/json;charset=utf-8",
+      png: "image/png",
+      jpg: "image/jpeg",
+      jpeg: "image/jpeg",
+      gif: "image/gif",
+      svg: "image/svg+xml",
+      ico: "image/x-icon",
+      woff: "font/woff",
+      woff2: "font/woff2",
+      ttf: "font/ttf",
+      wasm: "application/wasm",
+      txt: "text/plain;charset=utf-8",
+      xml: "application/xml",
+      webp: "image/webp",
+    };
+    return mimeMap[ext] || "application/octet-stream";
   }
 
   // ─── State Proof Routes ─────────────────────────────────────────────────
@@ -3040,6 +3171,31 @@ export class PersistiaWorldV4 implements DurableObject {
         if (rows.length === 0) return { ok: false, error: "Contract not found" };
         return { ok: true };
       }
+      case "app.upload": {
+        if (!payload.contract) return { ok: false, error: "Missing contract address" };
+        if (!payload.files || !Array.isArray(payload.files) || payload.files.length === 0) {
+          return { ok: false, error: "Missing or empty files array" };
+        }
+        // Verify contract exists
+        const contractRows = [...this.state.storage.sql.exec("SELECT deployer FROM contracts WHERE address = ?", payload.contract)];
+        if (contractRows.length === 0) return { ok: false, error: "Contract not found" };
+        // Only contract deployer can upload app files
+        if ((contractRows[0] as any).deployer !== pubkey) {
+          return { ok: false, error: "Only the contract deployer can upload app files" };
+        }
+        // Validate file paths
+        for (const f of payload.files) {
+          if (!f.path || !f.data_b64) return { ok: false, error: `Invalid file entry: missing path or data_b64` };
+          if (f.path.includes("..") || f.path.startsWith("/")) return { ok: false, error: `Invalid path: ${f.path}` };
+        }
+        // Check total size
+        let totalBytes = 0;
+        for (const f of payload.files) {
+          totalBytes += Math.ceil((f.data_b64.length * 3) / 4); // approximate decoded size
+        }
+        if (totalBytes > 2_097_152) return { ok: false, error: "Total app files exceed 2MB" };
+        return { ok: true };
+      }
       case "oracle.request": {
         if (!payload.contract || !payload.callback_method || !payload.url) {
           return { ok: false, error: "Missing contract, callback_method, or url" };
@@ -3135,6 +3291,20 @@ export class PersistiaWorldV4 implements DurableObject {
         const address = await this.contractExecutor.deploy(wasmBytes, pubkey, this.latestSeq);
         this.stateTree.markDirty(`deployed:${address}`, `${pubkey}:${address}`);
         this.broadcast({ type: "contract.deployed", address, deployer: pubkey });
+        break;
+      }
+      case "app.upload": {
+        // Store each file as contract state under _app/ prefix
+        for (const f of payload.files) {
+          const keyBytes = new TextEncoder().encode(`_app/${f.path}`);
+          const valueBytes = Uint8Array.from(atob(f.data_b64), c => c.charCodeAt(0));
+          sql.exec(
+            "INSERT OR REPLACE INTO contract_state (contract_address, key, value) VALUES (?, ?, ?)",
+            payload.contract, keyBytes, valueBytes,
+          );
+          this.stateTree.markDirty(`app:${payload.contract}:${f.path}`, `${f.path}:${valueBytes.length}`);
+        }
+        this.broadcast({ type: "app.uploaded", contract: payload.contract, files: payload.files.map((f: any) => f.path) });
         break;
       }
       case "contract.call": {
