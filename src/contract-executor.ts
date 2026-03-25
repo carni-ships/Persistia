@@ -44,6 +44,8 @@ export interface CallResult {
   error?: string;
   oracle_requests?: OracleRequestEmit[];
   trigger_requests?: TriggerRequestEmit[];
+  /** Contract state keys that were mutated (for incremental Merkle tracking) */
+  flushed_keys?: { contract: string; key: string; deleted: boolean }[];
 }
 
 export interface OracleRequestEmit {
@@ -274,8 +276,9 @@ export class ContractExecutor {
     const result = await this.executeInContext(ctx, address, method, args, caller);
 
     // Only flush all mutations if the top-level call succeeded
+    let flushed: { contract: string; key: string; deleted: boolean }[] | undefined;
     if (result.ok) {
-      this.flushAllMutations(ctx);
+      flushed = this.flushAllMutations(ctx);
     }
 
     return {
@@ -283,6 +286,7 @@ export class ContractExecutor {
       logs: ctx.logs,
       oracle_requests: ctx.oracleRequests.length > 0 ? ctx.oracleRequests : undefined,
       trigger_requests: ctx.triggerRequests.length > 0 ? ctx.triggerRequests : undefined,
+      flushed_keys: flushed && flushed.length > 0 ? flushed : undefined,
     };
   }
 
@@ -902,7 +906,8 @@ export class ContractExecutor {
 
   // ─── Flush All Mutations (atomic commit across all contracts in chain) ──
 
-  private flushAllMutations(ctx: ExecutionContext) {
+  private flushAllMutations(ctx: ExecutionContext): { contract: string; key: string; deleted: boolean }[] {
+    const flushed: { contract: string; key: string; deleted: boolean }[] = [];
     for (const [contractAddr, mutations] of ctx.mutations) {
       for (const [keyHex, value] of mutations) {
         const keyBytes = hexToBytes(keyHex);
@@ -911,15 +916,18 @@ export class ContractExecutor {
             "DELETE FROM contract_state WHERE contract_address = ? AND key = ?",
             contractAddr, keyBytes,
           );
+          flushed.push({ contract: contractAddr, key: keyHex, deleted: true });
         } else {
           this.sql.exec(
             `INSERT INTO contract_state (contract_address, key, value) VALUES (?, ?, ?)
              ON CONFLICT(contract_address, key) DO UPDATE SET value = ?`,
             contractAddr, keyBytes, value, value,
           );
+          flushed.push({ contract: contractAddr, key: keyHex, deleted: false });
         }
       }
     }
+    return flushed;
   }
 
   // ─── Info ─────────────────────────────────────────────────────────────

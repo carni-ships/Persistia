@@ -53,6 +53,11 @@ pub struct StateTransitionInput {
     /// Previous proof's public values (serialized StateTransitionOutput).
     /// Used to check chain integrity (prev state_root == our prev_state_root).
     pub prev_proof_public_values: Vec<u8>,
+
+    /// Batch mode: if non-empty, proves multiple blocks in one proof.
+    /// When set, the single-block fields (mutations, signatures, block_number,
+    /// new_state_root, active_nodes) are ignored in favor of these.
+    pub batch_blocks: Vec<BlockEvidence>,
 }
 
 /// Public output committed by the SP1 program.
@@ -72,8 +77,22 @@ pub struct StateTransitionOutput {
     pub genesis_root: [u8; 32],
 }
 
+/// Evidence for a single block in a batch proof.
+/// Contains all data needed to verify one block's state transition.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BlockEvidence {
+    pub block_number: u64,
+    pub new_state_root: [u8; 32],
+    pub mutations: Vec<StateMutation>,
+    pub signatures: Vec<NodeSignature>,
+    pub active_nodes: u32,
+}
+
 /// Maximum mutations per block that can be proven.
 pub const MAX_MUTATIONS_PER_BLOCK: usize = 1024;
+
+/// Maximum blocks in a single batch proof.
+pub const MAX_BATCH_SIZE: usize = 32;
 
 /// BFT quorum: need 2f+1 signatures where f = floor((n-1)/3).
 pub fn required_quorum(active_nodes: u32) -> u32 {

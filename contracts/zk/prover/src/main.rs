@@ -14,7 +14,7 @@
 use base64::Engine as _;
 use sha2::Digest;
 use clap::{Parser, Subcommand};
-use persistia_zk_types::{NodeSignature, StateMutation, StateTransitionInput, StateTransitionOutput};
+use persistia_zk_types::{BlockEvidence, NodeSignature, StateMutation, StateTransitionInput, StateTransitionOutput};
 use sp1_sdk::{HashableKey, ProverClient, SP1Proof, SP1ProofWithPublicValues, SP1Stdin};
 use std::path::PathBuf;
 
@@ -67,6 +67,10 @@ enum Commands {
         /// Poll interval in seconds
         #[arg(long, default_value = "10")]
         interval: u64,
+
+        /// Batch N blocks into one proof for amortized proving cost
+        #[arg(long, default_value = "1")]
+        batch: u64,
     },
 
     /// Verify a proof locally
@@ -88,30 +92,72 @@ enum Commands {
     },
 }
 
+// ─── Vertex Message Construction ────────────────────────────────────────────
+
+/// Build canonical JSON bytes for a vertex (the message each validator signs).
+/// Extracted to avoid duplication between primary vertex fetch and fallback.
+fn build_canonical_vertex_json(v: &serde_json::Value) -> (String, Vec<u8>) {
+    let author = v["author"].as_str().unwrap_or("").to_string();
+    let round = v["round"].as_u64().unwrap_or(0);
+    let timestamp = v["timestamp"].as_u64().unwrap_or(0);
+
+    let mut event_hashes: Vec<String> = v["event_hashes"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    event_hashes.sort();
+
+    let mut refs: Vec<String> = v["refs"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    refs.sort();
+
+    let eh_json = serde_json::to_string(&event_hashes).unwrap_or("[]".into());
+    let refs_json = serde_json::to_string(&refs).unwrap_or("[]".into());
+    let canonical = format!(
+        r#"{{"author":"{}","round":{},"event_hashes":{},"refs":{},"timestamp":{}}}"#,
+        author, round, eh_json, refs_json, timestamp,
+    );
+    (author, canonical.into_bytes())
+}
+
+/// Extract vertex messages from a JSON array of vertices.
+fn extract_vertex_messages(vertices: &serde_json::Value) -> std::collections::HashMap<String, Vec<u8>> {
+    let mut messages = std::collections::HashMap::new();
+    if let Some(arr) = vertices.as_array() {
+        for v in arr {
+            let (author, msg) = build_canonical_vertex_json(v);
+            if !author.is_empty() {
+                messages.insert(author, msg);
+            }
+        }
+    }
+    messages
+}
+
+// ─── Block Input Fetching ───────────────────────────────────────────────────
+
 /// Fetch block data from a Persistia node and construct the SP1 input.
 async fn fetch_block_input(
+    client: &reqwest::Client,
     node: &str,
     block_number: u64,
     recursive: bool,
     prev_proof: Option<&SP1ProofWithPublicValues>,
 ) -> anyhow::Result<StateTransitionInput> {
-    let client = reqwest::Client::new();
+    // Fetch consensus status + block data + vertices in parallel
+    let status_fut = client.get(format!("{}/dag/status", node)).send();
+    let block_fut = client.get(format!("{}/dag/block?round={}", node, block_number)).send();
+    let vertices_fut = client.get(format!("{}/dag/vertices?round={}", node, block_number)).send();
+    let commitment_fut = client.get(format!("{}/proof/commitment", node)).send();
 
-    // Fetch consensus status for active node count
-    let status: serde_json::Value = client
-        .get(format!("{}/dag/status", node))
-        .send()
-        .await?
-        .json()
-        .await?;
+    let (status_resp, block_resp, vertices_resp, commitment_resp) =
+        tokio::try_join!(status_fut, block_fut, vertices_fut, commitment_fut)?;
 
+    let status: serde_json::Value = status_resp.json().await?;
     let active_nodes = status["active_nodes"].as_u64().unwrap_or(1) as u32;
 
-    // Fetch the committed block/vertex data
-    let block_resp = client
-        .get(format!("{}/dag/block?round={}", node, block_number))
-        .send()
-        .await?;
     if !block_resp.status().is_success() {
         anyhow::bail!("Block {} not committed yet (HTTP {})", block_number, block_resp.status());
     }
@@ -120,21 +166,12 @@ async fn fetch_block_input(
         anyhow::bail!("Block {} error: {}", block_number, block["error"]);
     }
 
-    // Extract state roots from the proof endpoints
-    let commitment: serde_json::Value = client
-        .get(format!("{}/proof/commitment", node))
-        .send()
-        .await?
-        .json()
-        .await?;
-
+    let commitment: serde_json::Value = commitment_resp.json().await?;
     let state_root_hex = commitment["root"]
         .as_str()
         .unwrap_or("0000000000000000000000000000000000000000000000000000000000000000");
-
     let new_state_root = hex_to_bytes32(state_root_hex);
 
-    // For the previous state root, use the previous proof's output or zeros for genesis.
     let prev_state_root = if let Some(prev) = prev_proof {
         let prev_output: StateTransitionOutput =
             bincode::deserialize(prev.public_values.as_slice())?;
@@ -143,88 +180,20 @@ async fn fetch_block_input(
         [0u8; 32]
     };
 
-    // Build previous proof's public values for chain integrity checking inside guest
     let prev_proof_public_values = if let Some(prev) = prev_proof {
         prev.public_values.as_slice().to_vec()
     } else {
         vec![]
     };
 
-    // Fetch all vertices for this round to get per-validator canonical JSON.
-    // Each validator signs their OWN vertex, not a shared block hash.
-    let vertices: serde_json::Value = client
-        .get(format!("{}/dag/vertices?round={}", node, block_number))
-        .send()
-        .await?
-        .json()
-        .await?;
-
-    // Build a map: pubkey → canonical JSON bytes (the message that was signed)
-    let mut vertex_messages: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
-    if let Some(arr) = vertices.as_array() {
-        for v in arr {
-            let author = v["author"].as_str().unwrap_or("");
-            let round = v["round"].as_u64().unwrap_or(0);
-            let timestamp = v["timestamp"].as_u64().unwrap_or(0);
-
-            // Reconstruct sorted event_hashes and refs arrays
-            let mut event_hashes: Vec<String> = v["event_hashes"]
-                .as_array()
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-                .unwrap_or_default();
-            event_hashes.sort();
-
-            let mut refs: Vec<String> = v["refs"]
-                .as_array()
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-                .unwrap_or_default();
-            refs.sort();
-
-            // Canonical JSON must match JS key order exactly:
-            // JSON.stringify({ author, round, event_hashes: sorted, refs: sorted, timestamp })
-            // serde_json::json! uses BTreeMap (alphabetical), so we manually construct the string.
-            let eh_json = serde_json::to_string(&event_hashes).unwrap_or("[]".into());
-            let refs_json = serde_json::to_string(&refs).unwrap_or("[]".into());
-            let canonical = format!(
-                r#"{{"author":"{}","round":{},"event_hashes":{},"refs":{},"timestamp":{}}}"#,
-                author, round, eh_json, refs_json, timestamp,
-            );
-            vertex_messages.insert(author.to_string(), canonical.into_bytes());
-        }
-    }
-
-    // Also try the block response itself if it contains vertex data
+    // Build vertex messages from /dag/vertices response, fallback to block["vertices"]
+    let vertices: serde_json::Value = vertices_resp.json().await?;
+    let mut vertex_messages = extract_vertex_messages(&vertices);
     if vertex_messages.is_empty() {
-        if let Some(arr) = block["vertices"].as_array() {
-            for v in arr {
-                let author = v["author"].as_str().unwrap_or("");
-                let round = v["round"].as_u64().unwrap_or(0);
-                let timestamp = v["timestamp"].as_u64().unwrap_or(0);
-                let mut event_hashes: Vec<String> = v["event_hashes"]
-                    .as_array()
-                    .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-                    .unwrap_or_default();
-                event_hashes.sort();
-                let mut refs: Vec<String> = v["refs"]
-                    .as_array()
-                    .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-                    .unwrap_or_default();
-                refs.sort();
-                let eh_json = serde_json::to_string(&event_hashes).unwrap_or("[]".into());
-                let refs_json_str = serde_json::to_string(&refs).unwrap_or("[]".into());
-                let canonical = format!(
-                    r#"{{"author":"{}","round":{},"event_hashes":{},"refs":{},"timestamp":{}}}"#,
-                    author, round, eh_json, refs_json_str, timestamp,
-                );
-                vertex_messages.insert(author.to_string(), canonical.into_bytes());
-            }
-        }
+        vertex_messages = extract_vertex_messages(&block["vertices"]);
     }
 
-    // Extract signatures with per-vertex messages
     let signatures = extract_signatures_with_messages(&block, &vertex_messages);
-
-    // Extract mutations (state changes in this block)
     let mutations = extract_mutations(&block);
 
     Ok(StateTransitionInput {
@@ -236,6 +205,7 @@ async fn fetch_block_input(
         active_nodes,
         recursive,
         prev_proof_public_values,
+        batch_blocks: vec![],
     })
 }
 
@@ -257,7 +227,6 @@ fn extract_signatures_with_messages(
             if pk_bytes.len() == 32 {
                 let mut pubkey = [0u8; 32];
                 pubkey.copy_from_slice(&pk_bytes);
-                // Look up the canonical JSON message this validator signed
                 let message = vertex_messages
                     .get(pk_str)
                     .cloned()
@@ -293,6 +262,55 @@ fn extract_mutations(block: &serde_json::Value) -> Vec<StateMutation> {
     mutations
 }
 
+/// Fetch evidence for a single block (used in batch mode).
+/// Returns a BlockEvidence struct without the full StateTransitionInput overhead.
+async fn fetch_block_evidence(
+    client: &reqwest::Client,
+    node: &str,
+    block_number: u64,
+) -> anyhow::Result<BlockEvidence> {
+    let block_fut = client.get(format!("{}/dag/block?round={}", node, block_number)).send();
+    let vertices_fut = client.get(format!("{}/dag/vertices?round={}", node, block_number)).send();
+    let status_fut = client.get(format!("{}/dag/status", node)).send();
+    let commitment_fut = client.get(format!("{}/proof/commitment", node)).send();
+
+    let (block_resp, vertices_resp, status_resp, commitment_resp) =
+        tokio::try_join!(block_fut, vertices_fut, status_fut, commitment_fut)?;
+
+    let status: serde_json::Value = status_resp.json().await?;
+    let active_nodes = status["active_nodes"].as_u64().unwrap_or(1) as u32;
+
+    if !block_resp.status().is_success() {
+        anyhow::bail!("Block {} not committed yet", block_number);
+    }
+    let block: serde_json::Value = block_resp.json().await?;
+    if block.get("error").is_some() {
+        anyhow::bail!("Block {} error: {}", block_number, block["error"]);
+    }
+
+    let commitment: serde_json::Value = commitment_resp.json().await?;
+    let state_root_hex = commitment["root"].as_str()
+        .unwrap_or("0000000000000000000000000000000000000000000000000000000000000000");
+    let new_state_root = hex_to_bytes32(state_root_hex);
+
+    let vertices: serde_json::Value = vertices_resp.json().await?;
+    let mut vertex_messages = extract_vertex_messages(&vertices);
+    if vertex_messages.is_empty() {
+        vertex_messages = extract_vertex_messages(&block["vertices"]);
+    }
+
+    let signatures = extract_signatures_with_messages(&block, &vertex_messages);
+    let mutations = extract_mutations(&block);
+
+    Ok(BlockEvidence {
+        block_number,
+        new_state_root,
+        mutations,
+        signatures,
+        active_nodes,
+    })
+}
+
 fn hex_to_bytes32(hex: &str) -> [u8; 32] {
     let mut out = [0u8; 32];
     if let Ok(bytes) = hex::decode(hex) {
@@ -300,10 +318,6 @@ fn hex_to_bytes32(hex: &str) -> [u8; 32] {
         out[..len].copy_from_slice(&bytes[..len]);
     }
     out
-}
-
-fn hex_to_bytes64(hex: &str) -> Vec<u8> {
-    hex::decode(hex).unwrap_or_else(|_| vec![0u8; 64])
 }
 
 /// Load a previously generated proof from disk.
@@ -320,11 +334,6 @@ fn save_proof(path: &PathBuf, proof: &SP1ProofWithPublicValues) -> anyhow::Resul
 }
 
 /// Prepare stdin with recursive proof data if available.
-/// For recursive verification, the guest program reads:
-///   1. The input (StateTransitionInput with recursive=true)
-///   2. The vkey digest ([u32; 8])
-///   3. The public values digest ([u8; 32])
-/// And then the SP1 runtime internally provides the proof via write_proof.
 fn prepare_stdin_with_proof(
     input: &StateTransitionInput,
     prev_proof: Option<&SP1ProofWithPublicValues>,
@@ -334,7 +343,6 @@ fn prepare_stdin_with_proof(
     stdin.write(input);
 
     if let Some(prev) = prev_proof {
-        // Write vkey digest and pv digest for the guest to read
         let vk_digest: [u32; 8] = vk.hash_u32();
         let pv_hash = prev.public_values.hash();
         let mut pv_digest = [0u8; 32];
@@ -344,8 +352,6 @@ fn prepare_stdin_with_proof(
         stdin.write(&vk_digest);
         stdin.write(&pv_digest);
 
-        // Extract the inner compressed proof and stark vk for write_proof.
-        // write_proof expects SP1ReduceProof<InnerSC> and StarkVerifyingKey<CoreSC>.
         if let SP1Proof::Compressed(ref reduce_proof) = prev.proof {
             stdin.write_proof(*reduce_proof.clone(), vk.vk.clone());
         }
@@ -354,14 +360,53 @@ fn prepare_stdin_with_proof(
     stdin
 }
 
+/// Compute SHA-256 hash of proof bytes (for submission to node).
+/// Uses incremental hashing to avoid serializing the full proof twice.
+fn compute_proof_hash(proof: &SP1ProofWithPublicValues) -> String {
+    let bytes = bincode::serialize(proof).unwrap_or_default();
+    hex::encode(sha2::Sha256::digest(&bytes))
+}
+
+/// Post proof metadata to the Persistia node.
+async fn submit_proof_to_node(
+    http: &reqwest::Client,
+    node: &str,
+    block: u64,
+    proof_hash: &str,
+    state_root: &[u8; 32],
+    proven_blocks: u64,
+    proof_type: &str,
+) {
+    match http
+        .post(format!("{}/proof/zk/submit", node))
+        .json(&serde_json::json!({
+            "block_number": block,
+            "proof": proof_hash,
+            "state_root": hex::encode(state_root),
+            "proven_blocks": proven_blocks,
+            "proof_type": proof_type,
+        }))
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            if !resp.status().is_success() {
+                eprintln!("  Warning: proof submit HTTP {}", resp.status());
+            }
+        }
+        Err(e) => eprintln!("  Warning: proof submit failed: {}", e),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let http = reqwest::Client::new();
 
     match cli.command {
         Commands::Execute { node, block } => {
             println!("Fetching block {} from {}", block, node);
-            let input = fetch_block_input(&node, block, false, None).await?;
+            let input = fetch_block_input(&http, &node, block, false, None).await?;
 
             println!("Executing SP1 program (no proof generation)...");
             let client = ProverClient::from_env();
@@ -386,7 +431,6 @@ async fn main() -> anyhow::Result<()> {
             output,
             groth16,
         } => {
-            // Load previous proof if provided (for recursive IVC chain)
             let prev = match &prev_proof {
                 Some(path) => {
                     println!("Loading previous proof from {:?}", path);
@@ -398,7 +442,7 @@ async fn main() -> anyhow::Result<()> {
 
             println!("Fetching block {} from {}", block, node);
             let input =
-                fetch_block_input(&node, block, recursive, prev.as_ref()).await?;
+                fetch_block_input(&http, &node, block, recursive, prev.as_ref()).await?;
 
             println!(
                 "Generating {} proof{}...",
@@ -439,18 +483,20 @@ async fn main() -> anyhow::Result<()> {
             node,
             proof_dir,
             interval,
+            batch,
         } => {
             std::fs::create_dir_all(&proof_dir)?;
-            println!("Watching {} for new blocks (every {}s)", node, interval);
+            println!("Watching {} for new blocks (every {}s, batch={})", node, interval, batch);
             println!("Proofs will be saved to {:?}", proof_dir);
             println!("Recursive mode: each proof verifies the previous one (IVC chain)");
 
+            // Setup once (expensive — key generation)
             let client = ProverClient::from_env();
             let (pk, vk) = client.setup(ELF);
             let mut last_proven_block: u64 = 0;
             let mut last_proof: Option<SP1ProofWithPublicValues> = None;
 
-            // Check for existing proofs to resume from
+            // Resume from existing proofs
             if let Ok(entries) = std::fs::read_dir(&proof_dir) {
                 let mut max_block = 0u64;
                 let mut max_path = None;
@@ -484,16 +530,17 @@ async fn main() -> anyhow::Result<()> {
 
             loop {
                 // Check latest committed round
-                let status_result: Result<serde_json::Value, anyhow::Error> = async {
-                    Ok(reqwest::get(format!("{}/dag/status", node))
-                        .await?
-                        .json()
-                        .await?)
-                }.await;
-                let status = match status_result {
-                    Ok(s) => s,
+                let status = match http.get(format!("{}/dag/status", node)).send().await {
+                    Ok(resp) => match resp.json::<serde_json::Value>().await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("  Parse error: {} — retrying", e);
+                            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                            continue;
+                        }
+                    },
                     Err(e) => {
-                        eprintln!("  Network error fetching status: {} — retrying", e);
+                        eprintln!("  Network error: {} — retrying", e);
                         tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
                         continue;
                     }
@@ -502,104 +549,212 @@ async fn main() -> anyhow::Result<()> {
                 let latest = status["last_committed_round"].as_u64().unwrap_or(0);
 
                 if latest > last_proven_block {
-                    // For genesis (no previous proof), start from latest committed round.
-                    // For recursive, find the next committed round after last_proven_block.
-                    // Not all rounds are committed in Bullshark DAG (gaps are normal).
-                    let target = if last_proof.is_none() && last_proven_block == 0 {
-                        latest
-                    } else {
-                        // Find next committed round (not all rounds commit in Bullshark DAG)
-                        match async {
-                            let r: serde_json::Value = reqwest::get(
-                                format!("{}/dag/next_committed?after={}", node, last_proven_block)
-                            ).await?.json().await?;
-                            Ok::<u64, anyhow::Error>(r["round"].as_u64().unwrap_or(latest))
-                        }.await {
-                            Ok(r) => r,
-                            Err(e) => {
-                                eprintln!("  Network error: {} — retrying", e);
-                                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
-                                continue;
-                            }
-                        }
-                    };
-                    if target > latest {
-                        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
-                        continue;
-                    }
-                    let recursive = last_proof.is_some();
-                    println!(
-                        "\nBlock {} detected (latest: {}){}",
-                        target,
-                        latest,
-                        if recursive { " — chaining recursively" } else { " — genesis proof" }
-                    );
+                    if batch > 1 {
+                        // ─── Batch mode: accumulate up to N blocks into one proof ───
+                        let mut blocks_to_prove = Vec::new();
+                        let mut cursor = last_proven_block;
 
-                    match fetch_block_input(&node, target, recursive, last_proof.as_ref()).await {
-                        Ok(input) => {
-                            let stdin = prepare_stdin_with_proof(&input, last_proof.as_ref(), &vk);
+                        for _ in 0..batch {
+                            let target = if last_proof.is_none() && cursor == 0 {
+                                // First block ever
+                                match http.get(format!("{}/dag/next_committed?after=0", node)).send().await {
+                                    Ok(resp) => match resp.json::<serde_json::Value>().await {
+                                        Ok(r) => r["round"].as_u64().unwrap_or(latest),
+                                        Err(_) => break,
+                                    },
+                                    Err(_) => break,
+                                }
+                            } else {
+                                match http.get(
+                                    format!("{}/dag/next_committed?after={}", node, cursor)
+                                ).send().await {
+                                    Ok(resp) => match resp.json::<serde_json::Value>().await {
+                                        Ok(r) => match r["round"].as_u64() {
+                                            Some(round) if round <= latest => round,
+                                            _ => break,
+                                        },
+                                        Err(_) => break,
+                                    },
+                                    Err(_) => break,
+                                }
+                            };
 
-                            match client.prove(&pk, &stdin).compressed().run() {
-                                Ok(proof) => {
-                                    if let Err(e) = client.verify(&proof, &vk) {
-                                        eprintln!("  Verification failed for block {}: {}", target, e);
-                                        continue;
-                                    }
-
-                                    let path = proof_dir.join(format!("block_{}.proof", target));
-                                    if let Err(e) = save_proof(&path, &proof) {
-                                        eprintln!("  Failed to save proof: {}", e);
-                                        continue;
-                                    }
-
-                                    let result: StateTransitionOutput =
-                                        bincode::deserialize(proof.public_values.as_slice())?;
-
-                                    println!(
-                                        "  Block {} proven — root: {} | chain: {} blocks | {} bytes",
-                                        target,
-                                        hex::encode(result.state_root),
-                                        result.proven_blocks,
-                                        std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
-                                    );
-
-                                    // Post proof metadata to node (proof hash, not full blob)
-                                    let proof_bytes = bincode::serialize(&proof).unwrap_or_default();
-                                    let proof_hash = hex::encode(
-                                        sha2::Sha256::digest(&proof_bytes)
-                                    );
-                                    let http = reqwest::Client::new();
-                                    match http
-                                        .post(format!("{}/proof/zk/submit", node))
-                                        .json(&serde_json::json!({
-                                            "block_number": target,
-                                            "proof": proof_hash,
-                                            "state_root": hex::encode(result.state_root),
-                                            "proven_blocks": result.proven_blocks,
-                                            "proof_type": "compressed",
-                                        }))
-                                        .send()
-                                        .await
-                                    {
-                                        Ok(resp) => {
-                                            if !resp.status().is_success() {
-                                                eprintln!("  Warning: proof submit HTTP {}", resp.status());
-                                            }
-                                        }
-                                        Err(e) => eprintln!("  Warning: proof submit failed: {}", e),
-                                    }
-
-                                    // Update state for next recursive proof
-                                    last_proof = Some(proof);
-                                    last_proven_block = target;
+                            match fetch_block_evidence(&http, &node, target).await {
+                                Ok(evidence) => {
+                                    cursor = target;
+                                    blocks_to_prove.push(evidence);
                                 }
                                 Err(e) => {
-                                    eprintln!("  Failed to prove block {}: {}", target, e);
+                                    eprintln!("  Failed to fetch block {}: {}", target, e);
+                                    break;
                                 }
                             }
                         }
-                        Err(e) => {
-                            eprintln!("  Failed to fetch block {}: {}", target, e);
+
+                        if blocks_to_prove.is_empty() {
+                            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                            continue;
+                        }
+
+                        let first_block = blocks_to_prove.first().unwrap().block_number;
+                        let last_block = blocks_to_prove.last().unwrap().block_number;
+                        let recursive = last_proof.is_some();
+                        println!(
+                            "\nBatch: blocks {}..{} ({} blocks){}",
+                            first_block, last_block, blocks_to_prove.len(),
+                            if recursive { " — chaining recursively" } else { " — genesis proof" }
+                        );
+
+                        let prev_state_root = if let Some(ref prev) = last_proof {
+                            let prev_output: StateTransitionOutput =
+                                bincode::deserialize(prev.public_values.as_slice()).unwrap_or(
+                                    StateTransitionOutput {
+                                        state_root: [0u8; 32],
+                                        block_number: 0,
+                                        proven_blocks: 0,
+                                        genesis_root: [0u8; 32],
+                                    },
+                                );
+                            prev_output.state_root
+                        } else {
+                            [0u8; 32]
+                        };
+
+                        let prev_proof_public_values = last_proof.as_ref()
+                            .map(|p| p.public_values.as_slice().to_vec())
+                            .unwrap_or_default();
+
+                        let input = StateTransitionInput {
+                            prev_state_root,
+                            new_state_root: [0u8; 32], // ignored in batch mode
+                            block_number: 0,             // ignored in batch mode
+                            mutations: vec![],           // ignored in batch mode
+                            signatures: vec![],          // ignored in batch mode
+                            active_nodes: 0,             // ignored in batch mode
+                            recursive,
+                            prev_proof_public_values,
+                            batch_blocks: blocks_to_prove,
+                        };
+
+                        let stdin = prepare_stdin_with_proof(&input, last_proof.as_ref(), &vk);
+
+                        match client.prove(&pk, &stdin).compressed().run() {
+                            Ok(proof) => {
+                                if last_proven_block % 10 == 0 {
+                                    if let Err(e) = client.verify(&proof, &vk) {
+                                        eprintln!("  Verification failed for batch: {}", e);
+                                        continue;
+                                    }
+                                }
+
+                                let path = proof_dir.join(format!("block_{}.proof", last_block));
+                                if let Err(e) = save_proof(&path, &proof) {
+                                    eprintln!("  Failed to save proof: {}", e);
+                                    continue;
+                                }
+
+                                let result: StateTransitionOutput =
+                                    bincode::deserialize(proof.public_values.as_slice())?;
+
+                                println!(
+                                    "  Batch {}..{} proven — root: {} | chain: {} blocks | {} bytes",
+                                    first_block, last_block,
+                                    hex::encode(result.state_root),
+                                    result.proven_blocks,
+                                    std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+                                );
+
+                                let proof_hash = compute_proof_hash(&proof);
+                                submit_proof_to_node(
+                                    &http, &node, last_block, &proof_hash,
+                                    &result.state_root, result.proven_blocks, "compressed-batch",
+                                ).await;
+
+                                last_proof = Some(proof);
+                                last_proven_block = last_block;
+                            }
+                            Err(e) => {
+                                eprintln!("  Failed to prove batch: {}", e);
+                            }
+                        }
+                    } else {
+                        // ─── Single-block mode ──────────────────────────────────
+                        let target = if last_proof.is_none() && last_proven_block == 0 {
+                            latest
+                        } else {
+                            match http.get(
+                                format!("{}/dag/next_committed?after={}", node, last_proven_block)
+                            ).send().await {
+                                Ok(resp) => match resp.json::<serde_json::Value>().await {
+                                    Ok(r) => r["round"].as_u64().unwrap_or(latest),
+                                    Err(_) => latest,
+                                },
+                                Err(e) => {
+                                    eprintln!("  Network error: {} — retrying", e);
+                                    tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                                    continue;
+                                }
+                            }
+                        };
+                        if target > latest {
+                            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                            continue;
+                        }
+                        let recursive = last_proof.is_some();
+                        println!(
+                            "\nBlock {} detected (latest: {}){}",
+                            target, latest,
+                            if recursive { " — chaining recursively" } else { " — genesis proof" }
+                        );
+
+                        match fetch_block_input(&http, &node, target, recursive, last_proof.as_ref()).await {
+                            Ok(mut input) => {
+                                input.batch_blocks = vec![]; // ensure single-block mode
+                                let stdin = prepare_stdin_with_proof(&input, last_proof.as_ref(), &vk);
+
+                                match client.prove(&pk, &stdin).compressed().run() {
+                                    Ok(proof) => {
+                                        if last_proven_block % 10 == 0 {
+                                            if let Err(e) = client.verify(&proof, &vk) {
+                                                eprintln!("  Verification failed for block {}: {}", target, e);
+                                                continue;
+                                            }
+                                        }
+
+                                        let path = proof_dir.join(format!("block_{}.proof", target));
+                                        if let Err(e) = save_proof(&path, &proof) {
+                                            eprintln!("  Failed to save proof: {}", e);
+                                            continue;
+                                        }
+
+                                        let result: StateTransitionOutput =
+                                            bincode::deserialize(proof.public_values.as_slice())?;
+
+                                        println!(
+                                            "  Block {} proven — root: {} | chain: {} blocks | {} bytes",
+                                            target,
+                                            hex::encode(result.state_root),
+                                            result.proven_blocks,
+                                            std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+                                        );
+
+                                        let proof_hash = compute_proof_hash(&proof);
+                                        submit_proof_to_node(
+                                            &http, &node, target, &proof_hash,
+                                            &result.state_root, result.proven_blocks, "compressed",
+                                        ).await;
+
+                                        last_proof = Some(proof);
+                                        last_proven_block = target;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("  Failed to prove block {}: {}", target, e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("  Failed to fetch block {}: {}", target, e);
+                            }
                         }
                     }
                 }

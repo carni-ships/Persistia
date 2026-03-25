@@ -18,7 +18,7 @@ import {
   type OracleRequest, type NodeFetchResult, type AggregationStrategy,
 } from "./oracle";
 import { TriggerManager, MIN_INTERVAL_MS, MAX_INTERVAL_MS } from "./triggers";
-import { computeStateCommitment, generateStateProof, verifyProof } from "./state-proofs";
+import { computeStateCommitment, generateStateProof, verifyProof, IncrementalStateTree } from "./state-proofs";
 import { type CrossShardMessage, type CrossShardReceipt, validateMessage, createCrossShardMessage } from "./cross-shard";
 import { GossipManager, type GossipEnvelope, type SyncResponsePayload } from "./gossip";
 import { AnchorManager, type AnchorConfig, type AnchorRecord } from "./anchoring";
@@ -54,6 +54,9 @@ export class PersistiaWorld implements DurableObject {
   finalizedRoot: string = "";
   lastCommittedRound: number = -2;
   nodeUrl: string = "";
+
+  // ─── Incremental state commitment ──────────────────────────────────
+  stateTree: IncrementalStateTree = new IncrementalStateTree();
 
   // ─── Cached queries (invalidated on round change / node join) ──────
   private _activeCache: {
@@ -927,14 +930,17 @@ export class PersistiaWorld implements DurableObject {
 
     switch (url.pathname) {
       case "/proof/commitment": {
-        const commitment = await computeStateCommitment(sql);
+        // Use incremental tree (only recomputes dirty leaves)
+        const commitment = await this.stateTree.computeCommitment(sql);
         return this.json(commitment);
       }
 
       case "/proof/generate": {
         const key = url.searchParams.get("key");
         if (!key) return this.json({ error: "key required" }, 400);
-        const proof = await generateStateProof(sql, key);
+        // Try incremental tree first, fall back to full scan
+        const proof = await this.stateTree.generateProof(key)
+          || await generateStateProof(sql, key);
         if (!proof) return this.json({ error: "key not found in state" }, 404);
         return this.json(proof);
       }
@@ -2343,12 +2349,15 @@ export class PersistiaWorld implements DurableObject {
         sql.exec("INSERT OR REPLACE INTO blocks (x, z, block_type, placed_by) VALUES (?, ?, ?, ?)",
           payload.x, payload.z, payload.block, pubkey);
         this.addToInventory(pubkey, this.blockTypeToItem(payload.block), -1);
+        this.stateTree.markDirty(`block:${payload.x},${payload.z}`, `${payload.block}:${pubkey}`);
+        this.stateTree.markDirty(`inv:${pubkey}:${this.blockTypeToItem(payload.block)}`, null); // simplified; full value set on next commit
         break;
       case "break": {
         const rows = [...sql.exec("SELECT block_type FROM blocks WHERE x = ? AND z = ?", payload.x, payload.z)];
         if (rows.length > 0) {
           sql.exec("DELETE FROM blocks WHERE x = ? AND z = ?", payload.x, payload.z);
           this.addToInventory(pubkey, this.blockTypeToItem(rows[0].block_type as number), 1);
+          this.stateTree.markDirty(`block:${payload.x},${payload.z}`, null);
         }
         break;
       }
@@ -2361,7 +2370,7 @@ export class PersistiaWorld implements DurableObject {
       case "contract.deploy": {
         const wasmBytes = this.b64ToBytes(payload.wasm_b64);
         const address = await this.contractExecutor.deploy(wasmBytes, pubkey, this.latestSeq);
-        // Log the deployed address for clients
+        this.stateTree.markDirty(`deployed:${address}`, `${pubkey}:${address}`);
         this.broadcast({ type: "contract.deployed", address, deployer: pubkey });
         break;
       }
@@ -2372,6 +2381,13 @@ export class PersistiaWorld implements DurableObject {
         );
         if (!result.ok) {
           console.warn(`Contract call failed: ${result.error}`);
+        }
+        // Track flushed contract state keys for incremental Merkle
+        if (result.flushed_keys) {
+          for (const fk of result.flushed_keys) {
+            const stateKey = `contract:${fk.contract}:${fk.key}`;
+            this.stateTree.markDirty(stateKey, fk.deleted ? null : stateKey);
+          }
         }
         // Process any oracle/trigger requests emitted by the contract
         if (result.oracle_requests) {

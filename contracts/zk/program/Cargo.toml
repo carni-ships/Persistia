@@ -13,9 +13,3 @@ sp1-zkvm = { version = "4.0.0", features = ["verify"] }
 sha2 = "0.10"
 bincode = "1"
 ed25519-consensus = "2"
-p3-baby-bear = "=0.2.2-succinct"
-p3-field = "=0.2.2-succinct"
-p3-poseidon2 = "=0.2.2-succinct"
-p3-symmetric = "=0.2.2-succinct"
-sp1-primitives = "4.0.0"
-
