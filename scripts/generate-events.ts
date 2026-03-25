@@ -64,17 +64,27 @@ function shardUrl(path: string): string {
 }
 
 async function post(path: string, body: any): Promise<any> {
-  const res = await fetch(shardUrl(path), {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  return res.json();
+  try {
+    const res = await fetch(shardUrl(path), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const text = await res.text();
+    return text ? JSON.parse(text) : { ok: false, error: `Empty response (${res.status})` };
+  } catch (e: any) {
+    return { ok: false, error: e.message };
+  }
 }
 
 async function get(path: string): Promise<any> {
-  const res = await fetch(shardUrl(path));
-  return res.json();
+  try {
+    const res = await fetch(shardUrl(path));
+    const text = await res.text();
+    return text ? JSON.parse(text) : {};
+  } catch (e: any) {
+    return {};
+  }
 }
 
 function sleep(ms: number): Promise<void> {
