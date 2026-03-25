@@ -10,7 +10,7 @@ const NODE = process.argv.includes("--node")
 
 const INTERVAL = process.argv.includes("--interval")
   ? parseInt(process.argv[process.argv.indexOf("--interval") + 1])
-  : 400;
+  : 2000;
 
 const NUM_AGENTS = process.argv.includes("--agents")
   ? parseInt(process.argv[process.argv.indexOf("--agents") + 1])
@@ -66,6 +66,10 @@ async function post(path: string, body: any): Promise<any> {
 async function get(path: string): Promise<any> {
   const res = await fetch(`${NODE}${path}`);
   return res.json();
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(r => setTimeout(r, ms));
 }
 
 async function seedInventory(agent: Agent, amount = 500): Promise<void> {
@@ -494,6 +498,7 @@ function startOrganicPhase(agents: Agent[]) {
       const tree = generateTree(tx, tz);
       for (const b of tree) {
         await placeBlock(agent, b.x, b.z, b.block);
+        await sleep(500);
       }
       console.log(`  [${agent.name}] Planted tree at (${tx}, ${tz})`);
     } else if (roll < 0.7) {
@@ -501,11 +506,12 @@ function startOrganicPhase(agents: Agent[]) {
       const px = Math.round((Math.random() - 0.5) * 100);
       const pz = Math.round((Math.random() - 0.5) * 100);
       const block = Math.random() > 0.5 ? STONE : GRASS;
-      const size = 2 + Math.floor(Math.random() * 3);
+      const size = 2 + Math.floor(Math.random() * 2);
       for (let dx = 0; dx < size; dx++) {
         for (let dz = 0; dz < size; dz++) {
           if (Math.random() > 0.4) {
             await placeBlock(agent, px + dx, pz + dz, block);
+            await sleep(500);
           }
         }
       }
@@ -514,12 +520,13 @@ function startOrganicPhase(agents: Agent[]) {
       // Extend a road from a random spot
       const rx = Math.round((Math.random() - 0.5) * 80);
       const rz = Math.round((Math.random() - 0.5) * 80);
-      const len = 5 + Math.floor(Math.random() * 10);
+      const len = 3 + Math.floor(Math.random() * 5);
       const horizontal = Math.random() > 0.5;
       for (let i = 0; i < len; i++) {
         const x = horizontal ? rx + i : rx;
         const z = horizontal ? rz : rz + i;
         await placeBlock(agent, x, z, DIRT);
+        await sleep(500);
       }
       console.log(`  [${agent.name}] Extended road at (${rx}, ${rz})`);
     }
@@ -530,7 +537,7 @@ function startOrganicPhase(agents: Agent[]) {
         console.log(`\n── Tick ${tick} | Round ${status.current_round} | Seq ${status.finalized_seq} | Nodes ${status.active_nodes} ──\n`);
       } catch {}
     }
-  }, 3000);
+  }, 10000);
 
   process.on("SIGINT", () => {
     clearInterval(interval);

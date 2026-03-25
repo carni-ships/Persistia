@@ -962,6 +962,116 @@ function drawDAGFrame() {
 
     ctx.globalAlpha = 1;
   }
+
+  // ─── Legend ───────────────────────────────────────────────────────────────
+  const legendX = W - 210, legendY = 6;
+  const lw = 200, lh = 148;
+  // Background
+  ctx.fillStyle = 'rgba(18,18,28,0.88)';
+  ctx.strokeStyle = 'rgba(108,92,231,0.2)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.roundRect(legendX, legendY, lw, lh, 6);
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.font = 'bold 9px JetBrains Mono';
+  ctx.fillStyle = '#8a8aaa';
+  ctx.textAlign = 'left';
+  ctx.fillText('LEGEND', legendX + 10, legendY + 16);
+
+  let ly = legendY + 30;
+  const lSpacing = 17;
+
+  // Pending vertex (circle)
+  ctx.fillStyle = '#6c5ce7';
+  ctx.beginPath();
+  ctx.arc(legendX + 16, ly, 5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 6px JetBrains Mono';
+  ctx.textAlign = 'center';
+  ctx.fillText('3', legendX + 16, ly + 2);
+  ctx.fillStyle = '#9a9ab8';
+  ctx.font = '8px JetBrains Mono';
+  ctx.textAlign = 'left';
+  ctx.fillText('Pending vertex (events)', legendX + 28, ly + 3);
+
+  ly += lSpacing;
+  // Committed vertex (diamond)
+  ctx.fillStyle = '#00d2a0';
+  ctx.beginPath();
+  ctx.moveTo(legendX + 16, ly - 5);
+  ctx.lineTo(legendX + 21, ly);
+  ctx.lineTo(legendX + 16, ly + 5);
+  ctx.lineTo(legendX + 11, ly);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillStyle = '#9a9ab8';
+  ctx.font = '8px JetBrains Mono';
+  ctx.fillText('Committed vertex', legendX + 28, ly + 3);
+
+  ly += lSpacing;
+  // Edge reference
+  ctx.strokeStyle = 'rgba(108,92,231,0.35)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(legendX + 10, ly);
+  ctx.lineTo(legendX + 22, ly);
+  ctx.stroke();
+  ctx.fillStyle = '#9a9ab8';
+  ctx.fillText('DAG reference (edge)', legendX + 28, ly + 3);
+
+  ly += lSpacing;
+  // Commit edge
+  ctx.strokeStyle = 'rgba(0,210,160,0.5)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(legendX + 10, ly);
+  ctx.lineTo(legendX + 22, ly);
+  ctx.stroke();
+  ctx.fillStyle = '#9a9ab8';
+  ctx.lineWidth = 1;
+  ctx.fillText('Commit edge', legendX + 28, ly + 3);
+
+  ly += lSpacing;
+  // Even round column
+  ctx.fillStyle = 'rgba(0,210,160,0.12)';
+  ctx.fillRect(legendX + 10, ly - 5, 12, 10);
+  ctx.fillStyle = 'rgba(0,210,160,0.5)';
+  ctx.font = '7px JetBrains Mono';
+  ctx.fillText('R2', legendX + 12, ly + 3);
+  ctx.fillStyle = '#9a9ab8';
+  ctx.font = '8px JetBrains Mono';
+  ctx.fillText('Even round (commit)', legendX + 28, ly + 3);
+
+  ly += lSpacing;
+  // Validator color
+  ctx.fillStyle = '#ff6b6b';
+  ctx.beginPath();
+  ctx.arc(legendX + 13, ly, 3, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#ffd93d';
+  ctx.beginPath();
+  ctx.arc(legendX + 19, ly, 3, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#9a9ab8';
+  ctx.fillText('Color = validator ID', legendX + 28, ly + 3);
+
+  ly += lSpacing;
+  // Number inside vertex
+  ctx.fillStyle = '#555';
+  ctx.beginPath();
+  ctx.arc(legendX + 16, ly, 5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 7px JetBrains Mono';
+  ctx.textAlign = 'center';
+  ctx.fillText('N', legendX + 16, ly + 2.5);
+  ctx.fillStyle = '#9a9ab8';
+  ctx.font = '8px JetBrains Mono';
+  ctx.textAlign = 'left';
+  ctx.fillText('N = event count', legendX + 28, ly + 3);
 }
 
 // ─── WebSocket (live updates) ────────────────────────────────────────────────
@@ -1018,14 +1128,18 @@ function connectWS() {
               events: v.events_json ? JSON.parse(v.events_json) : [],
               signature: v.signature,
             });
-            addEvent('vertex', `Round ${v.round}`, shortKey(v.author), nodeColor(v.author));
+            if (dagAnim.initialSyncDone) {
+              addEvent('vertex', `Round ${v.round}`, shortKey(v.author), nodeColor(v.author));
+            }
           }
           lastSyncRound = Math.max(lastSyncRound, ...msg.vertices.map(v => v.round));
         }
         if (msg.commits) {
           for (const c of msg.commits) {
             dagData.commits.add(c.anchor_hash);
-            addEvent('commit', `Round ${c.round} finalized`, shortKey(c.anchor_hash), null);
+            if (dagAnim.initialSyncDone) {
+              addEvent('commit', `Round ${c.round} finalized`, shortKey(c.anchor_hash), null);
+            }
           }
         }
         renderDAG();
@@ -1073,6 +1187,7 @@ window.addEventListener('resize', () => renderDAG());
 connectWS();
 poll();
 setInterval(poll, 60000); // Fallback only — most data arrives via WS push
+setInterval(renderEvents, 5000); // Keep event timestamps fresh
 </script>
 </body>
 </html>
