@@ -35,7 +35,7 @@ const MIN_NODES_FOR_CONSENSUS = 4;
 export class PersistiaWorld implements DurableObject {
   state: DurableObjectState;
   env: any;
-  sockets: Map<WebSocket, { pubkey?: string; channels: Set<string>; isValidator: boolean }> = new Map();
+  sockets: Map<WebSocket, { pubkey?: string; channels: Set<string>; isValidator: boolean; msgCount: number; msgWindowStart: number }> = new Map();
 
   // Legacy state (backward compat when consensus off)
   currentRoot: string = "";
@@ -637,6 +637,10 @@ export class PersistiaWorld implements DurableObject {
       case "/dag/vertex": {
         if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
         const vertex = await req.json() as DAGVertex;
+        // Rate-limit vertex submissions by author
+        if (vertex.author && !this.validatorRegistry.checkGossipRateLimit(vertex.author)) {
+          return this.json({ error: "Vertex rate limited" }, 429);
+        }
         const result = await this.receiveVertex(vertex);
         return this.json(result, result.ok ? 200 : 400);
       }
@@ -1220,6 +1224,11 @@ export class PersistiaWorld implements DurableObject {
         if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
         const envelope = await req.json() as GossipEnvelope;
 
+        // Rate-limit gossip by sender pubkey (stricter for unregistered peers)
+        if (envelope.sender_pubkey && !this.validatorRegistry.checkGossipRateLimit(envelope.sender_pubkey)) {
+          return this.json({ error: "Gossip rate limited" }, 429);
+        }
+
         const valid = await this.gossipManager.verifyEnvelope(envelope);
         if (!valid) return this.json({ error: "Invalid or duplicate gossip envelope" }, 400);
 
@@ -1250,6 +1259,13 @@ export class PersistiaWorld implements DurableObject {
       }
 
       case "/gossip/sync": {
+        // Rate-limit sync requests by IP (no pubkey available on GET)
+        // Sync is expensive — cap at 10 requests/min per caller
+        const syncCaller = req.headers.get("CF-Connecting-IP") || "unknown";
+        if (!this.validatorRegistry.checkRateLimit(`sync:${syncCaller}`, 60_000, 10)) {
+          return this.json({ error: "Sync rate limited" }, 429);
+        }
+
         // Respond to sync requests from peers
         const afterRound = parseInt(url.searchParams.get("after_round") || "0");
         const limit = Math.min(parseInt(url.searchParams.get("limit") || "500"), 500);
@@ -1282,6 +1298,12 @@ export class PersistiaWorld implements DurableObject {
         // Peer exchange endpoint
         if (req.method === "POST") {
           const envelope = await req.json() as GossipEnvelope;
+
+          // Rate-limit peer exchange by sender
+          if (envelope.sender_pubkey && !this.validatorRegistry.checkGossipRateLimit(envelope.sender_pubkey)) {
+            return this.json({ error: "Gossip rate limited" }, 429);
+          }
+
           const valid = await this.gossipManager.verifyEnvelope(envelope);
           if (valid && envelope.payload?.peers) {
             for (const p of envelope.payload.peers) {
@@ -1449,10 +1471,27 @@ export class PersistiaWorld implements DurableObject {
 
   private handleWebSocket(ws: WebSocket) {
     ws.accept();
-    this.sockets.set(ws, { channels: new Set(), isValidator: false });
+    this.sockets.set(ws, { channels: new Set(), isValidator: false, msgCount: 0, msgWindowStart: Date.now() });
 
     ws.addEventListener("message", async (event) => {
       try {
+        // Per-connection message budget: max 100 msgs/sec
+        const meta = this.sockets.get(ws);
+        if (meta) {
+          const now = Date.now();
+          if (now - meta.msgWindowStart > 1000) {
+            meta.msgCount = 0;
+            meta.msgWindowStart = now;
+          }
+          meta.msgCount++;
+          if (meta.msgCount > 100) {
+            ws.send(JSON.stringify({ type: "error", message: "Message rate exceeded (max 100/sec)" }));
+            ws.close(4029, "Rate limit exceeded");
+            this.sockets.delete(ws);
+            return;
+          }
+        }
+
         const msg = JSON.parse(event.data as string);
         await this.handleWsMessage(ws, msg);
       } catch (e: any) {
@@ -1545,6 +1584,10 @@ export class PersistiaWorld implements DurableObject {
     // Submit vertex via WS (replaces POST /dag/vertex)
     if (msg.type === "vertex") {
       const vertex = msg as DAGVertex;
+      if (vertex.author && !this.validatorRegistry.checkGossipRateLimit(vertex.author)) {
+        ws.send(JSON.stringify({ type: "vertex.result", ok: false, error: "Vertex rate limited" }));
+        return;
+      }
       const result = await this.receiveVertex(vertex);
       ws.send(JSON.stringify({ type: "vertex.result", ...result }));
       return;

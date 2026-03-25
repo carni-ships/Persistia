@@ -9,10 +9,18 @@ const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
+const MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024; // 2MB — reject oversized payloads before they reach the DO
+
 export default {
   async fetch(request: Request, env: any): Promise<Response> {
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: CORS_HEADERS });
+    }
+
+    // Reject oversized request bodies early (before forwarding to Durable Object)
+    const contentLength = request.headers.get("Content-Length");
+    if (contentLength && parseInt(contentLength) > MAX_REQUEST_BODY_BYTES) {
+      return corsResponse(JSON.stringify({ error: "Request body too large (max 2MB)" }), 413);
     }
 
     const url = new URL(request.url);

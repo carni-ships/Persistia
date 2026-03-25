@@ -524,6 +524,19 @@ export class ValidatorRegistry {
     return true;
   }
 
+  /**
+   * Rate-limit gossip traffic. Registered validators get generous limits;
+   * unregistered peers get 10x stricter limits to make PoW serve double duty.
+   */
+  checkGossipRateLimit(pubkey: string): boolean {
+    const validator = this.getValidator(pubkey);
+    const isRegistered = validator && validator.status === "active";
+
+    // Registered validators: 200/min scaled by reputation. Unregistered: 20/min.
+    const baseLimit = isRegistered ? 200 : 20;
+    return this.checkRateLimit(pubkey, 60_000, baseLimit);
+  }
+
   // ─── PoW Difficulty Info ────────────────────────────────────────────────
 
   getDifficulty(): number {
