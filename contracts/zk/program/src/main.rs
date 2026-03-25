@@ -22,23 +22,34 @@ use sha2::{Sha256, Digest};
 
 /// Compute SHA-256 leaf hash: SHA256("leaf:{key_hex}:{value_hex}")
 /// Matches computeLeafHash() in state-proofs.ts
+/// Optimized: writes hex directly into hasher to avoid String allocations in zkVM.
 fn sha256_leaf_hash(key: &[u8], value: &[u8]) -> [u8; 32] {
-    let key_hex = hex_encode(key);
-    let val_hex = hex_encode(value);
-    let input = format!("leaf:{}:{}", key_hex, val_hex);
     let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
+    hasher.update(b"leaf:");
+    hash_update_hex(&mut hasher, key);
+    hasher.update(b":");
+    hash_update_hex(&mut hasher, value);
     hasher.finalize().into()
 }
 
 /// Compute SHA-256 of two concatenated hex hashes (internal Merkle node).
 /// Matches: sha256(left + right) in state-proofs.ts where left/right are hex strings.
+/// Optimized: streams hex bytes directly into hasher.
 fn sha256_node_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-    let combined = format!("{}{}", hex_encode(left), hex_encode(right));
     let mut hasher = Sha256::new();
-    hasher.update(combined.as_bytes());
+    hash_update_hex(&mut hasher, left);
+    hash_update_hex(&mut hasher, right);
     hasher.finalize().into()
 }
+
+/// Write bytes as lowercase hex directly into a Sha256 hasher (zero allocations).
+fn hash_update_hex(hasher: &mut Sha256, bytes: &[u8]) {
+    for &b in bytes {
+        hasher.update(&[HEX_BYTES[(b >> 4) as usize], HEX_BYTES[(b & 0xf) as usize]]);
+    }
+}
+
+const HEX_BYTES: [u8; 16] = *b"0123456789abcdef";
 
 /// Compute SHA-256 Merkle root from leaf hashes.
 /// Pads to power of 2 by duplicating last leaf (matches state-proofs.ts).
@@ -71,22 +82,6 @@ fn compute_sha256_merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     level[0]
 }
 
-/// Encode bytes as lowercase hex string (no allocations in hot path avoided
-/// by keeping this simple — inside zkVM the cycle cost of format is acceptable
-/// since SHA-256 uses the precompile anyway).
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        s.push(HEX_CHARS[(b >> 4) as usize]);
-        s.push(HEX_CHARS[(b & 0xf) as usize]);
-    }
-    s
-}
-
-const HEX_CHARS: [char; 16] = [
-    '0', '1', '2', '3', '4', '5', '6', '7',
-    '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
-];
 
 // ─── Ed25519 Signature Verification ─────────────────────────────────────────
 

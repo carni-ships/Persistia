@@ -7,3 +7,4 @@ resolver = "2"
 # curve25519-dalek-ng is patched transitively via ed25519-consensus.
 [patch.crates-io]
 ed25519-consensus = { git = "https://github.com/sp1-patches/ed25519-consensus", tag = "ed25519_consensus-v2.1.0-patch-v1" }
+sha2 = { git = "https://github.com/sp1-patches/RustCrypto-hashes", package = "sha2", tag = "sha2-v0.10.8-patch-v1" }
