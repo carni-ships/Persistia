@@ -22,6 +22,7 @@ import { computeStateCommitment, generateStateProof, verifyProof } from "./state
 import { type CrossShardMessage, type CrossShardReceipt, validateMessage, createCrossShardMessage } from "./cross-shard";
 import { GossipManager, type GossipEnvelope, type SyncResponsePayload } from "./gossip";
 import { AnchorManager, type AnchorConfig, type AnchorRecord } from "./anchoring";
+import { ValidatorRegistry, verifyPoW } from "./validator-registry";
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -46,6 +47,7 @@ export class PersistiaWorld implements DurableObject {
   triggerManager!: TriggerManager;
   gossipManager!: GossipManager;
   anchorManager!: AnchorManager;
+  validatorRegistry!: ValidatorRegistry;
   shardName: string = "global-world";
   currentRound: number = 0;
   finalizedSeq: number = 0;
@@ -271,6 +273,49 @@ export class PersistiaWorld implements DurableObject {
       verified INTEGER NOT NULL DEFAULT 0
     )`);
 
+    // ─── Validator Registry ──────────────────────────────────────────────
+    sql.exec(`CREATE TABLE IF NOT EXISTS validators (
+      pubkey TEXT PRIMARY KEY,
+      url TEXT NOT NULL DEFAULT '',
+      reputation INTEGER NOT NULL DEFAULT 100,
+      pow_nonce TEXT NOT NULL DEFAULT '',
+      pow_hash TEXT NOT NULL DEFAULT '',
+      registered_at INTEGER NOT NULL,
+      last_active_round INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'active',
+      equivocation_count INTEGER NOT NULL DEFAULT 0,
+      total_vertices INTEGER NOT NULL DEFAULT 0,
+      total_commits INTEGER NOT NULL DEFAULT 0
+    )`);
+    sql.exec(`CREATE INDEX IF NOT EXISTS idx_validators_status ON validators(status)`);
+
+    sql.exec(`CREATE TABLE IF NOT EXISTS equivocation_evidence (
+      id TEXT PRIMARY KEY,
+      validator_pubkey TEXT NOT NULL,
+      round INTEGER NOT NULL,
+      vertex_hash_1 TEXT NOT NULL,
+      vertex_hash_2 TEXT NOT NULL,
+      detected_at INTEGER NOT NULL,
+      reported_by TEXT NOT NULL
+    )`);
+    sql.exec(`CREATE INDEX IF NOT EXISTS idx_equivocation_validator ON equivocation_evidence(validator_pubkey)`);
+
+    sql.exec(`CREATE TABLE IF NOT EXISTS governance_votes (
+      id TEXT PRIMARY KEY,
+      action TEXT NOT NULL,
+      target TEXT NOT NULL,
+      voter_pubkey TEXT NOT NULL,
+      voter_reputation INTEGER NOT NULL,
+      created_at INTEGER NOT NULL
+    )`);
+    sql.exec(`CREATE INDEX IF NOT EXISTS idx_governance_action ON governance_votes(action, target)`);
+
+    sql.exec(`CREATE TABLE IF NOT EXISTS rate_limit_log (
+      pubkey TEXT NOT NULL,
+      timestamp INTEGER NOT NULL
+    )`);
+    sql.exec(`CREATE INDEX IF NOT EXISTS idx_rate_limit ON rate_limit_log(pubkey, timestamp)`);
+
     // ─── Gossip Peers ─────────────────────────────────────────────────────
     sql.exec(`CREATE TABLE IF NOT EXISTS gossip_peers (
       pubkey TEXT PRIMARY KEY,
@@ -316,8 +361,9 @@ export class PersistiaWorld implements DurableObject {
     this.contractExecutor = new ContractExecutor(sql);
     this.triggerManager = new TriggerManager(sql);
 
-    // Gossip + anchoring managers
+    // Gossip + anchoring + validator registry
     this.gossipManager = new GossipManager(sql);
+    this.validatorRegistry = new ValidatorRegistry(sql, this.env.POW_DIFFICULTY ? parseInt(this.env.POW_DIFFICULTY) : undefined);
     const anchorConfig: Partial<AnchorConfig> = {};
     if (this.env.ARWEAVE_GATEWAY) {
       anchorConfig.arweave = {
@@ -405,6 +451,9 @@ export class PersistiaWorld implements DurableObject {
       }
       if (url.pathname.startsWith("/xshard/")) {
         return this.handleCrossShardRoute(req, url);
+      }
+      if (url.pathname.startsWith("/validator/")) {
+        return this.handleValidatorRoute(req, url);
       }
       if (url.pathname.startsWith("/gossip/")) {
         return this.handleGossipRoute(req, url);
@@ -509,9 +558,10 @@ export class PersistiaWorld implements DurableObject {
           const contractCount = [...this.state.storage.sql.exec("SELECT COUNT(*) as c FROM contracts")] as any[];
           const gossipPeerCount = this.gossipManager.getHealthyPeers().length;
           const latestAnchor = this.anchorManager.getLatestAnchor();
+          const validatorCount = this.validatorRegistry.getActiveCount();
           return this.json({
             name: "Persistia Ledger Node",
-            version: "0.6.0",
+            version: "0.7.0",
             consensus: CONSENSUS_ENABLED,
             node_pubkey: this.nodeIdentity?.pubkey || null,
             node_url: this.nodeIdentity?.url || null,
@@ -521,6 +571,9 @@ export class PersistiaWorld implements DurableObject {
             active_nodes: this.getActiveNodeCount(),
             gossip_peers: gossipPeerCount,
             pending_events: this.getPendingEventCount(),
+            registered_validators: validatorCount,
+            quorum_threshold: this.validatorRegistry.getQuorumThreshold(),
+            pow_difficulty: this.validatorRegistry.getDifficulty(),
             contracts: contractCount[0]?.c || 0,
             latest_anchor: latestAnchor ? {
               id: latestAnchor.id,
@@ -1083,6 +1136,81 @@ export class PersistiaWorld implements DurableObject {
     }
   }
 
+  // ─── Validator Registry Routes ───────────────────────────────────────
+
+  private async handleValidatorRoute(req: Request, url: URL): Promise<Response> {
+    switch (url.pathname) {
+      case "/validator/register": {
+        // Register with Proof-of-Work
+        if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+        const { pubkey, url: peerUrl, pow_nonce, signature } = await req.json() as any;
+        if (!pubkey || !pow_nonce) return this.json({ error: "pubkey and pow_nonce required" }, 400);
+
+        // Verify the registration is signed by the claimed pubkey
+        const valid = await verifyNodeSignature(pubkey, signature, JSON.stringify({ pubkey, url: peerUrl || "", pow_nonce }));
+        if (!valid) return this.json({ error: "Invalid signature" }, 400);
+
+        const result = await this.validatorRegistry.register(pubkey, peerUrl || "", pow_nonce);
+        if (!result.ok) return this.json(result, 400);
+
+        // Also register in active_nodes for backward compat
+        this.state.storage.sql.exec(
+          `INSERT INTO active_nodes (pubkey, url, last_vertex_round, last_seen, is_self)
+           VALUES (?, ?, 0, ?, 0)
+           ON CONFLICT(pubkey) DO UPDATE SET url = ?, last_seen = ?`,
+          pubkey, peerUrl || "", Date.now(), peerUrl || "", Date.now(),
+        );
+
+        this.scheduleAlarm();
+        return this.json(result);
+      }
+
+      case "/validator/info": {
+        const pubkey = url.searchParams.get("pubkey");
+        if (!pubkey) return this.json({ error: "pubkey required" }, 400);
+        const v = this.validatorRegistry.getValidator(pubkey);
+        if (!v) return this.json({ error: "Validator not found" }, 404);
+        return this.json(v);
+      }
+
+      case "/validator/list":
+        return this.json({
+          validators: this.validatorRegistry.getActiveValidators(),
+          quorum_threshold: this.validatorRegistry.getQuorumThreshold(),
+          total_active: this.validatorRegistry.getActiveCount(),
+        });
+
+      case "/validator/registration-info":
+        return this.json(this.validatorRegistry.getRegistrationInfo());
+
+      case "/validator/equivocations": {
+        const pubkey = url.searchParams.get("pubkey") || undefined;
+        return this.json({ evidence: this.validatorRegistry.getEquivocationEvidence(pubkey) });
+      }
+
+      case "/validator/vote": {
+        if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+        const { voter_pubkey, action, target, signature } = await req.json() as any;
+        if (!voter_pubkey || !action || !target) {
+          return this.json({ error: "voter_pubkey, action, and target required" }, 400);
+        }
+
+        // Verify signature
+        const valid = await verifyNodeSignature(
+          voter_pubkey, signature,
+          JSON.stringify({ action, target }),
+        );
+        if (!valid) return this.json({ error: "Invalid signature" }, 400);
+
+        const result = await this.validatorRegistry.vote(voter_pubkey, action, target);
+        return this.json(result, result.ok ? 200 : 400);
+      }
+
+      default:
+        return this.json({ error: "Unknown validator endpoint" }, 404);
+    }
+  }
+
   // ─── Gossip Routes ──────────────────────────────────────────────────────
 
   private async handleGossipRoute(req: Request, url: URL): Promise<Response> {
@@ -1377,13 +1505,29 @@ export class PersistiaWorld implements DurableObject {
       return;
     }
 
-    // Validator registration via WS
+    // Validator registration via WS (supports both PoW and legacy modes)
     if (msg.type === "register") {
-      const valid = await verifyNodeSignature(msg.pubkey, msg.signature, JSON.stringify({ pubkey: msg.pubkey, url: msg.url || "" }));
+      const valid = await verifyNodeSignature(
+        msg.pubkey, msg.signature,
+        msg.pow_nonce
+          ? JSON.stringify({ pubkey: msg.pubkey, url: msg.url || "", pow_nonce: msg.pow_nonce })
+          : JSON.stringify({ pubkey: msg.pubkey, url: msg.url || "" }),
+      );
       if (!valid) {
         ws.send(JSON.stringify({ type: "register.result", ok: false, error: "Invalid signature" }));
         return;
       }
+
+      // If PoW nonce provided, register through validator registry (Sybil-resistant)
+      if (msg.pow_nonce) {
+        const regResult = await this.validatorRegistry.register(msg.pubkey, msg.url || "", msg.pow_nonce);
+        if (!regResult.ok) {
+          ws.send(JSON.stringify({ type: "register.result", ok: false, error: regResult.error }));
+          return;
+        }
+      }
+
+      // Also register in active_nodes for backward compat
       this.state.storage.sql.exec(
         `INSERT INTO active_nodes (pubkey, url, last_vertex_round, last_seen, is_self)
          VALUES (?, ?, 0, ?, 0)
@@ -1447,6 +1591,11 @@ export class PersistiaWorld implements DurableObject {
   private async receiveClientEvent(
     event: SignedEvent,
   ): Promise<{ ok: boolean; seq?: number; pending?: boolean; error?: string }> {
+    // 0. Rate limiting
+    if (!this.validatorRegistry.checkRateLimit(event.pubkey)) {
+      return { ok: false, error: "Rate limited — too many events, try again later" };
+    }
+
     // 1. Verify signature
     const valid = await this.verifySignature(event);
     if (!valid) return { ok: false, error: "Invalid signature" };
@@ -1641,12 +1790,26 @@ export class PersistiaWorld implements DurableObject {
       vertex.author, vertex.round,
     )];
     if (equivocation.length > 0) {
-      console.warn(`Equivocation detected: ${vertex.author} at round ${vertex.round}`);
-      return { ok: false, error: "Equivocation: duplicate vertex for same round" };
+      // Record evidence and slash reputation
+      const existingHash = (equivocation[0] as any).hash;
+      await this.validatorRegistry.recordEquivocation(
+        vertex.author, vertex.round, existingHash, vHash,
+        this.nodeIdentity?.pubkey || "system",
+      );
+      // Broadcast evidence to all peers
+      this.broadcast({
+        type: "equivocation.detected",
+        validator: vertex.author,
+        round: vertex.round,
+        vertex_hash_1: existingHash,
+        vertex_hash_2: vHash,
+      });
+      return { ok: false, error: "Equivocation: duplicate vertex for same round (slashed)" };
     }
 
-    // 6. Store
+    // 6. Store + reward reputation
     this.storeVertex(vHash, vertex);
+    this.validatorRegistry.rewardVertex(vertex.author, vertex.round);
 
     // 6b. Broadcast vertex to all WS clients (with hash for ref tracking)
     this.broadcast({
@@ -1876,6 +2039,12 @@ export class PersistiaWorld implements DurableObject {
       finalized_seq: this.finalizedSeq,
       root: this.finalizedRoot,
     });
+
+    // Reward validators who participated in this committed round
+    const commitParticipants = [...this.state.storage.sql.exec(
+      "SELECT DISTINCT author FROM dag_vertices WHERE round = ?", round,
+    )].map((r: any) => r.author as string);
+    this.validatorRegistry.rewardCommitParticipation(commitParticipants);
 
     console.log(`Committed round=${round} anchor=${anchorHash.slice(0, 12)} seq=${this.finalizedSeq}`);
   }

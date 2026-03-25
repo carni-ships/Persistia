@@ -4,6 +4,7 @@
 
 import { sha256 } from "./consensus";
 import type { AggregationStrategy } from "./oracle";
+import { injectFuelMetering, FuelTracker, FUEL_COSTS, DEFAULT_FUEL } from "./wasm-metering";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -76,6 +77,7 @@ interface ExecutionContext {
   callStack: string[];   // addresses currently executing (reentrancy detection)
   readOnly: boolean;
   rootCaller: string;    // original external caller (pubkey)
+  fuel: FuelTracker;     // deterministic fuel metering
 }
 
 function createContext(rootCaller: string, readOnly: boolean): ExecutionContext {
@@ -87,6 +89,7 @@ function createContext(rootCaller: string, readOnly: boolean): ExecutionContext 
     callStack: [],
     readOnly,
     rootCaller,
+    fuel: new FuelTracker(DEFAULT_FUEL),
   };
 }
 
@@ -190,8 +193,8 @@ function readLEB128(bytes: Uint8Array, offset: number): { value: number; bytesRe
 
 // ─── Contract Executor ────────────────────────────────────────────────────────
 
-const CALL_TIMEOUT_MS = 5_000;
-const DEFAULT_GAS = 1_000_000;
+// Fuel-based metering replaces timeout-based execution.
+// Fuel is cosmetic (no token) but deterministic — all nodes agree on execution bounds.
 
 export class ContractExecutor {
   private moduleCache: Map<string, WebAssembly.Module> = new Map();
@@ -207,7 +210,11 @@ export class ContractExecutor {
     const validation = validateWasm(wasmBytes);
     if (!validation.ok) throw new Error(validation.error);
 
-    const module = await WebAssembly.compile(wasmBytes);
+    // Inject fuel metering into the WASM binary before compilation.
+    // This adds a fuel global import and fuel checks at every function entry.
+    const meteredBytes = injectFuelMetering(wasmBytes);
+
+    const module = await WebAssembly.compile(meteredBytes);
 
     const exports = WebAssembly.Module.exports(module);
     const hasMemory = exports.some(e => e.name === "memory" && e.kind === "memory");
@@ -236,10 +243,11 @@ export class ContractExecutor {
     method: string,
     args: Uint8Array,
     caller: string,
-    gas: number = DEFAULT_GAS,
+    gas: number = DEFAULT_FUEL,
   ): Promise<CallResult> {
     const ctx = createContext(caller, false);
-    const result = await this.executeInContext(ctx, address, method, args, caller, gas);
+    ctx.fuel = new FuelTracker(gas);
+    const result = await this.executeInContext(ctx, address, method, args, caller);
 
     // Only flush all mutations if the top-level call succeeded
     if (result.ok) {
@@ -260,7 +268,8 @@ export class ContractExecutor {
     args: Uint8Array,
   ): Promise<CallResult> {
     const ctx = createContext("", true);
-    const result = await this.executeInContext(ctx, address, method, args, "", 0);
+    ctx.fuel = new FuelTracker(DEFAULT_FUEL);
+    const result = await this.executeInContext(ctx, address, method, args, "");
     return { ...result, logs: ctx.logs };
   }
 
@@ -272,8 +281,17 @@ export class ContractExecutor {
     method: string,
     args: Uint8Array,
     caller: string,
-    gas: number,
   ): Promise<CallResult> {
+    // Check fuel
+    if (!ctx.fuel.alive) {
+      return { ok: false, logs: [], error: "Out of fuel" };
+    }
+
+    // Deduct function call overhead
+    if (!ctx.fuel.consume(FUEL_COSTS.function_call)) {
+      return { ok: false, logs: [], error: "Out of fuel (function call overhead)" };
+    }
+
     // Check call depth
     if (ctx.callStack.length >= MAX_CALL_DEPTH) {
       return { ok: false, logs: [], error: `Max call depth (${MAX_CALL_DEPTH}) exceeded` };
@@ -301,9 +319,25 @@ export class ContractExecutor {
     // Set args in register 0
     registers.set(0, args);
 
+    // Fuel global — shared between WASM guest and host
+    const fuelGlobal = new WebAssembly.Global({ value: "i32", mutable: true }, ctx.fuel.remaining);
+
+    // Helper: deduct fuel for a host call, trap if exhausted
+    const deductFuel = (cost: number): boolean => {
+      ctx.fuel.syncFromGlobal(fuelGlobal); // read guest's fuel state
+      if (!ctx.fuel.consume(cost)) {
+        trapped = true;
+        trapMessage = "Out of fuel";
+        return false;
+      }
+      ctx.fuel.syncToGlobal(fuelGlobal); // write back to guest
+      return true;
+    };
+
     // Build host imports
     const env: Record<string, Function> = {
       storage_read: (keyReg: number): number => {
+        if (!deductFuel(FUEL_COSTS.storage_read)) return 0;
         const keyBytes = registers.get(keyReg);
         if (!keyBytes) return 0;
         const keyHex = bytesToHex(keyBytes);
@@ -328,6 +362,7 @@ export class ContractExecutor {
       },
 
       storage_write: (keyReg: number, valReg: number) => {
+        if (!deductFuel(FUEL_COSTS.storage_write)) return;
         if (ctx.readOnly) return;
         const keyBytes = registers.get(keyReg);
         const valBytes = registers.get(valReg);
@@ -336,6 +371,7 @@ export class ContractExecutor {
       },
 
       storage_remove: (keyReg: number): number => {
+        if (!deductFuel(FUEL_COSTS.storage_remove)) return 0;
         if (ctx.readOnly) return 0;
         const keyBytes = registers.get(keyReg);
         if (!keyBytes) return 0;
@@ -353,42 +389,48 @@ export class ContractExecutor {
       },
 
       register_len: (regId: number): number => {
+        deductFuel(FUEL_COSTS.register_len);
         const data = registers.get(regId);
         return data ? data.length : 0;
       },
 
       read_register: (regId: number, ptr: number) => {
+        if (!deductFuel(FUEL_COSTS.read_register)) return;
         const data = registers.get(regId);
         if (!data || !memory) return;
         new Uint8Array(memory.buffer).set(data, ptr);
       },
 
       write_register: (regId: number, ptr: number, len: number) => {
+        if (!deductFuel(FUEL_COSTS.write_register)) return;
         if (!memory) return;
         registers.set(regId, new Uint8Array(new Uint8Array(memory.buffer).slice(ptr, ptr + len)));
       },
 
       caller: (regId: number) => {
+        deductFuel(FUEL_COSTS.caller);
         registers.set(regId, new TextEncoder().encode(caller));
       },
 
-      // Return the original external caller (the user pubkey), not the immediate caller
       origin: (regId: number) => {
+        deductFuel(FUEL_COSTS.origin);
         registers.set(regId, new TextEncoder().encode(ctx.rootCaller));
       },
 
-      // Return the current contract's own address
       self_address: (regId: number) => {
+        deductFuel(FUEL_COSTS.self_address);
         registers.set(regId, new TextEncoder().encode(address));
       },
 
       log: (ptr: number, len: number) => {
+        if (!deductFuel(FUEL_COSTS.log)) return;
         if (!memory) return;
         const msg = new TextDecoder().decode(new Uint8Array(memory.buffer).slice(ptr, ptr + len));
         ctx.logs.push(`[${address.slice(0, 8)}] ${msg}`);
       },
 
       set_return: (regId: number) => {
+        deductFuel(FUEL_COSTS.set_return);
         returnReg = regId;
       },
 
@@ -411,6 +453,7 @@ export class ContractExecutor {
       // args_reg: register containing arguments (bytes)
       // Returns: 1 on success (return data in register 0), 0 on failure (error in register 0)
       cross_contract_call: (targetReg: number, methodReg: number, argsReg: number): number => {
+        if (!deductFuel(FUEL_COSTS.cross_contract_call)) return 0;
         const targetBytes = registers.get(targetReg);
         const methodBytes = registers.get(methodReg);
         const callArgs = registers.get(argsReg) || new Uint8Array();
@@ -421,24 +464,6 @@ export class ContractExecutor {
 
         const targetAddr = new TextDecoder().decode(targetBytes);
         const targetMethod = new TextDecoder().decode(methodBytes);
-
-        // We can't do async inside a sync WASM call, so we use a synchronous
-        // trampoline pattern: buffer the cross-call request and return a promise
-        // marker. However, WASM is synchronous, so we need a different approach.
-        //
-        // The solution: we pre-compile and cache all modules, and since
-        // WebAssembly.instantiate can be sync when the module is already compiled,
-        // we can do synchronous cross-contract calls IF we use the sync Module API.
-        //
-        // For now, we buffer the request and the caller must handle it.
-        // In V8/CF Workers, we can't do sync cross-calls from within WASM.
-        // Instead, we use a "promise-based trampoline" pattern:
-
-        // Actually, since CF Workers WASM host functions must be synchronous,
-        // and cross-contract calls need async module loading, we use a
-        // pre-loaded module approach: all modules in the call are pre-cached.
-        // The cross_contract_call itself executes synchronously using
-        // new WebAssembly.Instance() (sync constructor) with the cached module.
 
         try {
           const cachedModule = this.moduleCache.get(targetAddr);
@@ -466,15 +491,15 @@ export class ContractExecutor {
           let calleeReturnReg: number | null = null;
           let calleeTrapped = false;
 
-          // Build callee host imports (recursive — shares ctx)
-          const calleeEnv = this.buildHostImports(
-            ctx, targetAddr, address, // caller of this sub-call is the current contract
+          // Build callee host imports (recursive — shares ctx + fuel)
+          const calleeImports = this.buildHostImports(
+            ctx, targetAddr, address,
             calleeRegisters, calleeMutations,
             (reg: number) => { calleeReturnReg = reg; },
             (msg: string) => { calleeTrapped = true; trapMessage = msg; },
           );
 
-          const calleeInstance = new WebAssembly.Instance(cachedModule, { env: calleeEnv });
+          const calleeInstance = new WebAssembly.Instance(cachedModule, calleeImports);
           const calleeFn = calleeInstance.exports[targetMethod];
           if (!calleeFn || typeof calleeFn !== "function") {
             ctx.callStack.pop();
@@ -512,6 +537,7 @@ export class ContractExecutor {
       },
 
       oracle_request: (urlReg: number, callbackReg: number, aggregationReg: number, jsonPathReg: number) => {
+        if (!deductFuel(FUEL_COSTS.oracle_request)) return;
         if (ctx.readOnly) return;
         const urlBytes = registers.get(urlReg);
         const callbackBytes = registers.get(callbackReg);
@@ -529,6 +555,7 @@ export class ContractExecutor {
       },
 
       trigger_manage: (actionReg: number, dataReg: number) => {
+        if (!deductFuel(FUEL_COSTS.trigger_manage)) return;
         if (ctx.readOnly) return;
         const actionBytes = registers.get(actionReg);
         const dataBytes = registers.get(dataReg);
@@ -541,14 +568,21 @@ export class ContractExecutor {
         } catch { /* invalid JSON, ignore */ }
       },
 
-      gas_left: (): number => gas,
+      gas_left: (): number => {
+        deductFuel(FUEL_COSTS.gas_left);
+        ctx.fuel.syncFromGlobal(fuelGlobal);
+        return ctx.fuel.remaining;
+      },
     };
 
-    // Instantiate
+    // Instantiate with fuel global
     let instance: WebAssembly.Instance;
     let memory: WebAssembly.Memory;
     try {
-      instance = await WebAssembly.instantiate(module, { env });
+      instance = await WebAssembly.instantiate(module, {
+        env,
+        metering: { fuel: fuelGlobal },
+      });
       memory = instance.exports.memory as WebAssembly.Memory;
     } catch (e: any) {
       ctx.callStack.pop();
@@ -562,25 +596,29 @@ export class ContractExecutor {
       return { ok: false, logs: [], error: `Method '${method}' not found or not callable` };
     }
 
-    // Execute with timeout
+    // Execute — fuel metering handles termination deterministically.
+    // The WASM binary has fuel checks injected at every function entry.
+    // When fuel hits zero, the guest executes `unreachable` which traps.
     try {
-      await Promise.race([
-        Promise.resolve().then(() => (fn as Function)()),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error("Execution timeout (gas exhausted)")), CALL_TIMEOUT_MS),
-        ),
-      ]);
+      (fn as Function)();
+
+      // Sync fuel state after execution
+      ctx.fuel.syncFromGlobal(fuelGlobal);
 
       if (trapped) {
         ctx.callStack.pop();
-        // Rollback this contract's mutations on trap
         mutations.clear();
         return { ok: false, logs: [], error: `Contract trapped: ${trapMessage}` };
       }
     } catch (e: any) {
       ctx.callStack.pop();
+      ctx.fuel.syncFromGlobal(fuelGlobal);
       mutations.clear();
-      return { ok: false, logs: [], error: e.message };
+      // Distinguish fuel exhaustion from other traps
+      const msg = (trapped && trapMessage === "Out of fuel") || !ctx.fuel.alive
+        ? `Out of fuel (used ${ctx.fuel.consumed} of ${ctx.fuel.initial})`
+        : e.message;
+      return { ok: false, logs: [], error: msg };
     }
 
     ctx.callStack.pop();
@@ -599,11 +637,24 @@ export class ContractExecutor {
     mutations: Map<string, Uint8Array | null>,
     onSetReturn: (reg: number) => void,
     onTrap: (msg: string) => void,
-  ): { env: Record<string, Function> } {
+  ): { env: Record<string, Function>; metering: Record<string, WebAssembly.Global> } {
     let memory: WebAssembly.Memory | null = null;
+
+    // Share the parent's fuel global for cross-contract calls
+    const fuelGlobal = new WebAssembly.Global({ value: "i32", mutable: true }, ctx.fuel.remaining);
+    const deductFuel = (cost: number): boolean => {
+      ctx.fuel.syncFromGlobal(fuelGlobal);
+      if (!ctx.fuel.consume(cost)) {
+        onTrap("Out of fuel");
+        return false;
+      }
+      ctx.fuel.syncToGlobal(fuelGlobal);
+      return true;
+    };
 
     const env: Record<string, Function> = {
       storage_read: (keyReg: number): number => {
+        if (!deductFuel(FUEL_COSTS.storage_read)) return 0;
         const keyBytes = registers.get(keyReg);
         if (!keyBytes) return 0;
         const keyHex = bytesToHex(keyBytes);
@@ -624,6 +675,7 @@ export class ContractExecutor {
       },
 
       storage_write: (keyReg: number, valReg: number) => {
+        if (!deductFuel(FUEL_COSTS.storage_write)) return;
         if (ctx.readOnly) return;
         const keyBytes = registers.get(keyReg);
         const valBytes = registers.get(valReg);
@@ -632,6 +684,7 @@ export class ContractExecutor {
       },
 
       storage_remove: (keyReg: number): number => {
+        if (!deductFuel(FUEL_COSTS.storage_remove)) return 0;
         if (ctx.readOnly) return 0;
         const keyBytes = registers.get(keyReg);
         if (!keyBytes) return 0;
@@ -643,38 +696,44 @@ export class ContractExecutor {
         return existed ? 1 : 0;
       },
 
-      register_len: (regId: number): number => registers.get(regId)?.length ?? 0,
+      register_len: (regId: number): number => { deductFuel(FUEL_COSTS.register_len); return registers.get(regId)?.length ?? 0; },
 
       read_register: (regId: number, ptr: number) => {
+        if (!deductFuel(FUEL_COSTS.read_register)) return;
         const data = registers.get(regId);
         if (!data || !memory) return;
         new Uint8Array(memory.buffer).set(data, ptr);
       },
 
       write_register: (regId: number, ptr: number, len: number) => {
+        if (!deductFuel(FUEL_COSTS.write_register)) return;
         if (!memory) return;
         registers.set(regId, new Uint8Array(new Uint8Array(memory.buffer).slice(ptr, ptr + len)));
       },
 
       caller: (regId: number) => {
+        deductFuel(FUEL_COSTS.caller);
         registers.set(regId, new TextEncoder().encode(callerAddr));
       },
 
       origin: (regId: number) => {
+        deductFuel(FUEL_COSTS.origin);
         registers.set(regId, new TextEncoder().encode(ctx.rootCaller));
       },
 
       self_address: (regId: number) => {
+        deductFuel(FUEL_COSTS.self_address);
         registers.set(regId, new TextEncoder().encode(address));
       },
 
       log: (ptr: number, len: number) => {
+        if (!deductFuel(FUEL_COSTS.log)) return;
         if (!memory) return;
         const msg = new TextDecoder().decode(new Uint8Array(memory.buffer).slice(ptr, ptr + len));
         ctx.logs.push(`[${address.slice(0, 8)}] ${msg}`);
       },
 
-      set_return: (regId: number) => onSetReturn(regId),
+      set_return: (regId: number) => { deductFuel(FUEL_COSTS.set_return); onSetReturn(regId); },
 
       abort: (msgPtr: number, msgLen: number, line: number, col: number) => {
         if (memory && msgLen > 0) {
@@ -687,6 +746,7 @@ export class ContractExecutor {
 
       // Cross-contract call within sync context (same pattern as parent)
       cross_contract_call: (targetReg: number, methodReg: number, argsReg: number): number => {
+        if (!deductFuel(FUEL_COSTS.cross_contract_call)) return 0;
         const targetBytes = registers.get(targetReg);
         const methodBytes = registers.get(methodReg);
         const callArgs = registers.get(argsReg) || new Uint8Array();
@@ -760,6 +820,7 @@ export class ContractExecutor {
       },
 
       oracle_request: (urlReg: number, callbackReg: number, aggregationReg: number, jsonPathReg: number) => {
+        if (!deductFuel(FUEL_COSTS.oracle_request)) return;
         if (ctx.readOnly) return;
         const urlBytes = registers.get(urlReg);
         const callbackBytes = registers.get(callbackReg);
@@ -775,6 +836,7 @@ export class ContractExecutor {
       },
 
       trigger_manage: (actionReg: number, dataReg: number) => {
+        if (!deductFuel(FUEL_COSTS.trigger_manage)) return;
         if (ctx.readOnly) return;
         const actionBytes = registers.get(actionReg);
         const dataBytes = registers.get(dataReg);
@@ -785,10 +847,14 @@ export class ContractExecutor {
         } catch { }
       },
 
-      gas_left: (): number => 0,
+      gas_left: (): number => {
+        deductFuel(FUEL_COSTS.gas_left);
+        ctx.fuel.syncFromGlobal(fuelGlobal);
+        return ctx.fuel.remaining;
+      },
     };
 
-    return { env };
+    return { env, metering: { fuel: fuelGlobal } };
   }
 
   // ─── Pre-cache modules for cross-contract calls ──────────────────────
