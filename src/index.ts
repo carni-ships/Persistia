@@ -2,6 +2,7 @@ import { PersistiaWorldV4 } from "./PersistiaDO";
 import DASHBOARD_HTML from "../client/dashboard.html";
 import GAME_HTML from "../client/game.html";
 import VERIFIER_HTML from "../client/verifier.html";
+import WALLET_HTML from "../client/wallet.html";
 export { PersistiaWorldV4 };
 
 const CORS_HEADERS: Record<string, string> = {
@@ -101,6 +102,13 @@ export default {
     // ─── Verifier ─────────────────────────────────────────────────────
     if (url.pathname === "/verifier" || url.pathname === "/verifier.html") {
       return new Response(VERIFIER_HTML, {
+        headers: { "Content-Type": "text/html;charset=utf-8", ...CORS_HEADERS },
+      });
+    }
+
+    // ─── Wallet ──────────────────────────────────────────────────────
+    if (url.pathname === "/wallet" || url.pathname === "/wallet.html") {
+      return new Response(WALLET_HTML, {
         headers: { "Content-Type": "text/html;charset=utf-8", ...CORS_HEADERS },
       });
     }

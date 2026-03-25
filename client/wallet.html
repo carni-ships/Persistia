@@ -148,6 +148,17 @@
 </head>
 <body>
 
+<nav style="position:fixed;top:0;left:0;right:0;display:flex;align-items:center;gap:12px;padding:10px 20px;background:rgba(13,17,23,0.95);border-bottom:1px solid rgba(255,255,255,0.06);z-index:100;backdrop-filter:blur(12px)">
+  <span style="font-weight:700;color:#58a6ff;font-size:14px">Persistia</span>
+  <span style="color:#d29922;font-size:12px;border:1px solid rgba(210,153,34,0.4);padding:2px 8px;border-radius:4px">Wallet</span>
+  <div style="margin-left:auto;display:flex;gap:8px">
+    <a href="/game" style="color:#6c5ce7;text-decoration:none;font-size:12px;padding:4px 12px;border:1px solid rgba(108,92,231,0.4);border-radius:6px;transition:all 0.15s" onmouseover="this.style.background='rgba(108,92,231,0.15)'" onmouseout="this.style.background='transparent'">Game World</a>
+    <a href="/dashboard" style="color:#6c5ce7;text-decoration:none;font-size:12px;padding:4px 12px;border:1px solid rgba(108,92,231,0.4);border-radius:6px;transition:all 0.15s" onmouseover="this.style.background='rgba(108,92,231,0.15)'" onmouseout="this.style.background='transparent'">Dashboard</a>
+    <a href="/verifier" style="color:#00d2a0;text-decoration:none;font-size:12px;padding:4px 12px;border:1px solid rgba(0,210,160,0.4);border-radius:6px;transition:all 0.15s" onmouseover="this.style.background='rgba(0,210,160,0.15)'" onmouseout="this.style.background='transparent'">Verifier</a>
+  </div>
+</nav>
+<div style="height:48px"></div>
+
 <h1>Persistia Wallet</h1>
 <p class="subtitle">Ed25519 key management + Bech32 addresses</p>
 
