@@ -101,7 +101,8 @@ export interface AnchorInfo {
   finalized_seq: number;
   last_committed_round: number;
   arweave_tx?: string;
-  celestia_height?: number;
+  berachain_tx?: string;
+  berachain_block?: number;
   status: string;
   timestamp: number;
 }

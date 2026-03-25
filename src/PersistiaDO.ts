@@ -403,11 +403,13 @@ export class PersistiaWorld implements DurableObject {
         irys_token: this.env.IRYS_TOKEN,
       };
     }
-    if (this.env.CELESTIA_RPC) {
-      anchorConfig.celestia = {
-        rpc_url: this.env.CELESTIA_RPC,
-        auth_token: this.env.CELESTIA_TOKEN,
-        namespace: this.env.CELESTIA_NAMESPACE || "0000000000000000706572736973746961", // "persistia"
+    if (this.env.BERACHAIN_RPC) {
+      anchorConfig.berachain = {
+        rpc_url: this.env.BERACHAIN_RPC || "https://rpc.berachain.com",
+        private_key: this.env.BERACHAIN_PRIVATE_KEY,
+        hyberdb_address: this.env.HYBERDB_ADDRESS || "0x375B45C2c0Be74a79D8a23501fC13dc78eCd6294",
+        hyberdb_namespace: this.env.HYBERDB_NAMESPACE,
+        chain_id: 80094,
       };
     }
     this.anchorManager = new AnchorManager(sql, anchorConfig);
@@ -666,7 +668,8 @@ export class PersistiaWorld implements DurableObject {
             latest_anchor: latestAnchor ? {
               id: latestAnchor.id,
               arweave_tx: latestAnchor.arweave_tx,
-              celestia_height: latestAnchor.celestia_height,
+              berachain_tx: latestAnchor.berachain_tx,
+              berachain_block: latestAnchor.berachain_block,
               finalized_seq: latestAnchor.bundle.finalized_seq,
               timestamp: latestAnchor.created_at,
             } : null,
@@ -1449,19 +1452,19 @@ export class PersistiaWorld implements DurableObject {
       }
 
       case "/anchor/verify": {
-        // Verify an anchor from Arweave or Celestia
+        // Verify an anchor from Arweave or Berachain
         const arweaveTx = url.searchParams.get("arweave_tx");
-        const celestiaHeight = url.searchParams.get("celestia_height");
+        const berachainTx = url.searchParams.get("berachain_tx");
 
         if (arweaveTx) {
           const result = await this.anchorManager.verifyFromArweave(arweaveTx);
           return this.json(result);
         }
-        if (celestiaHeight) {
-          const result = await this.anchorManager.verifyFromCelestia(parseInt(celestiaHeight));
+        if (berachainTx) {
+          const result = await this.anchorManager.verifyFromBerachain(berachainTx);
           return this.json(result);
         }
-        return this.json({ error: "arweave_tx or celestia_height required" }, 400);
+        return this.json({ error: "arweave_tx or berachain_tx required" }, 400);
       }
 
       case "/anchor/bootstrap": {
@@ -1556,7 +1559,8 @@ export class PersistiaWorld implements DurableObject {
       type: "anchor.submitted",
       anchor_id: record.id,
       arweave_tx: record.arweave_tx,
-      celestia_height: record.celestia_height,
+      berachain_tx: record.berachain_tx,
+      berachain_block: record.berachain_block,
       state_root: effectiveRoot,
       finalized_seq: effectiveSeq,
     });

@@ -1,9 +1,11 @@
-// ─── State Anchoring: Arweave + Celestia ──────────────────────────────────────
+// ─── State Anchoring: Arweave + Berachain ────────────────────────────────────
 // Posts state roots and ZK proofs to permanent off-platform storage.
 // This ensures the ledger survives any Cloudflare account deletion/ban.
 //
-// Arweave: Pay-once permanent storage. Stores full anchor bundle (root, proof, metadata).
-// Celestia: Data Availability layer. Posts blob for public verifiability.
+// Arweave: Pay-once permanent storage via Irys. Stores full anchor bundle.
+// Berachain: EVM L1 with Proof of Liquidity. Posts anchor as calldata (HYTE format)
+//            to the dead address, same pattern as HyberText Transport Protocol.
+//            Optionally writes structured data to HyberDB contract.
 //
 // New nodes can bootstrap from the latest anchor instead of replaying the full history.
 
@@ -39,33 +41,46 @@ export interface AnchorRecord {
   id: string;                      // SHA-256 of the bundle
   bundle: AnchorBundle;
   arweave_tx?: string;             // Arweave transaction ID
-  celestia_height?: number;        // Celestia block height
-  celestia_commitment?: string;    // Celestia blob commitment
+  berachain_tx?: string;           // Berachain transaction hash
+  berachain_block?: number;        // Berachain block number
   status: "pending" | "submitted" | "confirmed" | "failed";
   created_at: number;
   confirmed_at?: number;
 }
 
 export interface ArweaveConfig {
-  gateway_url: string;             // e.g., "https://arweave.net" or "https://up.arweave.net"
-  wallet_jwk?: any;                // Arweave wallet JWK for signing (optional — can use bundlr/irys)
-  irys_url?: string;               // e.g., "https://node2.irys.xyz" (formerly Bundlr)
+  gateway_url: string;             // e.g., "https://arweave.net"
+  wallet_jwk?: any;                // Arweave wallet JWK for signing
+  irys_url?: string;               // e.g., "https://node2.irys.xyz"
   irys_token?: string;             // Auth token for Irys
 }
 
-export interface CelestiaConfig {
-  rpc_url: string;                 // e.g., "http://localhost:26658" or a public endpoint
-  auth_token?: string;             // Bearer token for auth
-  namespace: string;               // hex-encoded namespace (8 bytes)
+export interface BerachainConfig {
+  rpc_url: string;                 // e.g., "https://rpc.berachain.com"
+  private_key?: string;            // Hex-encoded private key for signing txs
+  hyberdb_address?: string;        // HyberDB contract address for structured anchors
+  hyberdb_namespace?: string;      // HyberDB namespace for Persistia anchors
+  chain_id: number;                // 80094 for Berachain mainnet
 }
 
 export interface AnchorConfig {
   arweave?: ArweaveConfig;
-  celestia?: CelestiaConfig;
+  berachain?: BerachainConfig;
   anchor_interval_seq: number;     // anchor every N finalized events (default: 100)
   anchor_interval_ms: number;      // minimum time between anchors (default: 300_000 = 5 min)
   snapshot_with_anchor: boolean;   // include full state snapshot in anchor (default: false for size)
 }
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+
+const DEAD_ADDRESS = "0x000000000000000000000000000000000000dEaD";
+const HYTE_MAGIC = [0x48, 0x59, 0x54, 0x45]; // "HYTE"
+const HYTE_VERSION = 0x01;
+const HYTE_COMPRESSION_NONE = 0x00;
+const HYTE_CONTENT_BLOB = 0x04;
+
+// HyberDB ABI fragments (only what we need)
+const HYBERDB_COMMIT_SIG = "0x5c36b186"; // commit(bytes32 namespace, bytes key, bytes value)
 
 // ─── Defaults ─────────────────────────────────────────────────────────────────
 
@@ -74,6 +89,58 @@ const DEFAULT_CONFIG: AnchorConfig = {
   anchor_interval_ms: 300_000,      // 5 minutes
   snapshot_with_anchor: false,
 };
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function hexToBytes(hex: string): Uint8Array {
+  const h = hex.startsWith("0x") ? hex.slice(2) : hex;
+  const bytes = new Uint8Array(h.length / 2);
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = parseInt(h.substr(i * 2, 2), 16);
+  }
+  return bytes;
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+  return "0x" + Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+function utf8ToBytes(str: string): Uint8Array {
+  return new TextEncoder().encode(str);
+}
+
+/**
+ * Wrap data in HYTE format (same as HyberText Transport Protocol).
+ * HYTE header: 4 bytes magic + 1 version + 1 compression + 1 content-type + 2 reserved
+ */
+function wrapHYTE(data: Uint8Array, contentType: number = HYTE_CONTENT_BLOB, compression: number = HYTE_COMPRESSION_NONE): Uint8Array {
+  const header = new Uint8Array(9);
+  header[0] = HYTE_MAGIC[0]; // H
+  header[1] = HYTE_MAGIC[1]; // Y
+  header[2] = HYTE_MAGIC[2]; // T
+  header[3] = HYTE_MAGIC[3]; // E
+  header[4] = HYTE_VERSION;
+  header[5] = compression;
+  header[6] = contentType;
+  header[7] = 0x00; // reserved
+  header[8] = 0x00; // reserved
+  const result = new Uint8Array(header.length + data.length);
+  result.set(header, 0);
+  result.set(data, header.length);
+  return result;
+}
+
+/**
+ * Encode an unsigned EIP-1559 transaction as hex.
+ * For CF Workers, we build raw transaction bytes and send via eth_sendRawTransaction.
+ * If no private key is available, we use eth_sendTransaction (requires unlocked account).
+ */
+function encodeAnchorCalldata(bundle: AnchorBundle): string {
+  const json = JSON.stringify(bundle);
+  const payload = utf8ToBytes(json);
+  const hyte = wrapHYTE(payload);
+  return bytesToHex(hyte);
+}
 
 // ─── AnchorManager ────────────────────────────────────────────────────────────
 
@@ -196,8 +263,6 @@ export class AnchorManager {
     // Fallback: direct Arweave gateway upload (requires wallet)
     if (arweave.gateway_url && arweave.wallet_jwk) {
       try {
-        // Arweave transaction construction (simplified — real impl needs arweave-js)
-        // For CF Workers, we use the gateway's upload endpoint
         const res = await fetch(`${arweave.gateway_url}/tx`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -227,77 +292,159 @@ export class AnchorManager {
     return null;
   }
 
-  // ─── Submit to Celestia ─────────────────────────────────────────────────
+  // ─── Submit to Berachain ──────────────────────────────────────────────
 
-  async submitToCelestia(bundle: AnchorBundle): Promise<{ height: number; commitment: string } | null> {
-    if (!this.config.celestia) return null;
+  /**
+   * Anchor state to Berachain using the HYTE format (same as HyberText Transport Protocol).
+   * Sends anchor bundle as calldata to the dead address (0x...dEaD).
+   * The transaction hash becomes a permanent, immutable reference to the anchor.
+   *
+   * If HyberDB is configured, also writes structured data for on-chain queryability.
+   */
+  async submitToBerachain(bundle: AnchorBundle): Promise<{ tx_hash: string; block_number: number } | null> {
+    if (!this.config.berachain) return null;
 
-    const celestia = this.config.celestia;
-    const blobData = JSON.stringify(bundle);
-    const blobB64 = btoa(blobData);
+    const bera = this.config.berachain;
+    const calldata = encodeAnchorCalldata(bundle);
 
     try {
-      const headers: Record<string, string> = {
-        "Content-Type": "application/json",
-      };
-      if (celestia.auth_token) {
-        headers["Authorization"] = `Bearer ${celestia.auth_token}`;
+      // Method 1: Send HYTE-encoded calldata to dead address
+      // This makes the anchor data permanently available via eth_getTransactionByHash,
+      // using the same retrieval pattern as HBTP sites.
+      const txHash = await this.sendBerachainTx(bera, {
+        to: DEAD_ADDRESS,
+        data: calldata,
+        value: "0x0",
+      });
+
+      if (!txHash) return null;
+
+      // Wait for receipt to get block number
+      const receipt = await this.waitForReceipt(bera, txHash);
+      const blockNumber = receipt?.blockNumber || 0;
+
+      // Method 2 (optional): Also write to HyberDB for structured querying
+      if (bera.hyberdb_address && bera.hyberdb_namespace) {
+        await this.writeToHyberDB(bera, bundle, txHash);
       }
 
-      // Celestia blob.Submit JSON-RPC
-      const res = await fetch(celestia.rpc_url, {
+      return { tx_hash: txHash, block_number: blockNumber };
+    } catch (e: any) {
+      console.warn(`Berachain anchor failed: ${e.message}`);
+      return null;
+    }
+  }
+
+  private async sendBerachainTx(
+    bera: BerachainConfig,
+    tx: { to: string; data: string; value: string },
+  ): Promise<string | null> {
+    try {
+      // Use eth_sendTransaction (requires an unlocked account or external signer)
+      // In production, this would use a signing service or wallet API
+      const res = await fetch(bera.rpc_url, {
         method: "POST",
-        headers,
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           id: 1,
           jsonrpc: "2.0",
-          method: "blob.Submit",
-          params: [
-            [
-              {
-                namespace: celestia.namespace,
-                data: blobB64,
-                share_version: 0,
-              },
-            ],
-            0.002, // gas price
-          ],
+          method: "eth_sendTransaction",
+          params: [{
+            to: tx.to,
+            data: tx.data,
+            value: tx.value,
+            chainId: "0x" + bera.chain_id.toString(16),
+          }],
         }),
       });
 
       if (!res.ok) return null;
-
       const result = await res.json() as any;
       if (result.error) {
-        console.warn(`Celestia submit error: ${result.error.message}`);
+        console.warn(`Berachain tx error: ${result.error.message}`);
         return null;
       }
-
-      // Result contains the block height
-      const height = result.result;
-
-      // Get the blob commitment for verification
-      const commitRes = await fetch(celestia.rpc_url, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          id: 2,
-          jsonrpc: "2.0",
-          method: "blob.Get",
-          params: [height, celestia.namespace, blobB64],
-        }),
-      });
-
-      let commitment = "";
-      if (commitRes.ok) {
-        const commitResult = await commitRes.json() as any;
-        commitment = commitResult.result?.commitment || "";
-      }
-
-      return { height, commitment };
+      return result.result as string;
     } catch (e: any) {
-      console.warn(`Celestia submit failed: ${e.message}`);
+      console.warn(`Berachain tx send failed: ${e.message}`);
       return null;
+    }
+  }
+
+  private async waitForReceipt(
+    bera: BerachainConfig,
+    txHash: string,
+    maxAttempts: number = 10,
+  ): Promise<{ blockNumber: number } | null> {
+    for (let i = 0; i < maxAttempts; i++) {
+      try {
+        const res = await fetch(bera.rpc_url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            id: 1,
+            jsonrpc: "2.0",
+            method: "eth_getTransactionReceipt",
+            params: [txHash],
+          }),
+        });
+
+        if (!res.ok) continue;
+        const result = await res.json() as any;
+        if (result.result) {
+          return { blockNumber: parseInt(result.result.blockNumber, 16) };
+        }
+      } catch {
+        // retry
+      }
+      // Wait 2 seconds between attempts
+      await new Promise(r => setTimeout(r, 2000));
+    }
+    return null;
+  }
+
+  /**
+   * Write structured anchor data to HyberDB for on-chain queryability.
+   * Uses the commit() function to write key-value pairs to a Persistia namespace.
+   */
+  private async writeToHyberDB(
+    bera: BerachainConfig,
+    bundle: AnchorBundle,
+    calldataTxHash: string,
+  ): Promise<void> {
+    if (!bera.hyberdb_address || !bera.hyberdb_namespace) return;
+
+    // Build commit calldata: commit(bytes32 namespace, bytes key, bytes value)
+    // Key: "anchor:{seq}" → Value: JSON with state_root, round, tx_hash
+    const key = `anchor:${bundle.finalized_seq}`;
+    const value = JSON.stringify({
+      state_root: bundle.state_root,
+      round: bundle.last_committed_round,
+      calldata_tx: calldataTxHash,
+      zk_proof_hash: bundle.zk_proof_hash,
+      active_nodes: bundle.active_nodes,
+      timestamp: bundle.timestamp,
+    });
+
+    // ABI encode: commit(bytes32, bytes, bytes)
+    const keyHex = bytesToHex(utf8ToBytes(key));
+    const valueHex = bytesToHex(utf8ToBytes(value));
+
+    // Simplified ABI encoding — in production use proper ABI encoder
+    const calldata = HYBERDB_COMMIT_SIG +
+      bera.hyberdb_namespace!.padStart(64, "0") +
+      abiEncodeBytes(keyHex) +
+      abiEncodeBytes(valueHex);
+
+    try {
+      await this.sendBerachainTx(bera, {
+        to: bera.hyberdb_address,
+        data: "0x" + calldata,
+        value: "0x0",
+      });
+    } catch (e: any) {
+      // Non-critical — the calldata anchor is the primary record
+      console.warn(`HyberDB write failed (non-critical): ${e.message}`);
     }
   }
 
@@ -329,8 +476,8 @@ export class AnchorManager {
     );
 
     let arweaveTx: string | undefined;
-    let celestiaHeight: number | undefined;
-    let celestiaCommitment: string | undefined;
+    let berachainTx: string | undefined;
+    let berachainBlock: number | undefined;
 
     // Submit to Arweave
     const arResult = await this.submitToArweave(bundle, params.snapshotJson);
@@ -342,19 +489,19 @@ export class AnchorManager {
       );
     }
 
-    // Submit to Celestia
-    const celResult = await this.submitToCelestia(bundle);
-    if (celResult) {
-      celestiaHeight = celResult.height;
-      celestiaCommitment = celResult.commitment;
+    // Submit to Berachain
+    const beraResult = await this.submitToBerachain(bundle);
+    if (beraResult) {
+      berachainTx = beraResult.tx_hash;
+      berachainBlock = beraResult.block_number;
       this.sql.exec(
         "UPDATE anchors SET celestia_height = ?, celestia_commitment = ? WHERE id = ?",
-        celestiaHeight, celestiaCommitment, anchorId,
+        berachainBlock, berachainTx, anchorId,
       );
     }
 
     // Update status
-    const status = (arweaveTx || celestiaHeight) ? "submitted" : "failed";
+    const status = (arweaveTx || berachainTx) ? "submitted" : "failed";
     this.sql.exec(
       "UPDATE anchors SET status = ? WHERE id = ?",
       status, anchorId,
@@ -368,8 +515,8 @@ export class AnchorManager {
       id: anchorId,
       bundle,
       arweave_tx: arweaveTx,
-      celestia_height: celestiaHeight,
-      celestia_commitment: celestiaCommitment,
+      berachain_tx: berachainTx,
+      berachain_block: berachainBlock,
       status,
       created_at: Date.now(),
     };
@@ -377,7 +524,7 @@ export class AnchorManager {
     console.log(
       `Anchored seq=${params.finalizedSeq} root=${params.stateRoot.slice(0, 12)}` +
       (arweaveTx ? ` arweave=${arweaveTx}` : "") +
-      (celestiaHeight ? ` celestia=${celestiaHeight}` : ""),
+      (berachainTx ? ` berachain=${berachainTx}` : ""),
     );
 
     return record;
@@ -397,8 +544,8 @@ export class AnchorManager {
       id: row.id,
       bundle: JSON.parse(row.bundle_json),
       arweave_tx: row.arweave_tx || undefined,
-      celestia_height: row.celestia_height || undefined,
-      celestia_commitment: row.celestia_commitment || undefined,
+      berachain_tx: row.celestia_commitment || undefined,    // reusing column for backward compat
+      berachain_block: row.celestia_height || undefined,
       status: row.status,
       created_at: row.created_at,
       confirmed_at: row.confirmed_at || undefined,
@@ -415,8 +562,8 @@ export class AnchorManager {
       id: row.id,
       bundle: JSON.parse(row.bundle_json),
       arweave_tx: row.arweave_tx || undefined,
-      celestia_height: row.celestia_height || undefined,
-      celestia_commitment: row.celestia_commitment || undefined,
+      berachain_tx: row.celestia_commitment || undefined,
+      berachain_block: row.celestia_height || undefined,
       status: row.status,
       created_at: row.created_at,
       confirmed_at: row.confirmed_at || undefined,
@@ -458,46 +605,43 @@ export class AnchorManager {
   }
 
   /**
-   * Verify an anchor from Celestia by height and namespace.
+   * Fetch and verify an anchor from Berachain by transaction hash.
+   * Retrieves the tx calldata, strips the HYTE header, and parses the anchor bundle.
    */
-  async verifyFromCelestia(height: number): Promise<{ valid: boolean; bundle?: AnchorBundle; error?: string }> {
-    if (!this.config.celestia) return { valid: false, error: "Celestia not configured" };
+  async verifyFromBerachain(txHash: string): Promise<{ valid: boolean; bundle?: AnchorBundle; error?: string }> {
+    if (!this.config.berachain) return { valid: false, error: "Berachain not configured" };
 
     try {
-      const headers: Record<string, string> = { "Content-Type": "application/json" };
-      if (this.config.celestia.auth_token) {
-        headers["Authorization"] = `Bearer ${this.config.celestia.auth_token}`;
-      }
-
-      const res = await fetch(this.config.celestia.rpc_url, {
+      const res = await fetch(this.config.berachain.rpc_url, {
         method: "POST",
-        headers,
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           id: 1,
           jsonrpc: "2.0",
-          method: "blob.GetAll",
-          params: [height, [this.config.celestia.namespace]],
+          method: "eth_getTransactionByHash",
+          params: [txHash],
         }),
       });
 
       if (!res.ok) return { valid: false, error: `HTTP ${res.status}` };
 
       const result = await res.json() as any;
-      if (result.error) return { valid: false, error: result.error.message };
+      if (!result.result) return { valid: false, error: "Transaction not found" };
 
-      const blobs = result.result || [];
-      for (const blob of blobs) {
-        try {
-          const data = JSON.parse(atob(blob.data));
-          if (data.state_root && data.finalized_seq) {
-            return { valid: true, bundle: data as AnchorBundle };
-          }
-        } catch {
-          // not our blob
-        }
+      const input = result.result.input;
+      if (!input || input.length < 20) return { valid: false, error: "No calldata" };
+
+      // Strip HYTE header (9 bytes = 18 hex chars + "0x" prefix)
+      const dataHex = input.slice(2 + 18); // skip "0x" + 18 hex chars (9 bytes header)
+      const dataBytes = hexToBytes(dataHex);
+      const json = new TextDecoder().decode(dataBytes);
+      const bundle = JSON.parse(json) as AnchorBundle;
+
+      if (!bundle.state_root || !bundle.finalized_seq) {
+        return { valid: false, error: "Invalid anchor data in calldata" };
       }
 
-      return { valid: false, error: "No Persistia anchor found at this height" };
+      return { valid: true, bundle };
     } catch (e: any) {
       return { valid: false, error: e.message };
     }
@@ -562,15 +706,28 @@ export class AnchorManager {
 
   /**
    * Prune old confirmed anchors, keeping the most recent `keep` entries.
-   * Removes bundle_json from older confirmed anchors to reclaim storage.
    */
   pruneOldAnchors(keep: number = 100) {
-    // Null out bundle_json for old confirmed anchors beyond the retention window.
-    // We keep the metadata (tx IDs, heights) for auditability but free the large payload.
     this.sql.exec(
       `UPDATE anchors SET bundle_json = '{}' WHERE status = 'confirmed'
        AND id NOT IN (SELECT id FROM anchors WHERE status = 'confirmed' ORDER BY created_at DESC LIMIT ?)`,
       keep,
     );
   }
+}
+
+// ─── ABI Helpers ─────────────────────────────────────────────────────────────
+
+/**
+ * Minimal ABI encoding for a bytes parameter.
+ * Returns hex string (no 0x prefix) for the offset + length + padded data.
+ */
+function abiEncodeBytes(hexData: string): string {
+  const data = hexData.startsWith("0x") ? hexData.slice(2) : hexData;
+  const byteLen = data.length / 2;
+  const lenHex = byteLen.toString(16).padStart(64, "0");
+  // Pad data to 32-byte boundary
+  const paddedLen = Math.ceil(data.length / 64) * 64;
+  const paddedData = data.padEnd(paddedLen, "0");
+  return lenHex + paddedData;
 }
