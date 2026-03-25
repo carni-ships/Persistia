@@ -229,6 +229,102 @@ This is possible because Persistia chose SQLite over a Merkle trie as the primar
 
 For cross-shard aggregation — querying state across multiple independent consensus domains — you'd query each shard's `/query` endpoint and merge results client-side. Within a single shard, the node *is* the indexer.
 
+## HTTP-Native Light Clients
+
+Most blockchains require specialized libraries to verify state — ethers.js for Ethereum, cosmjs for Cosmos, custom RPC clients for Solana. Light clients are separate binaries that must implement the chain's wire protocol, handle peer discovery, and maintain header sync. Building one is a multi-month engineering effort.
+
+Persistia doesn't need a separate light client implementation. The HTTP API *is* the light client protocol.
+
+### Verifying State in Three Requests
+
+Any environment with `fetch()` and an Ed25519 library can trustlessly verify Persistia state:
+
+**1. Get the latest header with its BFT certificate**
+
+```
+GET /headers/latest?shard=node-1
+```
+
+Returns the block header (state root, previous header hash, validator set hash, timestamp) plus a `bft_certificate` — an array of Ed25519 signatures from the validators who committed this round:
+
+```json
+{
+  "block_number": 5180,
+  "state_root": "e3b0c44298fc1c...",
+  "prev_header_hash": "a7ffb7eb4a743c...",
+  "validator_set_hash": "3c06073acb525c...",
+  "bft_certificate": [
+    { "pubkey": "J90nWC...", "signature": "Om7yr+...", "round": 5180 },
+    { "pubkey": "ME5YS9...", "signature": "Iuoh3Y...", "round": 5180 },
+    { "pubkey": "GhZuLr...", "signature": "My6eIx...", "round": 5180 }
+  ]
+}
+```
+
+Verify: check that the Ed25519 signatures are valid, the signers are in the known validator set, and the count meets quorum (2f+1). If all three checks pass, the state root is consensus-approved.
+
+**2. Request a Merkle proof for any state key**
+
+```
+GET /proof/generate?key=contract:abc123:count
+```
+
+Returns a sparse Merkle tree proof — the sibling hashes along the path from the leaf to the root, plus a direction array indicating left/right at each level:
+
+```json
+{
+  "key": "contract:abc123:count",
+  "value": "0x0500000000000000",
+  "siblings": ["a1b2c3...", "d4e5f6...", ...],
+  "directions": [0, 1, 1, 0, ...],
+  "root": "e3b0c44298fc1c...",
+  "inclusion": true
+}
+```
+
+**3. Verify locally**
+
+Recompute the Merkle root from the leaf hash and sibling path. If it matches the state root from the BFT-certified header, the value is proven — no trust in any individual node required.
+
+```javascript
+// ~30 lines of verification logic
+let hash = sha256("leaf:" + sha256(key) + ":" + value);
+for (let i = 0; i < siblings.length; i++) {
+  hash = directions[i] === 0
+    ? sha256(hash + siblings[i])
+    : sha256(siblings[i] + hash);
+}
+assert(hash === header.state_root); // proven
+```
+
+The entire verification runs client-side. The node could be malicious — it can't forge a proof that passes verification against a BFT-certified root.
+
+### Non-Inclusion Proofs
+
+The sparse Merkle tree also supports **non-inclusion proofs**: cryptographic proof that a key does *not* exist in the state. The proof shows where the path diverges from any existing leaf, with a `closest_key` and `diverge_depth`. This lets a light client prove negative facts — "this contract has no key called X" — which is impossible with most Merkle Patricia tries without scanning the entire trie.
+
+### Cross-Checking Against External Anchors
+
+For the highest assurance, light clients can verify the state root against Persistia's dual anchoring layer:
+
+- **Arweave**: Query the Arweave GraphQL gateway for transactions tagged with `App-Name: Persistia` and the target state root. The anchor is permanent and immutable — it exists independently of Persistia's validators.
+- **Berachain**: Fetch the anchor transaction via `eth_getTransactionByHash` and decode the HYTE-formatted calldata. The state root is embedded in an EVM L1 transaction, verifiable by any Ethereum-compatible client.
+
+If the state root in the BFT-certified header matches the root anchored to Arweave and Berachain, the client has three independent confirmations: validator consensus, permanent archival storage, and an EVM L1 chain.
+
+### Why This Matters
+
+Traditional light clients exist to avoid downloading the full chain. But they still require: a specialized binary, a peer discovery mechanism, a header sync protocol, and often a trusted checkpoint. Persistia collapses all of this into standard HTTP endpoints.
+
+This means:
+- **Mobile apps** can verify state with a single network request + local hash computation
+- **Browser extensions** can prove token balances without running a node
+- **IoT devices** can verify contract state with minimal compute
+- **Cross-chain bridges** can verify Persistia state from any environment that supports HTTP and SHA-256
+- **CI/CD pipelines** can assert on-chain state as part of deployment verification
+
+No library to install. No protocol to implement. No peers to discover. Just `fetch()`, `sha256()`, and `ed25519.verify()`.
+
 ## What's Novel
 
 To summarize what makes Persistia different from existing approaches:
@@ -245,6 +341,7 @@ To summarize what makes Persistia different from existing approaches:
 | **State anchoring** | Arweave + Berachain | Self-hosted or single DA layer |
 | **State queries** | SQL over HTTP (`/query`) | Requires external indexer |
 | **Token** | None (reputation-based) | Required for staking/gas |
+| **Light client** | 3 HTTP requests + local hash verification | Dedicated binary or trusted RPC |
 | **Operational cost** | Cloudflare free tier ($0) | $500–$5000+/month per validator |
 
 ## Try It
