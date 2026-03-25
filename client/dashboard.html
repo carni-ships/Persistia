@@ -588,8 +588,8 @@ async function poll() {
 }
 
 // ─── Event Log ───────────────────────────────────────────────────────────────
-function addEvent(type, detail, extra, color) {
-  events.unshift({ type, detail, extra, color, time: Date.now() });
+function addEvent(type, detail, extra, color, serverTime) {
+  events.unshift({ type, detail, extra, color, time: serverTime || Date.now() });
   if (events.length > 200) events.length = 200;
   renderEvents();
 }
@@ -1132,7 +1132,7 @@ function connectWS() {
               signature: v.signature,
             });
             if (dagAnim.initialSyncDone) {
-              addEvent('vertex', `Round ${v.round}`, shortKey(v.author), nodeColor(v.author));
+              addEvent('vertex', `Round ${v.round}`, shortKey(v.author), nodeColor(v.author), v.received_at || v.timestamp);
             }
           }
           lastSyncRound = Math.max(lastSyncRound, ...msg.vertices.map(v => v.round));
@@ -1141,7 +1141,7 @@ function connectWS() {
           for (const c of msg.commits) {
             dagData.commits.add(c.anchor_hash);
             if (dagAnim.initialSyncDone) {
-              addEvent('commit', `Round ${c.round} finalized`, shortKey(c.anchor_hash), null);
+              addEvent('commit', `Round ${c.round} finalized`, shortKey(c.anchor_hash), null, c.committed_at);
             }
           }
         }
@@ -1153,17 +1153,17 @@ function connectWS() {
         return;
       }
 
-      // Live push events
+      // Live push events — use server timestamps so "time ago" reflects when events happened on-chain
       if (msg.type === 'vertex.new') {
-        addEvent('vertex', `Round ${msg.round}`, shortKey(msg.author), nodeColor(msg.author));
+        addEvent('vertex', `Round ${msg.round}`, shortKey(msg.author), nodeColor(msg.author), msg.timestamp);
       } else if (msg.type === 'commit') {
-        addEvent('commit', `Round ${msg.round} finalized`, '', null);
+        addEvent('commit', `Round ${msg.round} finalized`, '', null, msg.timestamp);
       } else if (msg.type === 'event.finalized' || msg.type === 'event.pending') {
         const et = msg.event?.type || 'unknown';
         const badge = et.startsWith('contract.') ? 'contract' : 'event';
-        addEvent(badge, et, shortKey(msg.event?.pubkey), null);
+        addEvent(badge, et, shortKey(msg.event?.pubkey), null, msg.event?.timestamp);
       } else if (msg.type === 'zk.proof_submitted') {
-        addEvent('zk', `Block ${msg.block_number} proved`, '', null);
+        addEvent('zk', `Block ${msg.block_number} proved`, '', null, msg.timestamp);
         // Auto-refresh verifier if tab is active
         if (verifierAutoRan && document.getElementById('tab-verifier').classList.contains('active')) {
           setTimeout(runVerification, 1000);
