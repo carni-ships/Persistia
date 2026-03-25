@@ -149,8 +149,8 @@ export function checkCommit(
   }
 
   const quorum = getQuorumSize(activeCount);
-  if (activeCount < 4) {
-    return { committed: false, anchorHash: null, reason: `Need >= 4 active nodes, have ${activeCount}` };
+  if (activeCount < 3) {
+    return { committed: false, anchorHash: null, reason: `Need >= 3 active nodes, have ${activeCount}` };
   }
 
   // Find leader's vertex at this round

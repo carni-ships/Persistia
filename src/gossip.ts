@@ -57,6 +57,29 @@ const DEDUP_WINDOW = 1000;       // keep last N nonces for dedup
 const PEER_EXCHANGE_INTERVAL = 3; // exchange peers every N sync cycles
 const FLOOD_CONCURRENCY = 6;     // max parallel outbound connections per flood
 
+/**
+ * Build a URL by appending a path to a peer base URL.
+ * Handles peer URLs that contain query parameters (e.g. ?shard=node-1)
+ * by inserting the path before the query string.
+ */
+function buildPeerUrl(baseUrl: string, path: string, extraParams?: Record<string, string>): string {
+  try {
+    const u = new URL(baseUrl);
+    // Append path, merging with any existing path
+    const existingPath = u.pathname.replace(/\/$/, ""); // strip trailing slash
+    u.pathname = existingPath + path;
+    if (extraParams) {
+      for (const [k, v] of Object.entries(extraParams)) {
+        u.searchParams.set(k, v);
+      }
+    }
+    return u.toString();
+  } catch {
+    // Fallback for malformed URLs
+    return `${baseUrl}${path}`;
+  }
+}
+
 // ─── GossipManager ───────────────────────────────────────────────────────────
 
 export class GossipManager {
@@ -206,7 +229,7 @@ export class GossipManager {
       const batch = peers.slice(i, i + FLOOD_CONCURRENCY);
       const results = await Promise.allSettled(batch.map(async (peer) => {
         try {
-          const res = await fetchWithTimeout(`${peer.url}/gossip/push`, {
+          const res = await fetchWithTimeout(buildPeerUrl(peer.url, "/gossip/push"), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body,
@@ -263,7 +286,7 @@ export class GossipManager {
       try {
         const afterRound = Math.max(0, peer.last_sync_round || (currentRound - activeWindow));
         const res = await fetchWithTimeout(
-          `${peer.url}/gossip/sync?after_round=${afterRound}&limit=500`,
+          buildPeerUrl(peer.url, "/gossip/sync", { after_round: String(afterRound), limit: "500" }),
           { method: "GET" },
           GOSSIP_TIMEOUT_MS,
         );
@@ -317,7 +340,7 @@ export class GossipManager {
 
     for (const peer of peers.slice(0, 5)) { // limit to 5 peers per exchange
       try {
-        const res = await fetchWithTimeout(`${peer.url}/gossip/peers`, {
+        const res = await fetchWithTimeout(buildPeerUrl(peer.url, "/gossip/peers"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(envelope),

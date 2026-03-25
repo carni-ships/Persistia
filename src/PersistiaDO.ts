@@ -28,7 +28,7 @@ import { ValidatorRegistry, verifyPoW } from "./validator-registry";
 
 const CONSENSUS_ENABLED = true;
 const ROUND_INTERVAL_MS = 30_000;  // 30s fallback alarm for free tier
-const MIN_NODES_FOR_CONSENSUS = 4;
+const MIN_NODES_FOR_CONSENSUS = 3;
 
 // ─── Durable Object ──────────────────────────────────────────────────────────
 
@@ -563,6 +563,9 @@ export class PersistiaWorld implements DurableObject {
             } catch {}
           }
 
+          // Ensure alarm is running now that we have peers
+          if (CONSENSUS_ENABLED) this.scheduleAlarm();
+
           return this.json({ ok: true, peers: this.gossipManager.getPeers() });
         }
 
@@ -677,7 +680,7 @@ export class PersistiaWorld implements DurableObject {
         }));
 
         const commits = [...this.state.storage.sql.exec(
-          "SELECT round, anchor_hash, committed_at FROM dag_commits WHERE round > ? ORDER BY round ASC",
+          "SELECT round, anchor_hash, committed_at FROM dag_commits WHERE round >= ? ORDER BY round ASC",
           afterRound,
         )];
 
@@ -1292,7 +1295,7 @@ export class PersistiaWorld implements DurableObject {
         const limit = Math.min(parseInt(url.searchParams.get("limit") || "500"), 500);
 
         const vertices = [...this.state.storage.sql.exec(
-          "SELECT hash, author, round, events_json, refs_json, signature, timestamp FROM dag_vertices WHERE round > ? ORDER BY round ASC, hash ASC LIMIT ?",
+          "SELECT hash, author, round, events_json, refs_json, signature, timestamp FROM dag_vertices WHERE round >= ? ORDER BY round ASC, hash ASC LIMIT ?",
           afterRound, limit,
         )].map((r: any) => ({
           hash: r.hash, author: r.author, round: r.round,
@@ -1304,7 +1307,7 @@ export class PersistiaWorld implements DurableObject {
         }));
 
         const commits = [...this.state.storage.sql.exec(
-          "SELECT round, anchor_hash, committed_at FROM dag_commits WHERE round > ? ORDER BY round ASC",
+          "SELECT round, anchor_hash, committed_at FROM dag_commits WHERE round >= ? ORDER BY round ASC",
           afterRound,
         )];
 
@@ -1628,7 +1631,7 @@ export class PersistiaWorld implements DurableObject {
         events_json: r.events_json, refs_json: r.refs_json, signature: r.signature,
       }));
       const commits = [...sql.exec(
-        "SELECT round, anchor_hash, committed_at FROM dag_commits WHERE round > ? ORDER BY round ASC",
+        "SELECT round, anchor_hash, committed_at FROM dag_commits WHERE round >= ? ORDER BY round ASC",
         afterRound,
       )];
       ws.send(JSON.stringify({
@@ -1940,15 +1943,23 @@ export class PersistiaWorld implements DurableObject {
 
     const quorum = getQuorumSize(activeCount);
 
-    // Count distinct authors with vertices at current round
-    const countRows = [...this.state.storage.sql.exec(
-      "SELECT COUNT(DISTINCT author) as cnt FROM dag_vertices WHERE round = ?",
-      this.currentRound,
-    )];
-    const count = (countRows[0]?.cnt ?? 0) as number;
+    // Advance through all rounds that have quorum (not just one)
+    let advanced = false;
+    for (let i = 0; i < 50; i++) { // cap to avoid infinite loop
+      const countRows = [...this.state.storage.sql.exec(
+        "SELECT COUNT(DISTINCT author) as cnt FROM dag_vertices WHERE round = ?",
+        this.currentRound,
+      )];
+      const count = (countRows[0]?.cnt ?? 0) as number;
 
-    if (count >= quorum) {
-      this.currentRound++;
+      if (count >= quorum) {
+        this.currentRound++;
+        advanced = true;
+      } else {
+        break;
+      }
+    }
+    if (advanced) {
       this.setKV("current_round", this.currentRound.toString());
       this.invalidateActiveCache();
     }
@@ -2135,7 +2146,9 @@ export class PersistiaWorld implements DurableObject {
     const peers = this.getActiveNodes().filter(n => !n.is_self && n.url && !wsPeers.has(n.pubkey));
     for (const peer of peers) {
       try {
-        await fetch(`${peer.url}/dag/vertex`, {
+        const vertexUrl = new URL(peer.url || this.nodeUrl);
+        vertexUrl.pathname = vertexUrl.pathname.replace(/\/$/, "") + "/dag/vertex";
+        await fetch(vertexUrl.toString(), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(vertex),
@@ -2150,9 +2163,10 @@ export class PersistiaWorld implements DurableObject {
     const peers = this.getActiveNodes().filter(n => !n.is_self && n.url);
     for (const peer of peers) {
       try {
-        const res = await fetch(
-          `${peer.url}/dag/sync?after_round=${Math.max(0, this.currentRound - ACTIVE_WINDOW)}`,
-        );
+        const syncUrl = new URL(peer.url || this.nodeUrl);
+        syncUrl.pathname = syncUrl.pathname.replace(/\/$/, "") + "/dag/sync";
+        syncUrl.searchParams.set("after_round", String(Math.max(0, this.currentRound - ACTIVE_WINDOW)));
+        const res = await fetch(syncUrl.toString());
         if (!res.ok) continue;
         const data = await res.json() as any;
 
@@ -2186,12 +2200,13 @@ export class PersistiaWorld implements DurableObject {
     if (this._activeCache && this._activeCache.round === this.currentRound) return;
     const minRound = Math.max(0, this.currentRound - ACTIVE_WINDOW);
     const rows = [...this.state.storage.sql.exec(
-      "SELECT pubkey, url, last_vertex_round, is_self FROM active_nodes WHERE last_vertex_round >= ? OR is_self = 1 ORDER BY pubkey",
+      "SELECT pubkey, url, last_vertex_round, last_seen, is_self FROM active_nodes WHERE last_vertex_round >= ? OR is_self = 1 ORDER BY pubkey",
       minRound,
     )].map((r: any) => ({
       pubkey: r.pubkey as string,
       url: r.url as string,
       last_vertex_round: r.last_vertex_round as number,
+      last_seen: r.last_seen as number,
       is_self: !!r.is_self,
     }));
     this._activeCache = {
