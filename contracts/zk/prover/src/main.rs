@@ -21,6 +21,34 @@ use std::path::PathBuf;
 /// The ELF binary of the SP1 guest program (built by build.rs via sp1-build).
 const ELF: &[u8] = sp1_sdk::include_elf!("persistia-zk-program");
 
+/// Build a URL by appending a path to a base node URL.
+/// Handles base URLs with query parameters (e.g. "https://host/?shard=node-1")
+/// by inserting the path before the query string.
+fn node_url(base: &str, path: &str) -> String {
+    if let Ok(mut u) = url::Url::parse(base) {
+        let existing = u.path().trim_end_matches('/').to_string();
+        u.set_path(&format!("{}{}", existing, path));
+        u.to_string()
+    } else {
+        format!("{}{}", base, path)
+    }
+}
+
+/// Build a URL with additional query parameters.
+fn node_url_with_params(base: &str, path: &str, params: &[(&str, &str)]) -> String {
+    if let Ok(mut u) = url::Url::parse(base) {
+        let existing = u.path().trim_end_matches('/').to_string();
+        u.set_path(&format!("{}{}", existing, path));
+        for (k, v) in params {
+            u.query_pairs_mut().append_pair(k, v);
+        }
+        u.to_string()
+    } else {
+        let query = params.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("&");
+        format!("{}{}?{}", base, path, query)
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "persistia-prover")]
 #[command(about = "Generate and verify ZK proofs for Persistia state transitions")]
@@ -147,10 +175,10 @@ async fn fetch_block_input(
     prev_proof: Option<&SP1ProofWithPublicValues>,
 ) -> anyhow::Result<StateTransitionInput> {
     // Fetch consensus status + block data + vertices in parallel
-    let status_fut = client.get(format!("{}/dag/status", node)).send();
-    let block_fut = client.get(format!("{}/dag/block?round={}", node, block_number)).send();
-    let vertices_fut = client.get(format!("{}/dag/vertices?round={}", node, block_number)).send();
-    let commitment_fut = client.get(format!("{}/proof/commitment", node)).send();
+    let status_fut = client.get(node_url(node, "/dag/status")).send();
+    let block_fut = client.get(node_url_with_params(node, "/dag/block", &[("round", &block_number.to_string())])).send();
+    let vertices_fut = client.get(node_url_with_params(node, "/dag/vertices", &[("round", &block_number.to_string())])).send();
+    let commitment_fut = client.get(node_url(node, "/proof/commitment")).send();
 
     let (status_resp, block_resp, vertices_resp, commitment_resp) =
         tokio::try_join!(status_fut, block_fut, vertices_fut, commitment_fut)?;
@@ -269,10 +297,10 @@ async fn fetch_block_evidence(
     node: &str,
     block_number: u64,
 ) -> anyhow::Result<BlockEvidence> {
-    let block_fut = client.get(format!("{}/dag/block?round={}", node, block_number)).send();
-    let vertices_fut = client.get(format!("{}/dag/vertices?round={}", node, block_number)).send();
-    let status_fut = client.get(format!("{}/dag/status", node)).send();
-    let commitment_fut = client.get(format!("{}/proof/commitment", node)).send();
+    let block_fut = client.get(node_url_with_params(node, "/dag/block", &[("round", &block_number.to_string())])).send();
+    let vertices_fut = client.get(node_url_with_params(node, "/dag/vertices", &[("round", &block_number.to_string())])).send();
+    let status_fut = client.get(node_url(node, "/dag/status")).send();
+    let commitment_fut = client.get(node_url(node, "/proof/commitment")).send();
 
     let (block_resp, vertices_resp, status_resp, commitment_resp) =
         tokio::try_join!(block_fut, vertices_fut, status_fut, commitment_fut)?;
@@ -378,7 +406,7 @@ async fn submit_proof_to_node(
     proof_type: &str,
 ) {
     match http
-        .post(format!("{}/proof/zk/submit", node))
+        .post(node_url(node, "/proof/zk/submit"))
         .json(&serde_json::json!({
             "block_number": block,
             "proof": proof_hash,
@@ -530,7 +558,7 @@ async fn main() -> anyhow::Result<()> {
 
             loop {
                 // Check latest committed round
-                let status = match http.get(format!("{}/dag/status", node)).send().await {
+                let status = match http.get(node_url(&node, "/dag/status")).send().await {
                     Ok(resp) => match resp.json::<serde_json::Value>().await {
                         Ok(s) => s,
                         Err(e) => {
@@ -557,7 +585,7 @@ async fn main() -> anyhow::Result<()> {
                         for _ in 0..batch {
                             let target = if last_proof.is_none() && cursor == 0 {
                                 // First block ever
-                                match http.get(format!("{}/dag/next_committed?after=0", node)).send().await {
+                                match http.get(node_url_with_params(&node, "/dag/next_committed", &[("after", "0")])).send().await {
                                     Ok(resp) => match resp.json::<serde_json::Value>().await {
                                         Ok(r) => r["round"].as_u64().unwrap_or(latest),
                                         Err(_) => break,
@@ -566,7 +594,7 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             } else {
                                 match http.get(
-                                    format!("{}/dag/next_committed?after={}", node, cursor)
+                                    node_url_with_params(&node, "/dag/next_committed", &[("after", &cursor.to_string())])
                                 ).send().await {
                                     Ok(resp) => match resp.json::<serde_json::Value>().await {
                                         Ok(r) => match r["round"].as_u64() {
@@ -683,7 +711,7 @@ async fn main() -> anyhow::Result<()> {
                             latest
                         } else {
                             match http.get(
-                                format!("{}/dag/next_committed?after={}", node, last_proven_block)
+                                node_url_with_params(&node, "/dag/next_committed", &[("after", &last_proven_block.to_string())])
                             ).send().await {
                                 Ok(resp) => match resp.json::<serde_json::Value>().await {
                                     Ok(r) => r["round"].as_u64().unwrap_or(latest),

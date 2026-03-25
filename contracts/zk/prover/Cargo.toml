@@ -20,6 +20,12 @@ hex = "0.4"
 base64 = "0.22"
 sha2 = "0.10"
 anyhow = "1"
+url = "2"
 
 [build-dependencies]
 sp1-build = "4.0.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3

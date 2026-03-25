@@ -1,0 +1,13 @@
+[package]
+name = "cosmwasm-compat"
+version = "0.1.0"
+edition = "2021"
+description = "CosmWasm compatibility shim for Persistia — re-exports CosmWasm-like types routed through the Persistia SDK"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+persistia-sdk = { path = "../persistia-sdk" }
+serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }

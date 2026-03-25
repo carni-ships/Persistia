@@ -2764,13 +2764,8 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "ed25519-consensus",
- "p3-baby-bear",
- "p3-field",
- "p3-poseidon2",
- "p3-symmetric",
  "persistia-zk-types",
  "sha2 0.10.9",
- "sp1-primitives",
  "sp1-zkvm",
 ]
 
@@ -2791,6 +2786,7 @@ dependencies = [
  "sp1-build",
  "sp1-sdk",
  "tokio",
+ "url",
 ]
 
 [[package]]
