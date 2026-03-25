@@ -563,17 +563,32 @@ export class PersistiaWorldV4 implements DurableObject {
         case "/headers": {
           const after = parseInt(url.searchParams.get("after") || "0");
           const limit = Math.min(parseInt(url.searchParams.get("limit") || "100"), 1000);
-          const headers = [...sql.exec(
+          const db = this.state.storage.sql;
+          const headers = [...db.exec(
             "SELECT * FROM block_headers WHERE block_number > ? ORDER BY block_number ASC LIMIT ?",
             after, limit,
-          )];
+          )] as any[];
+          // Attach BFT commit certificates (validator signatures) to each header
+          for (const h of headers) {
+            const commit = [...db.exec(
+              "SELECT signatures_json FROM dag_commits WHERE round = ?", h.block_number,
+            )] as any[];
+            h.bft_certificate = commit.length > 0 ? JSON.parse(commit[0].signatures_json || "[]") : [];
+          }
           return this.json({ headers, count: headers.length });
         }
 
         case "/headers/latest": {
-          const rows = [...sql.exec("SELECT * FROM block_headers ORDER BY block_number DESC LIMIT 1")] as any[];
+          const db = this.state.storage.sql;
+          const rows = [...db.exec("SELECT * FROM block_headers ORDER BY block_number DESC LIMIT 1")] as any[];
           if (rows.length === 0) return this.json({ error: "No headers yet" }, 404);
-          return this.json(rows[0]);
+          const header = rows[0];
+          // Attach BFT commit certificate: 2/3+ validator signatures over this round's state
+          const commit = [...db.exec(
+            "SELECT signatures_json FROM dag_commits WHERE round = ?", header.block_number,
+          )] as any[];
+          header.bft_certificate = commit.length > 0 ? JSON.parse(commit[0].signatures_json || "[]") : [];
+          return this.json(header);
         }
 
         // ─── Note/Nullifier Endpoints (Miden-inspired) ──────────────────
