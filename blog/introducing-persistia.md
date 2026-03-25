@@ -1,6 +1,6 @@
 # Persistia: BFT Consensus at the Edge
 
-**A decentralized ledger that runs on Cloudflare Workers, proves state with zero-knowledge proofs, and anchors to Arweave and Berachain.**
+**A decentralized ledger that runs on Cloudflare Workers, proves state with zero-knowledge proofs, and anchors to Berachain.**
 
 ---
 
@@ -77,7 +77,7 @@ With batch proving (up to 32 blocks per proof), the amortized proving cost drops
 
 ### Level 4: DA Anchored — minutes
 
-State roots and metadata are anchored to **Arweave** (permanent, immutable storage) and **Berachain** (EVM-compatible L1 with Proof of Liquidity consensus). Even if every Persistia validator disappears, the state history is recoverable. This is the strongest finality: independently verifiable and permanently stored outside Persistia's own infrastructure.
+State roots and metadata are anchored to **Berachain** (EVM-compatible L1 with Proof of Liquidity consensus). Even if every Persistia validator disappears, the state history is recoverable from the Berachain anchor transactions. This is the strongest finality: independently verifiable and permanently stored on an external EVM L1.
 
 ### Finality Comparison
 
@@ -170,14 +170,41 @@ We built a compatibility shim (`cosmwasm-compat`) that maps CosmWasm's message-p
 
 This opens the door to porting existing CosmWasm applications — DEXs, lending protocols, NFT marketplaces — onto Persistia without rewriting business logic.
 
-## State Anchoring: Arweave + Berachain
+## State Anchoring: Berachain
 
-Persistia doesn't rely on a single external chain for data availability and state verification. Finalized state is anchored to **both** Arweave and Berachain.
+Persistia anchors finalized state to **Berachain**, an EVM-compatible L1 secured by Proof of Liquidity consensus.
 
-- **Arweave**: Permanent storage. State proofs are bundled and submitted via Irys, producing an Arweave transaction ID that serves as a permanent receipt. Even if Persistia's validators all go offline, the state history is recoverable from Arweave.
-- **Berachain**: EVM-compatible L1 secured by Proof of Liquidity. State roots and ZK proof commitments are published on-chain, enabling smart contracts on Berachain to verify Persistia state transitions. This creates a trust bridge: Berachain contracts can act on Persistia-proven state, and Persistia can reference Berachain finality as an external checkpoint.
+State roots and ZK proof commitments are published on-chain as HYTE-encoded calldata sent to the dead address (`0x...dEaD`), making them permanently retrievable via `eth_getTransactionByHash`. Optionally, structured data is also written to a HyberDB contract for on-chain queryability.
 
-Running both in parallel provides redundancy (permanent archival via Arweave, active verification via Berachain) and connects Persistia to the broader EVM ecosystem.
+This creates a trust bridge: Berachain contracts can act on Persistia-proven state, and Persistia can reference Berachain finality as an external checkpoint. Even if every Persistia validator goes offline, the full state history is recoverable from Berachain anchor transactions.
+
+## Machine Payment Protocol (MPP): HTTP 402 for the Machine Economy
+
+APIs are increasingly consumed by autonomous agents — LLMs calling tools, bots executing workflows, IoT devices requesting data. These machine-to-machine interactions need a payment layer that works at HTTP speed, without human intervention, browser redirects, or API key provisioning.
+
+Persistia implements **MPP (Machine Payment Protocol)**, a native HTTP 402-based payment flow built directly into the consensus layer:
+
+1. **Client requests a protected resource** → server responds `402 Payment Required` with a `WWW-Authenticate: Payment` header containing the challenge (amount, recipient address, denomination, expiry).
+2. **Client pays on-chain** → submits a `token.transfer` event to Persistia targeting the specified recipient address with the required amount.
+3. **Client retries with credential** → includes `Authorization: Payment <base64-credential>` header containing the challenge ID, transaction hash, and payer address.
+4. **Server verifies on-chain** → checks that a matching transfer event exists in the finalized ledger, marks the challenge consumed, and serves the resource with a `Payment-Receipt` header.
+
+The entire flow is machine-readable. No OAuth, no API keys, no billing dashboards. An LLM agent that encounters a 402 can parse the challenge, execute the payment, and retry — all programmatically.
+
+### Why This Matters
+
+Most payment-for-API solutions today involve Stripe subscriptions, prepaid credits, or centralized billing APIs — all designed for humans clicking through UIs. The 402 status code has existed since HTTP/1.1 but was "reserved for future use" because there was no good way to make it work without a payment rail native to the web.
+
+Persistia provides that rail. Token transfers finalize in ~24 seconds (BFT commit), the challenge-response flow uses standard HTTP headers, and the payment verification happens against the same consensus layer that serves the data. There's no external payment processor in the loop.
+
+This enables:
+
+- **Paid API endpoints** on any Persistia-hosted service, with per-request pricing
+- **Agent-to-agent commerce** — autonomous programs buying data, compute, or services from each other
+- **Micropayments** — sub-cent payments are practical because there are no gas fees inside Persistia
+- **Metered access** — pay-per-query for oracle data, contract state reads, or premium chain analytics
+
+Routes are configured declaratively — specify a URL prefix, price, and denomination, and MPP handles challenge generation, credential verification, and receipt issuance automatically.
 
 ## The Dashboard: Real-Time DAG Visualization
 
@@ -305,12 +332,11 @@ The sparse Merkle tree also supports **non-inclusion proofs**: cryptographic pro
 
 ### Cross-Checking Against External Anchors
 
-For the highest assurance, light clients can verify the state root against Persistia's dual anchoring layer:
+For the highest assurance, light clients can verify the state root against Persistia's Berachain anchor:
 
-- **Arweave**: Query the Arweave GraphQL gateway for transactions tagged with `App-Name: Persistia` and the target state root. The anchor is permanent and immutable — it exists independently of Persistia's validators.
 - **Berachain**: Fetch the anchor transaction via `eth_getTransactionByHash` and decode the HYTE-formatted calldata. The state root is embedded in an EVM L1 transaction, verifiable by any Ethereum-compatible client.
 
-If the state root in the BFT-certified header matches the root anchored to Arweave and Berachain, the client has three independent confirmations: validator consensus, permanent archival storage, and an EVM L1 chain.
+If the state root in the BFT-certified header matches the root anchored to Berachain, the client has two independent confirmations: validator consensus and an EVM L1 chain.
 
 ### Why This Matters
 
@@ -338,7 +364,7 @@ To summarize what makes Persistia different from existing approaches:
 | **Throughput** | ~42 TPS (12s) / ~250 TPS (2s) to ~100k TPS (sharded) | 15–4000 TPS |
 | **State proofs** | SP1 STARK recursive proofs | Optional or none |
 | **Smart contracts** | WASM with fuel metering, no floats | EVM / WASM / Move |
-| **State anchoring** | Arweave + Berachain | Self-hosted or single DA layer |
+| **State anchoring** | Berachain (EVM L1) | Self-hosted or single DA layer |
 | **State queries** | SQL over HTTP (`/query`) | Requires external indexer |
 | **Token** | None (reputation-based) | Required for staking/gas |
 | **Light client** | 3 HTTP requests + local hash verification | Dedicated binary or trusted RPC |

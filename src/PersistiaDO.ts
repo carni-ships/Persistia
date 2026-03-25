@@ -278,13 +278,6 @@ export class PersistiaWorldV4 implements DurableObject {
     this.mppHandler = new MPPHandler(sql, mppConfig);
 
     const anchorConfig: Partial<AnchorConfig> = {};
-    if (this.env.ARWEAVE_GATEWAY) {
-      anchorConfig.arweave = {
-        gateway_url: this.env.ARWEAVE_GATEWAY,
-        irys_url: this.env.IRYS_URL,
-        irys_token: this.env.IRYS_TOKEN,
-      };
-    }
     if (this.env.BERACHAIN_RPC) {
       anchorConfig.berachain = {
         rpc_url: this.env.BERACHAIN_RPC || "https://rpc.berachain.com",
@@ -820,7 +813,6 @@ export class PersistiaWorldV4 implements DurableObject {
             contracts: contractCount[0]?.c || 0,
             latest_anchor: latestAnchor ? {
               id: latestAnchor.id,
-              arweave_tx: latestAnchor.arweave_tx,
               berachain_tx: latestAnchor.berachain_tx,
               berachain_block: latestAnchor.berachain_block,
               finalized_seq: latestAnchor.bundle.finalized_seq,
@@ -1986,28 +1978,23 @@ export class PersistiaWorldV4 implements DurableObject {
       }
 
       case "/anchor/verify": {
-        // Verify an anchor from Arweave or Berachain
-        const arweaveTx = url.searchParams.get("arweave_tx");
+        // Verify an anchor from Berachain
         const berachainTx = url.searchParams.get("berachain_tx");
 
-        if (arweaveTx) {
-          const result = await this.anchorManager.verifyFromArweave(arweaveTx);
-          return this.json(result);
-        }
         if (berachainTx) {
           const result = await this.anchorManager.verifyFromBerachain(berachainTx);
           return this.json(result);
         }
-        return this.json({ error: "arweave_tx or berachain_tx required" }, 400);
+        return this.json({ error: "berachain_tx required" }, 400);
       }
 
       case "/anchor/bootstrap": {
         // Bootstrap from the latest anchor (for new nodes)
-        const shardName = url.searchParams.get("shard") || this.shardName;
-        const bundle = await this.anchorManager.findLatestArweaveAnchor(shardName);
-        if (!bundle) return this.json({ error: "No anchor found" }, 404);
+        const latestForBootstrap = this.anchorManager.getLatestAnchor();
+        if (!latestForBootstrap) return this.json({ error: "No anchor found" }, 404);
         return this.json({
-          bundle,
+          bundle: latestForBootstrap.bundle,
+          berachain_tx: latestForBootstrap.berachain_tx,
           instructions: "Use /dag/snapshot to get the full state after syncing to this anchor's round",
         });
       }
@@ -2105,7 +2092,6 @@ export class PersistiaWorldV4 implements DurableObject {
     this.broadcastToChannel("status", {
       type: "anchor.submitted",
       anchor_id: record.id,
-      arweave_tx: record.arweave_tx,
       berachain_tx: record.berachain_tx,
       berachain_block: record.berachain_block,
       state_root: effectiveRoot,

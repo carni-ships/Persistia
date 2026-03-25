@@ -1,6 +1,6 @@
 # Persistia
 
-A decentralized BFT consensus ledger running on Cloudflare Workers with zero-knowledge state proofs, WASM smart contracts, and dual-layer state anchoring.
+A decentralized BFT consensus ledger running on Cloudflare Workers with zero-knowledge state proofs, WASM smart contracts, and Berachain state anchoring.
 
 ## Architecture
 
@@ -8,7 +8,7 @@ A decentralized BFT consensus ledger running on Cloudflare Workers with zero-kno
 - **Infrastructure**: Cloudflare Workers + Durable Objects — each validator is a DO shard
 - **Smart Contracts**: WASM runtime with register-based ABI, fuel metering, float ban, cross-contract calls
 - **ZK Proofs**: SP1 STARK recursive proof chain with batch proving (up to 32 blocks per proof)
-- **Anchoring**: Dual-layer to Arweave (via Irys) and Berachain (EVM L1)
+- **Anchoring**: Berachain (EVM L1) state anchoring via HYTE-encoded calldata
 - **Wallet**: Ed25519 keys with Bech32 addresses (`persistia1...`), token transfers, nonce-based replay protection
 - **MPP**: Machine Payment Protocol (HTTP 402) for paid API access
 
@@ -63,7 +63,7 @@ src/
   wallet.ts               # Bech32 addresses, account model, token transfers
   contract-executor.ts    # WASM smart contract runtime
   state-proofs.ts         # Incremental Merkle tree and state commitments
-  anchoring.ts            # Arweave + Berachain state anchoring
+  anchoring.ts            # Berachain state anchoring
   cross-shard.ts          # Cross-shard message relay (notes + nullifiers)
   mpp.ts                  # Machine Payment Protocol (HTTP 402)
   oracle.ts               # Decentralized oracle with multi-node aggregation
@@ -183,5 +183,5 @@ The prover watches for new committed rounds, generates SP1 STARK proofs, and sub
 - **No native token**: Validators participate based on reputation, not stake
 - **Bech32 addresses**: Compatible with Cosmos ecosystem address format (`persistia1...`)
 - **Deterministic execution**: No floats, no WASI, fuel-metered WASM
-- **Dual anchoring**: Arweave (permanent) + Berachain (EVM L1) for redundancy
+- **Berachain anchoring**: State roots anchored to Berachain (EVM L1) for external verifiability
 - **Edge-native**: Runs entirely on Cloudflare's free tier

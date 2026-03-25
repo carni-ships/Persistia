@@ -13,7 +13,7 @@
   - Every state transition is cryptographically signed and verifiable.
   - New nodes or reconnecting clients sync in milliseconds via the latest succinct root.
   - No central operator — the ledger lives as long as ≥1 honest node is online.
-- **Not a full L1 blockchain**: No mining, no gas fees inside the ledger. Settlement/anchoring is offloaded to Arweave + cheap L2.
+- **Not a full L1 blockchain**: No mining, no gas fees inside the ledger. Settlement/anchoring is offloaded to Berachain (EVM L1).
 
 ### 2. Architecture
 ```
@@ -26,7 +26,7 @@ Cloudflare Node (any account) ── gossip (HTTP + p2pcf WebRTC) ── Cloudfl
       ├── Validator (signature + rule checks)
       └── Periodic prover (Merkle or SP1 recursive)
             ↓
-         Succinct Root → Arweave / Celestia (immutable anchor)
+         Succinct Root → Berachain (immutable anchor)
 ```
 
 - **Node = one Cloudflare account** (deploy the same code via one-click Wrangler).
@@ -69,7 +69,7 @@ Stored in DO’s built-in SQLite + in-memory cache:
   - Immediate flood on new signed event (HTTP POST).  
   - Periodic sync every 30 s (pull missing events by sequenceId).  
 - **Conflict resolution**: Highest sequence + valid signature wins; invalid events are dropped before storage.  
-- **No fork risk for anchored state**: The canonical history is the latest Arweave-anchored root.
+- **No fork risk for anchored state**: The canonical history is the latest Berachain-anchored root.
 
 ### 6. Succinctness Layer (Mina-style)
 **Phase 1 (current PoC — already implemented in v0.1 code)**:  
@@ -94,17 +94,17 @@ Contracts are executed inside the proof → fully verifiable, no trust in the no
 ### 8. Anchoring & Persistence
 Every 5–10 min (or on major events):
 1. Compute succinct root/proof.
-2. Post `{root, proof, metadata}` to Arweave (pay-once, permanent).
-3. Optional: Mirror root hash to Celestia DA or cheap L2 for public verifiability.
+2. Post `{root, proof, metadata}` to Berachain as HYTE-encoded calldata.
+3. Optionally write structured data to HyberDB contract for on-chain queryability.
 
-The ledger’s canonical state = latest valid Arweave object. Any node can bootstrap from it.
+The ledger’s canonical state = latest valid Berachain anchor. Any node can bootstrap from it.
 
 ### 9. Security & Attack Mitigation
 - **DDoS**: Cloudflare automatic edge mitigation + decentralization (must hit every node simultaneously).  
 - **Spam/Sybil**: Per-pubkey rate limits inside DO + optional PoW on events.  
 - **Invalid state**: Signature + rule checks reject before storage/gossip.  
-- **Eclipse**: Multiple gossip paths + periodic root pull from Arweave.  
-- **Node deletion**: Irrelevant — any other node + Arweave anchor keeps the ledger alive.  
+- **Eclipse**: Multiple gossip paths + periodic root pull from Berachain anchor.
+- **Node deletion**: Irrelevant — any other node + Berachain anchor keeps the ledger alive.  
 - **Key compromise**: Short-lived session keys recommended; full key rotation possible.
 
 ### 10. Deployment & Scaling

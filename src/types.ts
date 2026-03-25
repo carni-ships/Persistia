@@ -100,7 +100,6 @@ export interface AnchorInfo {
   state_root: string;
   finalized_seq: number;
   last_committed_round: number;
-  arweave_tx?: string;
   berachain_tx?: string;
   berachain_block?: number;
   status: string;

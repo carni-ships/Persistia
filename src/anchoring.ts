@@ -1,8 +1,7 @@
-// ─── State Anchoring: Arweave + Berachain ────────────────────────────────────
-// Posts state roots and ZK proofs to permanent off-platform storage.
+// ─── State Anchoring: Berachain ──────────────────────────────────────────────
+// Posts state roots and ZK proofs to Berachain (EVM L1).
 // This ensures the ledger survives any Cloudflare account deletion/ban.
 //
-// Arweave: Pay-once permanent storage via Irys. Stores full anchor bundle.
 // Berachain: EVM L1 with Proof of Liquidity. Posts anchor as calldata (HYTE format)
 //            to the dead address, same pattern as HyberText Transport Protocol.
 //            Optionally writes structured data to HyberDB contract.
@@ -40,19 +39,11 @@ export interface AnchorBundle {
 export interface AnchorRecord {
   id: string;                      // SHA-256 of the bundle
   bundle: AnchorBundle;
-  arweave_tx?: string;             // Arweave transaction ID
   berachain_tx?: string;           // Berachain transaction hash
   berachain_block?: number;        // Berachain block number
   status: "pending" | "submitted" | "confirmed" | "failed";
   created_at: number;
   confirmed_at?: number;
-}
-
-export interface ArweaveConfig {
-  gateway_url: string;             // e.g., "https://arweave.net"
-  wallet_jwk?: any;                // Arweave wallet JWK for signing
-  irys_url?: string;               // e.g., "https://node2.irys.xyz"
-  irys_token?: string;             // Auth token for Irys
 }
 
 export interface BerachainConfig {
@@ -64,7 +55,6 @@ export interface BerachainConfig {
 }
 
 export interface AnchorConfig {
-  arweave?: ArweaveConfig;
   berachain?: BerachainConfig;
   anchor_interval_seq: number;     // anchor every N finalized events (default: 100)
   anchor_interval_ms: number;      // minimum time between anchors (default: 300_000 = 5 min)
@@ -215,81 +205,6 @@ export class AnchorManager {
       active_nodes: params.activeNodes,
       vertex_count: params.vertexCount,
     };
-  }
-
-  // ─── Submit to Arweave ──────────────────────────────────────────────────
-
-  async submitToArweave(
-    bundle: AnchorBundle,
-    snapshotJson?: string,
-  ): Promise<{ tx_id: string } | null> {
-    if (!this.config.arweave) return null;
-
-    const arweave = this.config.arweave;
-
-    // Prepare the data to store
-    const anchorData = JSON.stringify({
-      bundle,
-      snapshot: snapshotJson || null,
-    });
-
-    // Try Irys (formerly Bundlr) first — simpler API, instant finality
-    if (arweave.irys_url && arweave.irys_token) {
-      try {
-        const res = await fetch(`${arweave.irys_url}/tx`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${arweave.irys_token}`,
-            "x-tag-App-Name": "Persistia",
-            "x-tag-Content-Type": "application/json",
-            "x-tag-Shard": bundle.shard_name,
-            "x-tag-State-Root": bundle.state_root,
-            "x-tag-Seq": bundle.finalized_seq.toString(),
-            "x-tag-Round": bundle.last_committed_round.toString(),
-          },
-          body: anchorData,
-        });
-
-        if (res.ok) {
-          const result = await res.json() as any;
-          return { tx_id: result.id || result.txId };
-        }
-      } catch (e: any) {
-        console.warn(`Irys upload failed: ${e.message}`);
-      }
-    }
-
-    // Fallback: direct Arweave gateway upload (requires wallet)
-    if (arweave.gateway_url && arweave.wallet_jwk) {
-      try {
-        const res = await fetch(`${arweave.gateway_url}/tx`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            data: btoa(anchorData),
-            tags: [
-              { name: "App-Name", value: "Persistia" },
-              { name: "Content-Type", value: "application/json" },
-              { name: "Shard", value: bundle.shard_name },
-              { name: "State-Root", value: bundle.state_root },
-              { name: "Seq", value: bundle.finalized_seq.toString() },
-              { name: "Round", value: bundle.last_committed_round.toString() },
-              { name: "Type", value: "state-anchor" },
-            ],
-          }),
-        });
-
-        if (res.ok) {
-          const result = await res.json() as any;
-          return { tx_id: result.id };
-        }
-      } catch (e: any) {
-        console.warn(`Arweave upload failed: ${e.message}`);
-      }
-    }
-
-    return null;
   }
 
   // ─── Submit to Berachain ──────────────────────────────────────────────
@@ -475,19 +390,8 @@ export class AnchorManager {
       anchorId, JSON.stringify(bundle), params.finalizedSeq, Date.now(),
     );
 
-    let arweaveTx: string | undefined;
     let berachainTx: string | undefined;
     let berachainBlock: number | undefined;
-
-    // Submit to Arweave
-    const arResult = await this.submitToArweave(bundle, params.snapshotJson);
-    if (arResult) {
-      arweaveTx = arResult.tx_id;
-      this.sql.exec(
-        "UPDATE anchors SET arweave_tx = ? WHERE id = ?",
-        arweaveTx, anchorId,
-      );
-    }
 
     // Submit to Berachain
     const beraResult = await this.submitToBerachain(bundle);
@@ -501,7 +405,7 @@ export class AnchorManager {
     }
 
     // Update status
-    const status = (arweaveTx || berachainTx) ? "submitted" : "failed";
+    const status = berachainTx ? "submitted" : "failed";
     this.sql.exec(
       "UPDATE anchors SET status = ? WHERE id = ?",
       status, anchorId,
@@ -514,7 +418,6 @@ export class AnchorManager {
     const record: AnchorRecord = {
       id: anchorId,
       bundle,
-      arweave_tx: arweaveTx,
       berachain_tx: berachainTx,
       berachain_block: berachainBlock,
       status,
@@ -523,7 +426,6 @@ export class AnchorManager {
 
     console.log(
       `Anchored seq=${params.finalizedSeq} root=${params.stateRoot.slice(0, 12)}` +
-      (arweaveTx ? ` arweave=${arweaveTx}` : "") +
       (berachainTx ? ` berachain=${berachainTx}` : ""),
     );
 
@@ -534,7 +436,7 @@ export class AnchorManager {
 
   getLatestAnchor(): AnchorRecord | null {
     const rows = [...this.sql.exec(
-      "SELECT id, bundle_json, arweave_tx, celestia_height, celestia_commitment, status, created_at, confirmed_at FROM anchors WHERE status IN ('submitted', 'confirmed') ORDER BY created_at DESC LIMIT 1",
+      "SELECT id, bundle_json, celestia_height, celestia_commitment, status, created_at, confirmed_at FROM anchors WHERE status IN ('submitted', 'confirmed') ORDER BY created_at DESC LIMIT 1",
     )] as any[];
 
     if (rows.length === 0) return null;
@@ -543,7 +445,6 @@ export class AnchorManager {
     return {
       id: row.id,
       bundle: JSON.parse(row.bundle_json),
-      arweave_tx: row.arweave_tx || undefined,
       berachain_tx: row.celestia_commitment || undefined,    // reusing column for backward compat
       berachain_block: row.celestia_height || undefined,
       status: row.status,
@@ -554,14 +455,13 @@ export class AnchorManager {
 
   getAnchorHistory(limit: number = 20): AnchorRecord[] {
     const rows = [...this.sql.exec(
-      "SELECT id, bundle_json, arweave_tx, celestia_height, celestia_commitment, status, created_at, confirmed_at FROM anchors ORDER BY created_at DESC LIMIT ?",
+      "SELECT id, bundle_json, celestia_height, celestia_commitment, status, created_at, confirmed_at FROM anchors ORDER BY created_at DESC LIMIT ?",
       limit,
     )] as any[];
 
     return rows.map((row: any) => ({
       id: row.id,
       bundle: JSON.parse(row.bundle_json),
-      arweave_tx: row.arweave_tx || undefined,
       berachain_tx: row.celestia_commitment || undefined,
       berachain_block: row.celestia_height || undefined,
       status: row.status,
@@ -571,38 +471,6 @@ export class AnchorManager {
   }
 
   // ─── Verification ──────────────────────────────────────────────────────
-
-  /**
-   * Fetch and verify an anchor from Arweave by transaction ID.
-   */
-  async verifyFromArweave(txId: string): Promise<{ valid: boolean; bundle?: AnchorBundle; error?: string }> {
-    if (!this.config.arweave) return { valid: false, error: "Arweave not configured" };
-
-    try {
-      const gateway = this.config.arweave.gateway_url || "https://arweave.net";
-      const res = await fetch(`${gateway}/${txId}`);
-      if (!res.ok) return { valid: false, error: `HTTP ${res.status}` };
-
-      const data = await res.json() as any;
-      const bundle = data.bundle as AnchorBundle;
-
-      if (!bundle || !bundle.state_root || !bundle.finalized_seq) {
-        return { valid: false, error: "Invalid anchor data" };
-      }
-
-      // Verify the anchor ID matches
-      const expectedId = await sha256(JSON.stringify(bundle));
-      const storedAnchor = [...this.sql.exec("SELECT id FROM anchors WHERE arweave_tx = ?", txId)] as any[];
-
-      if (storedAnchor.length > 0 && storedAnchor[0].id !== expectedId) {
-        return { valid: false, error: "Anchor ID mismatch" };
-      }
-
-      return { valid: true, bundle };
-    } catch (e: any) {
-      return { valid: false, error: e.message };
-    }
-  }
 
   /**
    * Fetch and verify an anchor from Berachain by transaction hash.
@@ -644,63 +512,6 @@ export class AnchorManager {
       return { valid: true, bundle };
     } catch (e: any) {
       return { valid: false, error: e.message };
-    }
-  }
-
-  // ─── Bootstrap ──────────────────────────────────────────────────────────
-
-  /**
-   * Find the latest anchor from Arweave for bootstrapping a new node.
-   * Searches by tag to find the most recent Persistia anchor.
-   */
-  async findLatestArweaveAnchor(shardName: string): Promise<AnchorBundle | null> {
-    if (!this.config.arweave) return null;
-
-    try {
-      const gateway = this.config.arweave.gateway_url || "https://arweave.net";
-
-      // GraphQL query to find latest Persistia anchor by shard
-      const query = `{
-        transactions(
-          tags: [
-            { name: "App-Name", values: ["Persistia"] },
-            { name: "Type", values: ["state-anchor"] },
-            { name: "Shard", values: ["${shardName}"] }
-          ],
-          sort: HEIGHT_DESC,
-          first: 1
-        ) {
-          edges {
-            node {
-              id
-              tags { name value }
-            }
-          }
-        }
-      }`;
-
-      const res = await fetch(`${gateway}/graphql`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query }),
-      });
-
-      if (!res.ok) return null;
-
-      const data = await res.json() as any;
-      const edges = data?.data?.transactions?.edges || [];
-      if (edges.length === 0) return null;
-
-      const txId = edges[0].node.id;
-
-      // Fetch the anchor data
-      const anchorRes = await fetch(`${gateway}/${txId}`);
-      if (!anchorRes.ok) return null;
-
-      const anchorData = await anchorRes.json() as any;
-      return anchorData.bundle as AnchorBundle;
-    } catch {
-      return null;
     }
   }
 
