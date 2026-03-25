@@ -59,7 +59,7 @@ export async function selectLeader(round: number, activePubkeys: string[]): Prom
 
 // ─── Active Set ───────────────────────────────────────────────────────────────
 
-export const ACTIVE_WINDOW = 10; // rounds
+export const ACTIVE_WINDOW = 50; // rounds — wide enough to tolerate multi-round catch-up between alarm cycles
 
 export function computeActiveSet(
   vertices: { author: string; round: number }[],

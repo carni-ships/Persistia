@@ -23,6 +23,7 @@ import { type CrossShardMessage, type CrossShardReceipt, validateMessage, create
 import { GossipManager, type GossipEnvelope, type SyncResponsePayload } from "./gossip";
 import { AnchorManager, type AnchorConfig, type AnchorRecord } from "./anchoring";
 import { ValidatorRegistry, verifyPoW } from "./validator-registry";
+import { AccountManager, pubkeyB64ToAddress, validateAddress } from "./wallet";
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -48,6 +49,7 @@ export class PersistiaWorld implements DurableObject {
   gossipManager!: GossipManager;
   anchorManager!: AnchorManager;
   validatorRegistry!: ValidatorRegistry;
+  accountManager!: AccountManager;
   shardName: string = "global-world";
   currentRound: number = 0;
   finalizedSeq: number = 0;
@@ -351,6 +353,23 @@ export class PersistiaWorld implements DurableObject {
     )`);
     sql.exec(`CREATE INDEX IF NOT EXISTS idx_anchors_status ON anchors(status)`);
     sql.exec(`CREATE INDEX IF NOT EXISTS idx_anchors_seq ON anchors(finalized_seq)`);
+
+    // ─── Wallet / Accounts ──────────────────────────────────────────────
+    sql.exec(`CREATE TABLE IF NOT EXISTS accounts (
+      address TEXT PRIMARY KEY,
+      pubkey TEXT NOT NULL UNIQUE,
+      key_type TEXT NOT NULL DEFAULT 'ed25519',
+      nonce INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL
+    )`);
+    sql.exec(`CREATE INDEX IF NOT EXISTS idx_accounts_pubkey ON accounts(pubkey)`);
+
+    sql.exec(`CREATE TABLE IF NOT EXISTS token_balances (
+      address TEXT NOT NULL,
+      denom TEXT NOT NULL,
+      amount TEXT NOT NULL DEFAULT '0',
+      PRIMARY KEY (address, denom)
+    )`);
   }
 
   private async loadState() {
@@ -375,6 +394,7 @@ export class PersistiaWorld implements DurableObject {
     // Gossip + anchoring + validator registry
     this.gossipManager = new GossipManager(sql);
     this.validatorRegistry = new ValidatorRegistry(sql, this.env.POW_DIFFICULTY ? parseInt(this.env.POW_DIFFICULTY) : undefined);
+    this.accountManager = new AccountManager(sql);
     const anchorConfig: Partial<AnchorConfig> = {};
     if (this.env.ARWEAVE_GATEWAY) {
       anchorConfig.arweave = {
@@ -405,15 +425,25 @@ export class PersistiaWorld implements DurableObject {
         }
       }
 
-      // Register self in active_nodes
+      // Register self in active_nodes — use actual last vertex round, not currentRound
+      const selfVertexRows = [...sql.exec(
+        "SELECT MAX(round) as max_round FROM dag_vertices WHERE author = ?",
+        this.nodeIdentity.pubkey,
+      )];
+      const selfLastVertexRound = (selfVertexRows[0]?.max_round ?? this.currentRound) as number;
       sql.exec(
         `INSERT INTO active_nodes (pubkey, url, last_vertex_round, last_seen, is_self)
          VALUES (?, ?, ?, ?, 1)
-         ON CONFLICT(pubkey) DO UPDATE SET url = ?, last_seen = ?, is_self = 1`,
-        this.nodeIdentity.pubkey, this.nodeIdentity.url, this.currentRound, Date.now(),
-        this.nodeIdentity.url, Date.now(),
+         ON CONFLICT(pubkey) DO UPDATE SET url = ?, last_seen = ?, is_self = 1, last_vertex_round = MAX(last_vertex_round, ?)`,
+        this.nodeIdentity.pubkey, this.nodeIdentity.url, selfLastVertexRound, Date.now(),
+        this.nodeIdentity.url, Date.now(), selfLastVertexRound,
       );
       this.invalidateActiveCache();
+    }
+
+    // Always ensure alarm is scheduled on startup
+    if (CONSENSUS_ENABLED) {
+      this.scheduleAlarm();
     }
   }
 
@@ -507,15 +537,58 @@ export class PersistiaWorld implements DurableObject {
           if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
           const { pubkey, amount } = await req.json() as any;
           if (!pubkey) return this.json({ error: "Missing pubkey" }, 400);
+          // Auto-create wallet account on seed
+          const seedAcct = await this.accountManager.getOrCreate(pubkey);
           if (amount && typeof amount === "number") {
-            // Grant specific amount of each resource
             for (const item of ["dirt", "stone", "wood"]) {
               this.addToInventory(pubkey, item, amount);
             }
           } else {
             this.ensureStartingInventory(pubkey);
           }
-          return this.json({ ok: true, inventory: this.getPlayerInventory(pubkey) });
+          return this.json({ ok: true, address: seedAcct.address, inventory: this.getPlayerInventory(pubkey) });
+        }
+
+        // ─── Wallet Endpoints ──────────────────────────────────────────────
+        case "/wallet/info": {
+          const addr = url.searchParams.get("address");
+          const pk = url.searchParams.get("pubkey");
+          if (!addr && !pk) return this.json({ error: "address or pubkey required" }, 400);
+          if (addr) {
+            if (!validateAddress(addr)) return this.json({ error: "Invalid address" }, 400);
+            const acct = this.accountManager.getByAddress(addr);
+            if (!acct) return this.json({ error: "Account not found" }, 404);
+            const balances = this.accountManager.getAllBalances(acct.address);
+            return this.json({ account: acct, balances: balances.map(b => ({ denom: b.denom, amount: b.amount.toString() })) });
+          }
+          const acct = await this.accountManager.getOrCreate(pk!);
+          const balances = this.accountManager.getAllBalances(acct.address);
+          return this.json({ account: acct, balances: balances.map(b => ({ denom: b.denom, amount: b.amount.toString() })) });
+        }
+
+        case "/wallet/balance": {
+          const addr = url.searchParams.get("address");
+          if (!addr) return this.json({ error: "address required" }, 400);
+          const balances = this.accountManager.getAllBalances(addr);
+          return this.json({ balances: balances.map(b => ({ denom: b.denom, amount: b.amount.toString() })) });
+        }
+
+        case "/wallet/address": {
+          const pk = url.searchParams.get("pubkey");
+          if (!pk) return this.json({ error: "pubkey required" }, 400);
+          const address = await pubkeyB64ToAddress(pk);
+          return this.json({ address, pubkey: pk });
+        }
+
+        case "/wallet/faucet": {
+          if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+          const { pubkey: faucetPk, denom, amount } = await req.json() as any;
+          if (!faucetPk) return this.json({ error: "pubkey required" }, 400);
+          const acct = await this.accountManager.getOrCreate(faucetPk);
+          const mintDenom = denom || "PERSIST";
+          const mintAmount = BigInt(amount || 1000);
+          this.accountManager.mint(acct.address, mintDenom, mintAmount);
+          return this.json({ ok: true, address: acct.address, balance: this.accountManager.getBalance(acct.address, mintDenom).toString() });
         }
 
         case "/sync": {
@@ -1804,6 +1877,15 @@ export class PersistiaWorld implements DurableObject {
     // Store locally
     this.storeVertex(vHash, vertex);
 
+    // Update self in active_nodes (receiveVertex does this for peer vertices, but not for self-created ones)
+    this.state.storage.sql.exec(
+      `INSERT INTO active_nodes (pubkey, url, last_vertex_round, last_seen, is_self)
+       VALUES (?, ?, ?, ?, 1)
+       ON CONFLICT(pubkey) DO UPDATE SET last_vertex_round = MAX(last_vertex_round, ?), last_seen = ?`,
+      this.nodeIdentity!.pubkey, this.nodeIdentity!.url, vertex.round, Date.now(), vertex.round, Date.now(),
+    );
+    this.invalidateActiveCache();
+
     // Clear pending events that were included
     for (const h of eventHashes) {
       this.state.storage.sql.exec("DELETE FROM pending_events WHERE hash = ?", h);
@@ -2199,9 +2281,15 @@ export class PersistiaWorld implements DurableObject {
   private ensureActiveCache() {
     if (this._activeCache && this._activeCache.round === this.currentRound) return;
     const minRound = Math.max(0, this.currentRound - ACTIVE_WINDOW);
+    // A node is active if:
+    //  1. It has produced a vertex within the last ACTIVE_WINDOW rounds, OR
+    //  2. It is this node (is_self), OR
+    //  3. It was seen recently via gossip (last_seen within 5 minutes) — prevents
+    //     deadlock when nodes are at different rounds but all alive
+    const recentlySeen = Date.now() - 5 * 60_000;
     const rows = [...this.state.storage.sql.exec(
-      "SELECT pubkey, url, last_vertex_round, last_seen, is_self FROM active_nodes WHERE last_vertex_round >= ? OR is_self = 1 ORDER BY pubkey",
-      minRound,
+      "SELECT pubkey, url, last_vertex_round, last_seen, is_self FROM active_nodes WHERE last_vertex_round >= ? OR is_self = 1 OR last_seen >= ? ORDER BY pubkey",
+      minRound, recentlySeen,
     )].map((r: any) => ({
       pubkey: r.pubkey as string,
       url: r.url as string,
@@ -2347,6 +2435,21 @@ export class PersistiaWorld implements DurableObject {
         if (!payload.trigger_id) return { ok: false, error: "Missing trigger_id" };
         return { ok: true };
       }
+      case "token.transfer": {
+        if (!payload.to || !payload.amount) return { ok: false, error: "Missing to or amount" };
+        const amt = BigInt(payload.amount);
+        if (amt <= 0n) return { ok: false, error: "Amount must be positive" };
+        const denom = payload.denom || "PERSIST";
+        // Sender address derived from pubkey
+        const senderRows = [...this.state.storage.sql.exec("SELECT address FROM accounts WHERE pubkey = ?", pubkey)];
+        if (senderRows.length === 0) return { ok: false, error: "Sender account not found — call /wallet/faucet first" };
+        const senderAddr = senderRows[0].address as string;
+        const balance = this.accountManager.getBalance(senderAddr, denom);
+        if (balance < amt) return { ok: false, error: `Insufficient balance: have ${balance}, need ${amt}` };
+        // Validate recipient address
+        if (!validateAddress(payload.to)) return { ok: false, error: "Invalid recipient address" };
+        return { ok: true };
+      }
       case "oracle.response":
         // System-generated — always valid if it reaches here
         return { ok: true };
@@ -2382,6 +2485,18 @@ export class PersistiaWorld implements DurableObject {
       case "craft":
         this.applyCraft(pubkey, payload.recipe);
         break;
+      case "token.transfer": {
+        const senderRows = [...sql.exec("SELECT address FROM accounts WHERE pubkey = ?", pubkey)];
+        const senderAddr = senderRows[0].address as string;
+        const denom = payload.denom || "PERSIST";
+        const amount = BigInt(payload.amount);
+        const err = this.accountManager.transfer(senderAddr, payload.to, denom, amount);
+        if (err) console.warn(`Transfer failed in apply: ${err}`);
+        this.stateTree.markDirty(`bal:${senderAddr}:${denom}`, null);
+        this.stateTree.markDirty(`bal:${payload.to}:${denom}`, null);
+        this.broadcast({ type: "token.transfer", from: senderAddr, to: payload.to, denom, amount: amount.toString() });
+        break;
+      }
       case "contract.deploy": {
         const wasmBytes = this.b64ToBytes(payload.wasm_b64);
         const address = await this.contractExecutor.deploy(wasmBytes, pubkey, this.latestSeq);

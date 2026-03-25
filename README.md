@@ -1,21 +1,152 @@
-# Persistia PoC v0.1 — Decentralized Minecraft-lite on Cloudflare
+# Persistia
+
+A decentralized BFT consensus ledger running on Cloudflare Workers with zero-knowledge state proofs, WASM smart contracts, and dual-layer state anchoring.
+
+## Architecture
+
+- **Consensus**: Bullshark DAG-based BFT with 30s rounds, quorum-gated advancement, leader-based commit rule
+- **Infrastructure**: Cloudflare Workers + Durable Objects — each validator is a DO shard
+- **Smart Contracts**: WASM runtime with register-based ABI, fuel metering, float ban, cross-contract calls
+- **ZK Proofs**: SP1 STARK recursive proof chain with batch proving (up to 32 blocks per proof)
+- **Anchoring**: Dual-layer to Arweave (via Irys) and Celestia simultaneously
+- **Wallet**: Ed25519 keys with Bech32 addresses (`persistia1...`), token transfers, nonce-based replay protection
 
 ## Quick Start
-1. `npm install`
-2. `wrangler deploy` (uses your Cloudflare account)
-3. Open `client/index.html` (or deploy to Cloudflare Pages)
-4. Play! Build, transfer items, craft.
 
-To add a second node (true decentralization):
-- Deploy the same code to another Cloudflare account
-- Paste the new Worker URL into the first client's console: `addNode("https://other-worker...")`
+```bash
+npm install
+npx wrangler deploy
+```
 
-World state survives account deletion because the Merkle root can be anchored (see anchor.js).
+### Multi-Node Setup
 
-Next steps (we'll do these together):
-- Upgrade to Godot 4 + godot_voxel
-- Full SP1 recursive zk proofs
-- Real Arweave anchoring
-- Multi-zone spatial sharding
+Deploy and register a 3-node cluster:
 
-Enjoy the persistent universe!
+```bash
+BASE="https://your-worker.workers.dev"
+
+# Register peers (full mesh)
+curl -X POST "$BASE/addNode?shard=node-1" -H "Content-Type: application/json" \
+  -d '{"url":"'$BASE'/?shard=node-2"}'
+curl -X POST "$BASE/addNode?shard=node-1" -H "Content-Type: application/json" \
+  -d '{"url":"'$BASE'/?shard=node-3"}'
+# Repeat for node-2 and node-3...
+```
+
+Consensus activates automatically when 3+ nodes are registered and producing vertices.
+
+### Dashboard
+
+Open `client/dashboard.html` and point it at your node URL. Shows real-time DAG visualization, validator status, ZK proof progress, and contract deployments.
+
+### Wallet
+
+Open `client/wallet.html` to manage Ed25519 keys, view balances, and send token transfers. Use the faucet endpoint to get test tokens.
+
+## Project Structure
+
+```
+src/
+  PersistiaDO.ts          # Main Durable Object — consensus, events, routing
+  consensus.ts            # Pure consensus functions (quorum, leader, topological sort, commit rule)
+  gossip.ts               # Node-to-node gossip protocol
+  node-identity.ts        # Ed25519 key management and signing
+  wallet.ts               # Bech32 addresses, account model, token transfers
+  contract-executor.ts    # WASM smart contract runtime
+  state-proofs.ts         # Incremental Merkle tree and state commitments
+  anchoring.ts            # Arweave + Celestia state anchoring
+  cross-shard.ts          # Cross-shard message relay
+  oracle.ts               # Decentralized oracle with multi-node aggregation
+  triggers.ts             # Scheduled contract execution (cron)
+  validator-registry.ts   # PoW-based Sybil resistance and reputation tracking
+  types.ts                # Shared type definitions
+  index.ts                # Worker entry point and HTTP routing
+
+client/
+  dashboard.html          # Real-time DAG explorer and chain monitor
+  wallet.html             # Key management, balances, and transfers
+  game.html               # Minecraft-lite game client
+  script.js               # Game client library
+
+contracts/
+  persistia-sdk/          # Rust SDK for writing smart contracts
+  cosmwasm-compat/        # CosmWasm compatibility layer
+  example-counter/        # Example counter contract
+  zk/
+    program/              # SP1 guest program (what the proof verifies)
+    prover/               # SP1 prover binary (generates proofs)
+    types/                # Shared Rust types for ZK system
+
+blog/
+  introducing-persistia.md  # Technical blog post
+```
+
+## API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/dag/status` | GET | Chain status (round, active nodes, finalized seq) |
+| `/dag/vertices?round=N` | GET | Vertices at a specific round |
+| `/event` | POST | Submit a signed event |
+| `/sync?after=N` | GET | Fetch finalized events after sequence N |
+| `/state` | GET | Full state snapshot |
+| `/wallet/info?pubkey=X` | GET | Account info and balances |
+| `/wallet/address?pubkey=X` | GET | Derive Bech32 address from pubkey |
+| `/wallet/balance?address=X` | GET | Token balances |
+| `/wallet/faucet` | POST | Mint test tokens |
+| `/contract/deploy` | POST | Deploy WASM contract |
+| `/contract/call` | POST | Call contract method |
+| `/contract/query` | GET | Read-only contract query |
+| `/proof/zk/status` | GET | ZK proof chain status |
+| `/proof/zk/submit` | POST | Submit a ZK proof |
+| `/admin/peers` | GET | Active validator list |
+| `/addNode` | POST | Register a gossip peer |
+| `/gossip/sync` | GET | Pull vertices from peer |
+| `/anchor/latest` | GET | Latest state anchor |
+| `/network` | GET | Node identity and capabilities |
+
+## Smart Contracts
+
+Contracts are written in Rust, compiled to `wasm32-unknown-unknown`, and deployed as signed events.
+
+```rust
+use persistia_sdk::*;
+
+#[no_mangle]
+pub extern "C" fn increment() {
+    let key = b"count";
+    let current: u64 = storage_read(key)
+        .map(|v| u64::from_le_bytes(v.try_into().unwrap_or([0; 8])))
+        .unwrap_or(0);
+    storage_write(key, &(current + 1).to_le_bytes());
+    set_return(&(current + 1).to_le_bytes());
+}
+```
+
+Build and deploy:
+```bash
+cd contracts/example-counter
+cargo build --target wasm32-unknown-unknown --release
+# Then POST the .wasm binary (base64-encoded) to /contract/deploy
+```
+
+CosmWasm contracts can be ported using the `cosmwasm-compat` crate — swap imports and rebuild.
+
+## ZK Prover
+
+Run the prover against a live node:
+
+```bash
+cd contracts/zk/prover
+./run-local.sh watch --node "https://your-worker.workers.dev/?shard=node-1"
+```
+
+The prover watches for new committed rounds, generates SP1 STARK proofs, and submits them back to the chain. Supports batch mode (`--batch N`) for amortizing proof overhead.
+
+## Key Design Decisions
+
+- **No native token**: Validators participate based on reputation, not stake
+- **Bech32 addresses**: Compatible with Cosmos ecosystem address format (`persistia1...`)
+- **Deterministic execution**: No floats, no WASI, fuel-metered WASM
+- **Dual anchoring**: Arweave (permanent) + Celestia (DA sampling) for redundancy
+- **Edge-native**: Runs entirely on Cloudflare's free tier

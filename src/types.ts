@@ -122,3 +122,20 @@ export interface TriggerInfo {
   fire_count: number;
   max_fires: number;
 }
+
+// ─── Wallet Types ───────────────────────────────────────────────────────────
+
+export interface WalletAccount {
+  address: string;         // persistia1... (Bech32)
+  pubkey: string;          // base64 Ed25519 public key
+  key_type: "ed25519" | "secp256k1";
+  nonce: number;
+  created_at: number;
+}
+
+export interface TokenTransfer {
+  from: string;            // Bech32 address
+  to: string;              // Bech32 address
+  denom: string;
+  amount: string;          // stringified bigint
+}
