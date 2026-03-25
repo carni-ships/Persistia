@@ -632,22 +632,68 @@ function renderNodes(nodes) {
   }).join('');
 }
 
-// ─── DAG Canvas ──────────────────────────────────────────────────────────────
+// ─── DAG Canvas (Animated) ───────────────────────────────────────────────────
+const dagAnim = {
+  particles: [],       // flying particles along edges
+  pulses: [],          // expanding rings on new vertices
+  commitFlashes: [],   // flash effects on commits
+  knownHashes: new Set(),
+  knownCommits: new Set(),
+  time: 0,
+  running: false,
+};
+
+function spawnPulse(x, y, color) {
+  dagAnim.pulses.push({ x, y, color, birth: dagAnim.time, radius: 0, alpha: 1 });
+}
+
+function spawnCommitFlash(x, y) {
+  dagAnim.commitFlashes.push({ x, y, birth: dagAnim.time, radius: 0, alpha: 1 });
+}
+
+function spawnEdgeParticle(x1, y1, x2, y2, color) {
+  dagAnim.particles.push({
+    x1, y1, x2, y2, color,
+    t: 0, speed: 0.008 + Math.random() * 0.006,
+  });
+}
+
 function renderDAG() {
+  // just flag a re-render; the animation loop handles drawing
+  if (!dagAnim.running) {
+    dagAnim.running = true;
+    requestAnimationFrame(dagAnimLoop);
+  }
+}
+
+function dagAnimLoop(ts) {
+  dagAnim.time = ts;
+  drawDAGFrame();
+  dagAnim.running = true;
+  requestAnimationFrame(dagAnimLoop);
+}
+
+function drawDAGFrame() {
   const canvas = document.getElementById('dag-canvas');
   const container = canvas.parentElement;
   const dpr = window.devicePixelRatio || 1;
-  canvas.width = container.clientWidth * dpr;
-  canvas.height = container.clientHeight * dpr;
-  canvas.style.width = container.clientWidth + 'px';
-  canvas.style.height = container.clientHeight + 'px';
+  const cw = container.clientWidth;
+  const ch = container.clientHeight;
+
+  if (canvas.width !== cw * dpr || canvas.height !== ch * dpr) {
+    canvas.width = cw * dpr;
+    canvas.height = ch * dpr;
+    canvas.style.width = cw + 'px';
+    canvas.style.height = ch + 'px';
+  }
 
   const ctx = canvas.getContext('2d');
-  ctx.scale(dpr, dpr);
-  const W = container.clientWidth;
-  const H = container.clientHeight;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const W = cw, H = ch;
 
-  ctx.clearRect(0, 0, W, H);
+  // Subtle dark clear with slight trail
+  ctx.fillStyle = 'rgba(13,17,23,0.92)';
+  ctx.fillRect(0, 0, W, H);
 
   const vertices = dagData.vertices;
   if (vertices.length === 0) {
@@ -659,11 +705,9 @@ function renderDAG() {
     return;
   }
 
-  // Collect unique authors and rounds
   const authors = [...new Set(vertices.map(v => v.author))];
   const rounds = [...new Set(vertices.map(v => v.round))].sort((a,b) => a-b);
 
-  // Only show last N rounds that fit
   const COL_W = 60;
   const ROW_H = 50;
   const PAD_L = 70;
@@ -676,7 +720,7 @@ function renderDAG() {
     `rounds ${visibleRounds[0] || 0}–${visibleRounds[visibleRounds.length-1] || 0} | ${authors.length} nodes`;
 
   // Build position map
-  const posMap = new Map(); // hash → {x, y}
+  const posMap = new Map();
   for (const v of vertices) {
     if (v.round < minRound) continue;
     const col = v.round - minRound;
@@ -685,69 +729,154 @@ function renderDAG() {
     const x = PAD_L + col * COL_W + COL_W/2;
     const y = PAD_T + row * ROW_H + ROW_H/2;
     posMap.set(v.hash, { x, y, v });
+
+    // Spawn effects for new vertices
+    if (!dagAnim.knownHashes.has(v.hash)) {
+      dagAnim.knownHashes.add(v.hash);
+      spawnPulse(x, y, nodeColor(v.author));
+      // Spawn particles along each edge
+      if (v.refs) {
+        for (const ref of v.refs) {
+          const rp = posMap.get(ref);
+          if (rp) spawnEdgeParticle(rp.x, rp.y, x, y, nodeColor(v.author));
+        }
+      }
+    }
+
+    // Spawn commit flash
+    if (dagData.commits.has(v.hash) && !dagAnim.knownCommits.has(v.hash)) {
+      dagAnim.knownCommits.add(v.hash);
+      spawnCommitFlash(x, y);
+    }
   }
 
-  // Draw round labels
-  ctx.fillStyle = '#4a4a5e';
+  // ─── Draw round column indicators ─────────────────────────────────────
+  const t = dagAnim.time * 0.001;
+  for (let i = 0; i < visibleRounds.length; i++) {
+    const x = PAD_L + i * COL_W + COL_W/2;
+    // Subtle column glow for even rounds (commit-eligible)
+    if (visibleRounds[i] % 2 === 0) {
+      const grad = ctx.createLinearGradient(x, PAD_T - 10, x, PAD_T + authors.length * ROW_H);
+      grad.addColorStop(0, 'rgba(0,210,160,0.03)');
+      grad.addColorStop(0.5, 'rgba(0,210,160,0.06)');
+      grad.addColorStop(1, 'rgba(0,210,160,0.02)');
+      ctx.fillStyle = grad;
+      ctx.fillRect(x - COL_W/2, PAD_T - 10, COL_W, authors.length * ROW_H + 20);
+    }
+  }
+
+  // ─── Round labels ─────────────────────────────────────────────────────
   ctx.font = '10px JetBrains Mono';
   ctx.textAlign = 'center';
   for (let i = 0; i < visibleRounds.length; i++) {
     const x = PAD_L + i * COL_W + COL_W/2;
+    ctx.fillStyle = visibleRounds[i] % 2 === 0 ? 'rgba(0,210,160,0.5)' : '#4a4a5e';
     ctx.fillText('R' + visibleRounds[i], x, 16);
   }
 
-  // Draw author labels
+  // ─── Author labels ────────────────────────────────────────────────────
   ctx.textAlign = 'right';
   for (let i = 0; i < authors.length; i++) {
     const y = PAD_T + i * ROW_H + ROW_H/2;
     ctx.fillStyle = nodeColor(authors[i]);
+    ctx.globalAlpha = 0.7;
     ctx.fillText(shortKey(authors[i]), PAD_L - 8, y + 4);
+    ctx.globalAlpha = 1;
   }
 
-  // Draw grid lines
-  ctx.strokeStyle = 'rgba(42,42,58,0.3)';
+  // ─── Grid lines (subtle, animated dash) ───────────────────────────────
   ctx.lineWidth = 1;
   for (let i = 0; i < authors.length; i++) {
     const y = PAD_T + i * ROW_H + ROW_H/2;
+    ctx.strokeStyle = 'rgba(42,42,58,0.25)';
+    ctx.setLineDash([4, 8]);
+    ctx.lineDashOffset = -t * 12;
     ctx.beginPath();
     ctx.moveTo(PAD_L, y);
     ctx.lineTo(W - 10, y);
     ctx.stroke();
   }
+  ctx.setLineDash([]);
+  ctx.lineDashOffset = 0;
 
-  // Draw edges (references to previous round vertices)
-  ctx.lineWidth = 1;
+  // ─── Edges with gradient ──────────────────────────────────────────────
   for (const [hash, pos] of posMap) {
     const v = pos.v;
     if (!v.refs) continue;
     for (const ref of v.refs) {
       const refPos = posMap.get(ref);
       if (!refPos) continue;
-      ctx.strokeStyle = 'rgba(108,92,231,0.2)';
+      const isCommitEdge = dagData.commits.has(hash) || dagData.commits.has(ref);
+      const grad = ctx.createLinearGradient(refPos.x, refPos.y, pos.x, pos.y);
+      if (isCommitEdge) {
+        grad.addColorStop(0, 'rgba(0,210,160,0.1)');
+        grad.addColorStop(1, 'rgba(0,210,160,0.35)');
+      } else {
+        grad.addColorStop(0, 'rgba(108,92,231,0.08)');
+        grad.addColorStop(1, 'rgba(108,92,231,0.22)');
+      }
+      ctx.strokeStyle = grad;
+      ctx.lineWidth = isCommitEdge ? 1.5 : 1;
       ctx.beginPath();
-      ctx.moveTo(pos.x, pos.y);
-      ctx.lineTo(refPos.x, refPos.y);
+      ctx.moveTo(refPos.x, refPos.y);
+      // Slight curve for visual interest
+      const mx = (refPos.x + pos.x) / 2;
+      const my = (refPos.y + pos.y) / 2 - 6;
+      ctx.quadraticCurveTo(mx, my, pos.x, pos.y);
       ctx.stroke();
     }
   }
 
-  // Draw vertices
+  // ─── Edge particles ───────────────────────────────────────────────────
+  for (let i = dagAnim.particles.length - 1; i >= 0; i--) {
+    const p = dagAnim.particles[i];
+    p.t += p.speed;
+    if (p.t > 1) { dagAnim.particles.splice(i, 1); continue; }
+    const px = p.x1 + (p.x2 - p.x1) * p.t;
+    const py = p.y1 + (p.y2 - p.y1) * p.t - Math.sin(p.t * Math.PI) * 6;
+    const alpha = Math.sin(p.t * Math.PI);
+    ctx.globalAlpha = alpha * 0.9;
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(px, py, 2.5, 0, Math.PI * 2);
+    ctx.fill();
+    // Trail
+    ctx.globalAlpha = alpha * 0.3;
+    ctx.beginPath();
+    ctx.arc(px - (p.x2 - p.x1) * 0.02, py - (p.y2 - p.y1) * 0.02, 1.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  // ─── Vertices ─────────────────────────────────────────────────────────
   for (const [hash, pos] of posMap) {
     const v = pos.v;
     const isCommitted = dagData.commits.has(hash);
     const color = nodeColor(v.author);
-    const r = isCommitted ? 10 : 7;
+    const baseR = isCommitted ? 10 : 7;
+    // Subtle breathing on vertices
+    const breathe = 1 + Math.sin(dagAnim.time * 0.003 + pos.x * 0.1) * 0.08;
+    const r = baseR * breathe;
 
-    // Glow for committed
+    // Ambient glow
+    const glowR = r * 2.5;
+    const glow = ctx.createRadialGradient(pos.x, pos.y, r * 0.5, pos.x, pos.y, glowR);
     if (isCommitted) {
-      ctx.shadowColor = '#00d2a0';
-      ctx.shadowBlur = 12;
+      glow.addColorStop(0, 'rgba(0,210,160,0.25)');
+      glow.addColorStop(1, 'rgba(0,210,160,0)');
+    } else {
+      const c = color;
+      glow.addColorStop(0, c + '20');
+      glow.addColorStop(1, c + '00');
     }
+    ctx.fillStyle = glow;
+    ctx.fillRect(pos.x - glowR, pos.y - glowR, glowR * 2, glowR * 2);
 
+    // Main vertex shape
     ctx.fillStyle = isCommitted ? '#00d2a0' : color;
     ctx.beginPath();
     if (isCommitted) {
-      // Diamond shape for committed anchors
+      // Diamond
       ctx.moveTo(pos.x, pos.y - r);
       ctx.lineTo(pos.x + r, pos.y);
       ctx.lineTo(pos.x, pos.y + r);
@@ -757,7 +886,13 @@ function renderDAG() {
       ctx.arc(pos.x, pos.y, r, 0, Math.PI * 2);
     }
     ctx.fill();
-    ctx.shadowBlur = 0;
+
+    // Inner highlight
+    const hl = ctx.createRadialGradient(pos.x - r*0.3, pos.y - r*0.3, 0, pos.x, pos.y, r);
+    hl.addColorStop(0, 'rgba(255,255,255,0.2)');
+    hl.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = hl;
+    ctx.fill();
 
     // Border
     ctx.strokeStyle = isCommitted ? '#00d2a0' : color;
@@ -768,10 +903,55 @@ function renderDAG() {
     const evCount = v.events ? v.events.length : 0;
     if (evCount > 0) {
       ctx.fillStyle = '#fff';
-      ctx.font = '8px JetBrains Mono';
+      ctx.font = 'bold 8px JetBrains Mono';
       ctx.textAlign = 'center';
       ctx.fillText(evCount, pos.x, pos.y + 3);
     }
+  }
+
+  // ─── Pulse rings (new vertex arrival) ─────────────────────────────────
+  for (let i = dagAnim.pulses.length - 1; i >= 0; i--) {
+    const p = dagAnim.pulses[i];
+    const age = (dagAnim.time - p.birth) / 1000;
+    if (age > 1.2) { dagAnim.pulses.splice(i, 1); continue; }
+    const radius = 8 + age * 30;
+    const alpha = Math.max(0, 1 - age / 1.2);
+    ctx.strokeStyle = p.color;
+    ctx.globalAlpha = alpha * 0.6;
+    ctx.lineWidth = 2 - age * 1.2;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  // ─── Commit flash (expanding green ring + burst) ──────────────────────
+  for (let i = dagAnim.commitFlashes.length - 1; i >= 0; i--) {
+    const f = dagAnim.commitFlashes[i];
+    const age = (dagAnim.time - f.birth) / 1000;
+    if (age > 1.5) { dagAnim.commitFlashes.splice(i, 1); continue; }
+
+    // Expanding ring
+    const radius = 10 + age * 50;
+    const alpha = Math.max(0, 1 - age / 1.5);
+    ctx.strokeStyle = '#00d2a0';
+    ctx.globalAlpha = alpha * 0.5;
+    ctx.lineWidth = 3 - age * 1.5;
+    ctx.beginPath();
+    ctx.arc(f.x, f.y, radius, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // Second ring offset
+    if (age > 0.1) {
+      const r2 = 10 + (age - 0.1) * 40;
+      ctx.globalAlpha = alpha * 0.3;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(f.x, f.y, r2, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    ctx.globalAlpha = 1;
   }
 }
 
