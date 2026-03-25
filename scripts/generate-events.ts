@@ -8,6 +8,10 @@ const NODE = process.argv.includes("--node")
   ? process.argv[process.argv.indexOf("--node") + 1]
   : process.env.PERSISTIA_NODE || "https://persistia.carnation-903.workers.dev";
 
+const SHARD = process.argv.includes("--shard")
+  ? process.argv[process.argv.indexOf("--shard") + 1]
+  : process.env.PERSISTIA_SHARD || "node-1";
+
 const INTERVAL = process.argv.includes("--interval")
   ? parseInt(process.argv[process.argv.indexOf("--interval") + 1])
   : 2000;
@@ -54,8 +58,13 @@ async function sign(privateKey: CryptoKey, data: any): Promise<string> {
 
 // ─── API ─────────────────────────────────────────────────────────────────────
 
+function shardUrl(path: string): string {
+  const sep = path.includes("?") ? "&" : "?";
+  return `${NODE}${path}${sep}shard=${SHARD}`;
+}
+
 async function post(path: string, body: any): Promise<any> {
-  const res = await fetch(`${NODE}${path}`, {
+  const res = await fetch(shardUrl(path), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -64,7 +73,7 @@ async function post(path: string, body: any): Promise<any> {
 }
 
 async function get(path: string): Promise<any> {
-  const res = await fetch(`${NODE}${path}`);
+  const res = await fetch(shardUrl(path));
   return res.json();
 }
 
@@ -324,6 +333,7 @@ function generateLandmark(cx: number, cz: number): { x: number; z: number; block
 async function main() {
   console.log(`Persistia Procedural Builder`);
   console.log(`  Node:     ${NODE}`);
+  console.log(`  Shard:    ${SHARD}`);
   console.log(`  Interval: ${INTERVAL}ms`);
   console.log(`  Agents:   ${NUM_AGENTS}`);
   console.log();
