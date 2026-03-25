@@ -426,7 +426,7 @@
 // ─── Config ──────────────────────────────────────────────────────────────────
 const params = new URLSearchParams(location.search);
 const NODE = params.get('node') || location.origin;
-const SHARD = params.get('shard') || 'global-world';
+const SHARD = params.get('shard') || 'node-1';
 const POLL_MS = 3000;
 
 let connected = false;

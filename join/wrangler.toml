@@ -1,0 +1,24 @@
+name = "persistia-node"
+main = "src/index.ts"
+compatibility_date = "2026-03-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[rules]]
+type = "Text"
+globs = ["**/*.html"]
+
+[[durable_objects.bindings]]
+name = "PERSISTIA_WORLD"
+class_name = "PersistiaWorldV4"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["PersistiaWorldV4"]
+
+# ─── Required: Set these for your node ─────────────────────────────────
+[vars]
+# Your node's public URL (your worker's *.workers.dev URL)
+# NODE_URL = "https://persistia-node.YOUR_SUBDOMAIN.workers.dev"
+
+# Seed nodes to bootstrap into the network
+SEED_NODES = "https://persistia.carnation-903.workers.dev/?shard=node-1,https://persistia.carnation-903.workers.dev/?shard=node-2,https://persistia.carnation-903.workers.dev/?shard=node-3"

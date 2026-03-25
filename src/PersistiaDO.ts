@@ -24,16 +24,17 @@ import { GossipManager, type GossipEnvelope, type SyncResponsePayload } from "./
 import { AnchorManager, type AnchorConfig, type AnchorRecord } from "./anchoring";
 import { ValidatorRegistry, verifyPoW } from "./validator-registry";
 import { AccountManager, pubkeyB64ToAddress, validateAddress } from "./wallet";
+import { MPPHandler, type MPPConfig } from "./mpp";
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
 const CONSENSUS_ENABLED = true;
-const ROUND_INTERVAL_MS = 30_000;  // 30s fallback alarm for free tier
+const ROUND_INTERVAL_MS = 12_000;  // 12s rounds — tuned so single prover keeps up with batch-32
 const MIN_NODES_FOR_CONSENSUS = 3;
 
 // ─── Durable Object ──────────────────────────────────────────────────────────
 
-export class PersistiaWorld implements DurableObject {
+export class PersistiaWorldV4 implements DurableObject {
   state: DurableObjectState;
   env: any;
   sockets: Map<WebSocket, { pubkey?: string; channels: Set<string>; isValidator: boolean; msgCount: number; msgWindowStart: number }> = new Map();
@@ -50,6 +51,7 @@ export class PersistiaWorld implements DurableObject {
   anchorManager!: AnchorManager;
   validatorRegistry!: ValidatorRegistry;
   accountManager!: AccountManager;
+  mppHandler!: MPPHandler;
   shardName: string = "global-world";
   currentRound: number = 0;
   finalizedSeq: number = 0;
@@ -68,316 +70,172 @@ export class PersistiaWorld implements DurableObject {
     nodes: { pubkey: string; url: string; last_vertex_round: number; is_self: boolean }[];
   } | null = null;
 
+  private _initialized = false;
+  private _nextAlarmTime: number = 0;
+
   constructor(state: DurableObjectState, env: any) {
     this.state = state;
     this.env = env;
     this.nodeUrl = env.NODE_URL || "";
     this.state.blockConcurrencyWhile(async () => {
-      this.initDB();
-      await this.loadState();
+      try {
+        this.initDB();
+        await this.loadState();
+        this._initialized = true;
+      } catch (e: any) {
+        // SQL quota may be exhausted — log but don't crash the DO.
+        // We'll retry initialization on each fetch until it succeeds.
+        console.error(`Constructor init failed: ${e.message}`);
+      }
     });
+  }
+
+  /** Lazy init: retries DB setup if constructor failed (e.g. quota was exhausted). */
+  private async ensureInitialized() {
+    if (this._initialized) return;
+    this.initDB();
+    await this.loadState();
+    this._initialized = true;
   }
 
   // ─── Schema ──────────────────────────────────────────────────────────────
 
   private initDB() {
+    // Guard: skip DDL if schema already exists (1 row read vs 43).
+    const existing = [...this.state.storage.sql.exec(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='events' LIMIT 1"
+    )];
+    if (existing.length > 0) {
+      // Migrations for existing DOs
+      this.migrateDB();
+      return;
+    }
+
+    // First init: create all tables + indexes in small batches to stay within free-tier row limits.
     const sql = this.state.storage.sql;
 
-    // --- Legacy tables (kept for game state) ---
+    // Batch 1: core event + world tables
+    sql.exec(`
+      CREATE TABLE events (seq INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL, payload TEXT NOT NULL, pubkey TEXT NOT NULL, signature TEXT NOT NULL, timestamp INTEGER NOT NULL, hash TEXT NOT NULL);
+      CREATE TABLE blocks (x INTEGER NOT NULL, z INTEGER NOT NULL, block_type INTEGER NOT NULL, placed_by TEXT NOT NULL, PRIMARY KEY (x, z));
+      CREATE TABLE ownership (asset_id TEXT PRIMARY KEY, owner_pubkey TEXT NOT NULL, metadata TEXT DEFAULT '', created_at INTEGER NOT NULL);
+      CREATE TABLE inventory (pubkey TEXT NOT NULL, item TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (pubkey, item));
+      CREATE TABLE roots (id INTEGER PRIMARY KEY AUTOINCREMENT, root TEXT NOT NULL, seq INTEGER NOT NULL, timestamp INTEGER NOT NULL);
+      CREATE INDEX idx_events_seq ON events(seq);
+      CREATE INDEX idx_events_hash ON events(hash);
+      CREATE TABLE node_identity (pubkey TEXT PRIMARY KEY, privkey_encrypted TEXT NOT NULL, node_url TEXT NOT NULL, created_at INTEGER NOT NULL);
+    `);
 
-    sql.exec(`CREATE TABLE IF NOT EXISTS events (
-      seq INTEGER PRIMARY KEY AUTOINCREMENT,
-      type TEXT NOT NULL,
-      payload TEXT NOT NULL,
-      pubkey TEXT NOT NULL,
-      signature TEXT NOT NULL,
-      timestamp INTEGER NOT NULL,
-      hash TEXT NOT NULL
-    )`);
+    // Batch 2: DAG consensus tables
+    sql.exec(`
+      CREATE TABLE dag_vertices (hash TEXT PRIMARY KEY, author TEXT NOT NULL, round INTEGER NOT NULL, events_json TEXT NOT NULL, refs_json TEXT NOT NULL, signature TEXT NOT NULL, received_at INTEGER NOT NULL, timestamp INTEGER NOT NULL DEFAULT 0);
+      CREATE INDEX idx_vertices_round_author ON dag_vertices(round, author);
+      CREATE INDEX idx_vertices_round_hash ON dag_vertices(round, hash);
+      CREATE INDEX idx_vertices_author_round ON dag_vertices(author, round);
+      CREATE TABLE dag_commits (round INTEGER PRIMARY KEY, anchor_hash TEXT NOT NULL, committed_at INTEGER NOT NULL, signatures_json TEXT NOT NULL DEFAULT '[]');
+      CREATE TABLE consensus_events (consensus_seq INTEGER PRIMARY KEY AUTOINCREMENT, event_hash TEXT NOT NULL UNIQUE, vertex_hash TEXT NOT NULL, round INTEGER NOT NULL, finalized_at INTEGER NOT NULL);
+      CREATE TABLE pending_events (hash TEXT PRIMARY KEY, type TEXT NOT NULL, payload TEXT NOT NULL, pubkey TEXT NOT NULL, signature TEXT NOT NULL, timestamp INTEGER NOT NULL);
+      CREATE TABLE active_nodes (pubkey TEXT PRIMARY KEY, url TEXT NOT NULL, last_vertex_round INTEGER NOT NULL DEFAULT 0, last_seen INTEGER NOT NULL, is_self INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE consensus_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    `);
 
-    sql.exec(`CREATE TABLE IF NOT EXISTS blocks (
-      x INTEGER NOT NULL,
-      z INTEGER NOT NULL,
-      block_type INTEGER NOT NULL,
-      placed_by TEXT NOT NULL,
-      PRIMARY KEY (x, z)
-    )`);
+    // Batch 3: smart contract + oracle tables
+    sql.exec(`
+      CREATE TABLE contracts (address TEXT PRIMARY KEY, deployer TEXT NOT NULL, wasm_hash TEXT NOT NULL, wasm_bytes BLOB NOT NULL, created_at INTEGER NOT NULL, deploy_seq INTEGER NOT NULL);
+      CREATE TABLE contract_state (contract_address TEXT NOT NULL, key BLOB NOT NULL, value BLOB NOT NULL, PRIMARY KEY (contract_address, key));
+      CREATE TABLE oracle_requests (id TEXT PRIMARY KEY, contract TEXT NOT NULL, callback_method TEXT NOT NULL, url TEXT NOT NULL, json_path TEXT, aggregation TEXT NOT NULL DEFAULT 'identical', status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL, result_value TEXT, result_sources INTEGER DEFAULT 0, delivered_at INTEGER);
+      CREATE INDEX idx_oracle_status ON oracle_requests(status);
+      CREATE TABLE oracle_responses (request_id TEXT NOT NULL, node_pubkey TEXT NOT NULL, value TEXT NOT NULL, fetched_at INTEGER NOT NULL, PRIMARY KEY (request_id, node_pubkey));
+      CREATE TABLE triggers (id TEXT PRIMARY KEY, contract TEXT NOT NULL, method TEXT NOT NULL, args_b64 TEXT NOT NULL DEFAULT '', interval_ms INTEGER NOT NULL, next_fire INTEGER NOT NULL, creator TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, last_fired INTEGER NOT NULL DEFAULT 0, fire_count INTEGER NOT NULL DEFAULT 0, max_fires INTEGER NOT NULL DEFAULT 0);
+      CREATE INDEX idx_triggers_next ON triggers(enabled, next_fire);
+    `);
 
-    sql.exec(`CREATE TABLE IF NOT EXISTS ownership (
-      asset_id TEXT PRIMARY KEY,
-      owner_pubkey TEXT NOT NULL,
-      metadata TEXT DEFAULT '',
-      created_at INTEGER NOT NULL
-    )`);
+    // Batch 4: cross-shard + ZK + validator tables
+    sql.exec(`
+      CREATE TABLE xshard_outbox (id TEXT PRIMARY KEY, target_shard TEXT NOT NULL, message_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL, delivered_at INTEGER);
+      CREATE TABLE xshard_inbox (id TEXT PRIMARY KEY, source_shard TEXT NOT NULL, message_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', received_at INTEGER NOT NULL, processed_at INTEGER);
+      CREATE TABLE zk_proofs (block_number INTEGER PRIMARY KEY, proof_hex TEXT NOT NULL, state_root TEXT NOT NULL, proven_blocks INTEGER NOT NULL DEFAULT 1, proof_type TEXT NOT NULL DEFAULT 'compressed', submitted_at INTEGER NOT NULL, verified INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE validators (pubkey TEXT PRIMARY KEY, url TEXT NOT NULL DEFAULT '', reputation INTEGER NOT NULL DEFAULT 100, pow_nonce TEXT NOT NULL DEFAULT '', pow_hash TEXT NOT NULL DEFAULT '', registered_at INTEGER NOT NULL, last_active_round INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'active', equivocation_count INTEGER NOT NULL DEFAULT 0, total_vertices INTEGER NOT NULL DEFAULT 0, total_commits INTEGER NOT NULL DEFAULT 0);
+      CREATE INDEX idx_validators_status ON validators(status);
+      CREATE TABLE equivocation_evidence (id TEXT PRIMARY KEY, validator_pubkey TEXT NOT NULL, round INTEGER NOT NULL, vertex_hash_1 TEXT NOT NULL, vertex_hash_2 TEXT NOT NULL, detected_at INTEGER NOT NULL, reported_by TEXT NOT NULL);
+      CREATE INDEX idx_equivocation_validator ON equivocation_evidence(validator_pubkey);
+      CREATE TABLE proof_claims (block_start INTEGER NOT NULL, block_end INTEGER NOT NULL, prover_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'claimed', claimed_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, completed_at INTEGER, proof_hash TEXT, PRIMARY KEY (block_start, block_end));
+      CREATE INDEX idx_proof_claims_status ON proof_claims(status);
+      CREATE INDEX idx_proof_claims_prover ON proof_claims(prover_id);
+    `);
 
-    sql.exec(`CREATE TABLE IF NOT EXISTS inventory (
-      pubkey TEXT NOT NULL,
-      item TEXT NOT NULL,
-      count INTEGER NOT NULL DEFAULT 0,
-      PRIMARY KEY (pubkey, item)
-    )`);
+    // Batch 5: governance + rate limiting + gossip + anchors + accounts
+    sql.exec(`
+      CREATE TABLE governance_votes (id TEXT PRIMARY KEY, action TEXT NOT NULL, target TEXT NOT NULL, voter_pubkey TEXT NOT NULL, voter_reputation INTEGER NOT NULL, created_at INTEGER NOT NULL);
+      CREATE INDEX idx_governance_action ON governance_votes(action, target);
+      CREATE TABLE rate_limit_log (pubkey TEXT NOT NULL, timestamp INTEGER NOT NULL);
+      CREATE INDEX idx_rate_limit ON rate_limit_log(pubkey, timestamp);
+      CREATE TABLE gossip_peers (pubkey TEXT PRIMARY KEY, url TEXT NOT NULL, last_seen INTEGER NOT NULL, last_sync_round INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, added_at INTEGER NOT NULL);
+      CREATE TABLE anchors (id TEXT PRIMARY KEY, bundle_json TEXT NOT NULL, arweave_tx TEXT, celestia_height INTEGER, celestia_commitment TEXT, status TEXT NOT NULL DEFAULT 'pending', finalized_seq INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, confirmed_at INTEGER);
+      CREATE INDEX idx_anchors_status ON anchors(status);
+      CREATE INDEX idx_anchors_seq ON anchors(finalized_seq);
+      CREATE TABLE accounts (address TEXT PRIMARY KEY, pubkey TEXT NOT NULL UNIQUE, key_type TEXT NOT NULL DEFAULT 'ed25519', nonce INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
+      CREATE INDEX idx_accounts_pubkey ON accounts(pubkey);
+      CREATE TABLE token_balances (address TEXT NOT NULL, denom TEXT NOT NULL, amount TEXT NOT NULL DEFAULT '0', PRIMARY KEY (address, denom));
+    `);
 
-    sql.exec(`CREATE TABLE IF NOT EXISTS roots (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      root TEXT NOT NULL,
-      seq INTEGER NOT NULL,
-      timestamp INTEGER NOT NULL
-    )`);
+    // Batch 6: light client headers + notes/nullifiers + covenants + private accounts
+    sql.exec(`
+      CREATE TABLE block_headers (block_number INTEGER PRIMARY KEY, state_root TEXT NOT NULL, prev_header_hash TEXT NOT NULL, validator_set_hash TEXT NOT NULL, timestamp INTEGER NOT NULL, tx_count INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE notes (id TEXT PRIMARY KEY, creator TEXT NOT NULL, recipient TEXT, asset_type TEXT NOT NULL, amount TEXT NOT NULL, script TEXT NOT NULL DEFAULT '', shard TEXT NOT NULL, state_root TEXT NOT NULL, created_round INTEGER NOT NULL, consumed INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
+      CREATE INDEX idx_notes_recipient ON notes(recipient);
+      CREATE INDEX idx_notes_shard ON notes(shard);
+      CREATE TABLE nullifiers (nullifier TEXT PRIMARY KEY, note_id TEXT NOT NULL, consumed_by TEXT NOT NULL, consumed_at INTEGER NOT NULL);
+      CREATE TABLE covenants (id TEXT PRIMARY KEY, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, current_state TEXT NOT NULL, allowed_transitions TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+      CREATE INDEX idx_covenants_entity ON covenants(entity_type, entity_id);
+      CREATE TABLE private_state (contract_address TEXT NOT NULL, key_hash TEXT NOT NULL, commitment TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (contract_address, key_hash));
+    `);
+  }
 
-    sql.exec(`CREATE INDEX IF NOT EXISTS idx_events_seq ON events(seq)`);
-    sql.exec(`CREATE INDEX IF NOT EXISTS idx_events_hash ON events(hash)`);
-
-    // --- Consensus tables ---
-
-    sql.exec(`CREATE TABLE IF NOT EXISTS node_identity (
-      pubkey TEXT PRIMARY KEY,
-      privkey_encrypted TEXT NOT NULL,
-      node_url TEXT NOT NULL,
-      created_at INTEGER NOT NULL
-    )`);
-
-    sql.exec(`CREATE TABLE IF NOT EXISTS dag_vertices (
-      hash TEXT PRIMARY KEY,
-      author TEXT NOT NULL,
-      round INTEGER NOT NULL,
-      events_json TEXT NOT NULL,
-      refs_json TEXT NOT NULL,
-      signature TEXT NOT NULL,
-      received_at INTEGER NOT NULL,
-      timestamp INTEGER NOT NULL DEFAULT 0
-    )`);
-    sql.exec(`CREATE INDEX IF NOT EXISTS idx_vertices_round ON dag_vertices(round)`);
-    sql.exec(`CREATE INDEX IF NOT EXISTS idx_vertices_author_round ON dag_vertices(author, round)`);
-
-    // Migration: add timestamp column if missing (existing tables won't get new columns from CREATE TABLE IF NOT EXISTS)
-    try { sql.exec(`ALTER TABLE dag_vertices ADD COLUMN timestamp INTEGER NOT NULL DEFAULT 0`); } catch {}
-
-    sql.exec(`CREATE TABLE IF NOT EXISTS dag_edges (
-      parent_hash TEXT NOT NULL,
-      child_hash TEXT NOT NULL,
-      PRIMARY KEY (parent_hash, child_hash)
-    )`);
-
-    sql.exec(`CREATE TABLE IF NOT EXISTS dag_commits (
-      round INTEGER PRIMARY KEY,
-      anchor_hash TEXT NOT NULL,
-      committed_at INTEGER NOT NULL
-    )`);
-
-    sql.exec(`CREATE TABLE IF NOT EXISTS consensus_events (
-      consensus_seq INTEGER PRIMARY KEY AUTOINCREMENT,
-      event_hash TEXT NOT NULL UNIQUE,
-      vertex_hash TEXT NOT NULL,
-      round INTEGER NOT NULL,
-      finalized_at INTEGER NOT NULL
-    )`);
-
-    sql.exec(`CREATE TABLE IF NOT EXISTS pending_events (
-      hash TEXT PRIMARY KEY,
-      type TEXT NOT NULL,
-      payload TEXT NOT NULL,
-      pubkey TEXT NOT NULL,
-      signature TEXT NOT NULL,
-      timestamp INTEGER NOT NULL
-    )`);
-
-    sql.exec(`CREATE TABLE IF NOT EXISTS active_nodes (
-      pubkey TEXT PRIMARY KEY,
-      url TEXT NOT NULL,
-      last_vertex_round INTEGER NOT NULL DEFAULT 0,
-      last_seen INTEGER NOT NULL,
-      is_self INTEGER NOT NULL DEFAULT 0
-    )`);
-
-    sql.exec(`CREATE TABLE IF NOT EXISTS consensus_state (
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL
-    )`);
-
-    // --- Contract tables ---
-
-    sql.exec(`CREATE TABLE IF NOT EXISTS contracts (
-      address TEXT PRIMARY KEY,
-      deployer TEXT NOT NULL,
-      wasm_hash TEXT NOT NULL,
-      wasm_bytes BLOB NOT NULL,
-      created_at INTEGER NOT NULL,
-      deploy_seq INTEGER NOT NULL
-    )`);
-
-    sql.exec(`CREATE TABLE IF NOT EXISTS contract_state (
-      contract_address TEXT NOT NULL,
-      key BLOB NOT NULL,
-      value BLOB NOT NULL,
-      PRIMARY KEY (contract_address, key)
-    )`);
-
-    // --- Oracle tables ---
-
-    sql.exec(`CREATE TABLE IF NOT EXISTS oracle_requests (
-      id TEXT PRIMARY KEY,
-      contract TEXT NOT NULL,
-      callback_method TEXT NOT NULL,
-      url TEXT NOT NULL,
-      json_path TEXT,
-      aggregation TEXT NOT NULL DEFAULT 'identical',
-      status TEXT NOT NULL DEFAULT 'pending',
-      created_at INTEGER NOT NULL,
-      result_value TEXT,
-      result_sources INTEGER DEFAULT 0,
-      delivered_at INTEGER
-    )`);
-    sql.exec(`CREATE INDEX IF NOT EXISTS idx_oracle_status ON oracle_requests(status)`);
-
-    sql.exec(`CREATE TABLE IF NOT EXISTS oracle_responses (
-      request_id TEXT NOT NULL,
-      node_pubkey TEXT NOT NULL,
-      value TEXT NOT NULL,
-      fetched_at INTEGER NOT NULL,
-      PRIMARY KEY (request_id, node_pubkey)
-    )`);
-
-    // --- Trigger tables ---
-
-    sql.exec(`CREATE TABLE IF NOT EXISTS triggers (
-      id TEXT PRIMARY KEY,
-      contract TEXT NOT NULL,
-      method TEXT NOT NULL,
-      args_b64 TEXT NOT NULL DEFAULT '',
-      interval_ms INTEGER NOT NULL,
-      next_fire INTEGER NOT NULL,
-      creator TEXT NOT NULL,
-      enabled INTEGER NOT NULL DEFAULT 1,
-      created_at INTEGER NOT NULL,
-      last_fired INTEGER NOT NULL DEFAULT 0,
-      fire_count INTEGER NOT NULL DEFAULT 0,
-      max_fires INTEGER NOT NULL DEFAULT 0
-    )`);
-    sql.exec(`CREATE INDEX IF NOT EXISTS idx_triggers_next ON triggers(enabled, next_fire)`);
-
-    // --- Cross-shard tables ---
-
-    sql.exec(`CREATE TABLE IF NOT EXISTS xshard_outbox (
-      id TEXT PRIMARY KEY,
-      target_shard TEXT NOT NULL,
-      message_json TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'pending',
-      created_at INTEGER NOT NULL,
-      delivered_at INTEGER
-    )`);
-
-    sql.exec(`CREATE TABLE IF NOT EXISTS xshard_inbox (
-      id TEXT PRIMARY KEY,
-      source_shard TEXT NOT NULL,
-      message_json TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'pending',
-      received_at INTEGER NOT NULL,
-      processed_at INTEGER
-    )`);
-
-    // ─── ZK Proofs ───────────────────────────────────────────────────────
-    sql.exec(`CREATE TABLE IF NOT EXISTS zk_proofs (
-      block_number INTEGER PRIMARY KEY,
-      proof_hex TEXT NOT NULL,
-      state_root TEXT NOT NULL,
-      proven_blocks INTEGER NOT NULL DEFAULT 1,
-      proof_type TEXT NOT NULL DEFAULT 'compressed',
-      submitted_at INTEGER NOT NULL,
-      verified INTEGER NOT NULL DEFAULT 0
-    )`);
-
-    // ─── Validator Registry ──────────────────────────────────────────────
-    sql.exec(`CREATE TABLE IF NOT EXISTS validators (
-      pubkey TEXT PRIMARY KEY,
-      url TEXT NOT NULL DEFAULT '',
-      reputation INTEGER NOT NULL DEFAULT 100,
-      pow_nonce TEXT NOT NULL DEFAULT '',
-      pow_hash TEXT NOT NULL DEFAULT '',
-      registered_at INTEGER NOT NULL,
-      last_active_round INTEGER NOT NULL DEFAULT 0,
-      status TEXT NOT NULL DEFAULT 'active',
-      equivocation_count INTEGER NOT NULL DEFAULT 0,
-      total_vertices INTEGER NOT NULL DEFAULT 0,
-      total_commits INTEGER NOT NULL DEFAULT 0
-    )`);
-    sql.exec(`CREATE INDEX IF NOT EXISTS idx_validators_status ON validators(status)`);
-
-    sql.exec(`CREATE TABLE IF NOT EXISTS equivocation_evidence (
-      id TEXT PRIMARY KEY,
-      validator_pubkey TEXT NOT NULL,
-      round INTEGER NOT NULL,
-      vertex_hash_1 TEXT NOT NULL,
-      vertex_hash_2 TEXT NOT NULL,
-      detected_at INTEGER NOT NULL,
-      reported_by TEXT NOT NULL
-    )`);
-    sql.exec(`CREATE INDEX IF NOT EXISTS idx_equivocation_validator ON equivocation_evidence(validator_pubkey)`);
-
-    sql.exec(`CREATE TABLE IF NOT EXISTS governance_votes (
-      id TEXT PRIMARY KEY,
-      action TEXT NOT NULL,
-      target TEXT NOT NULL,
-      voter_pubkey TEXT NOT NULL,
-      voter_reputation INTEGER NOT NULL,
-      created_at INTEGER NOT NULL
-    )`);
-    sql.exec(`CREATE INDEX IF NOT EXISTS idx_governance_action ON governance_votes(action, target)`);
-
-    sql.exec(`CREATE TABLE IF NOT EXISTS rate_limit_log (
-      pubkey TEXT NOT NULL,
-      timestamp INTEGER NOT NULL
-    )`);
-    sql.exec(`CREATE INDEX IF NOT EXISTS idx_rate_limit ON rate_limit_log(pubkey, timestamp)`);
-
-    // ─── Gossip Peers ─────────────────────────────────────────────────────
-    sql.exec(`CREATE TABLE IF NOT EXISTS gossip_peers (
-      pubkey TEXT PRIMARY KEY,
-      url TEXT NOT NULL,
-      last_seen INTEGER NOT NULL,
-      last_sync_round INTEGER NOT NULL DEFAULT 0,
-      failures INTEGER NOT NULL DEFAULT 0,
-      added_at INTEGER NOT NULL
-    )`);
-
-    // ─── State Anchors ────────────────────────────────────────────────────
-    sql.exec(`CREATE TABLE IF NOT EXISTS anchors (
-      id TEXT PRIMARY KEY,
-      bundle_json TEXT NOT NULL,
-      arweave_tx TEXT,
-      celestia_height INTEGER,
-      celestia_commitment TEXT,
-      status TEXT NOT NULL DEFAULT 'pending',
-      finalized_seq INTEGER NOT NULL DEFAULT 0,
-      created_at INTEGER NOT NULL,
-      confirmed_at INTEGER
-    )`);
-    sql.exec(`CREATE INDEX IF NOT EXISTS idx_anchors_status ON anchors(status)`);
-    sql.exec(`CREATE INDEX IF NOT EXISTS idx_anchors_seq ON anchors(finalized_seq)`);
-
-    // ─── Wallet / Accounts ──────────────────────────────────────────────
-    sql.exec(`CREATE TABLE IF NOT EXISTS accounts (
-      address TEXT PRIMARY KEY,
-      pubkey TEXT NOT NULL UNIQUE,
-      key_type TEXT NOT NULL DEFAULT 'ed25519',
-      nonce INTEGER NOT NULL DEFAULT 0,
-      created_at INTEGER NOT NULL
-    )`);
-    sql.exec(`CREATE INDEX IF NOT EXISTS idx_accounts_pubkey ON accounts(pubkey)`);
-
-    sql.exec(`CREATE TABLE IF NOT EXISTS token_balances (
-      address TEXT NOT NULL,
-      denom TEXT NOT NULL,
-      amount TEXT NOT NULL DEFAULT '0',
-      PRIMARY KEY (address, denom)
-    )`);
+  private migrateDB() {
+    const sql = this.state.storage.sql;
+    // Migration: add signatures_json to dag_commits if missing
+    try {
+      const cols = [...sql.exec("PRAGMA table_info(dag_commits)")] as any[];
+      if (!cols.some((c: any) => c.name === "signatures_json")) {
+        sql.exec("ALTER TABLE dag_commits ADD COLUMN signatures_json TEXT NOT NULL DEFAULT '[]'");
+      }
+    } catch {}
+    // Migration: add proof_claims table if missing
+    try {
+      const tables = [...sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='proof_claims'")] as any[];
+      if (tables.length === 0) {
+        sql.exec(`
+          CREATE TABLE proof_claims (block_start INTEGER NOT NULL, block_end INTEGER NOT NULL, prover_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'claimed', claimed_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, completed_at INTEGER, proof_hash TEXT, PRIMARY KEY (block_start, block_end));
+          CREATE INDEX idx_proof_claims_status ON proof_claims(status);
+          CREATE INDEX idx_proof_claims_prover ON proof_claims(prover_id);
+        `);
+      }
+    } catch {}
+    // Migration: add light client + notes + covenants + private state tables
+    const newTables = [
+      ["block_headers", `CREATE TABLE block_headers (block_number INTEGER PRIMARY KEY, state_root TEXT NOT NULL, prev_header_hash TEXT NOT NULL, validator_set_hash TEXT NOT NULL, timestamp INTEGER NOT NULL, tx_count INTEGER NOT NULL DEFAULT 0)`],
+      ["notes", `CREATE TABLE notes (id TEXT PRIMARY KEY, creator TEXT NOT NULL, recipient TEXT, asset_type TEXT NOT NULL, amount TEXT NOT NULL, script TEXT NOT NULL DEFAULT '', shard TEXT NOT NULL, state_root TEXT NOT NULL, created_round INTEGER NOT NULL, consumed INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL); CREATE INDEX idx_notes_recipient ON notes(recipient); CREATE INDEX idx_notes_shard ON notes(shard)`],
+      ["nullifiers", `CREATE TABLE nullifiers (nullifier TEXT PRIMARY KEY, note_id TEXT NOT NULL, consumed_by TEXT NOT NULL, consumed_at INTEGER NOT NULL)`],
+      ["covenants", `CREATE TABLE covenants (id TEXT PRIMARY KEY, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, current_state TEXT NOT NULL, allowed_transitions TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL); CREATE INDEX idx_covenants_entity ON covenants(entity_type, entity_id)`],
+      ["private_state", `CREATE TABLE private_state (contract_address TEXT NOT NULL, key_hash TEXT NOT NULL, commitment TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (contract_address, key_hash))`],
+      ["mpp_challenges", `CREATE TABLE mpp_challenges (challenge_id TEXT PRIMARY KEY, resource TEXT NOT NULL, amount TEXT NOT NULL, denom TEXT NOT NULL, recipient TEXT NOT NULL, expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL, consumed INTEGER NOT NULL DEFAULT 0)`],
+      ["mpp_receipts", `CREATE TABLE mpp_receipts (receipt_id TEXT PRIMARY KEY, challenge_id TEXT NOT NULL, tx_hash TEXT NOT NULL, payer TEXT NOT NULL, amount TEXT NOT NULL, denom TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'paid', created_at INTEGER NOT NULL); CREATE INDEX idx_mpp_receipts_challenge ON mpp_receipts(challenge_id); CREATE INDEX idx_mpp_receipts_payer ON mpp_receipts(payer)`],
+    ] as const;
+    for (const [name, ddl] of newTables) {
+      try {
+        const exists = [...sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name=?", name)] as any[];
+        if (exists.length === 0) sql.exec(ddl);
+      } catch {}
+    }
   }
 
   private async loadState() {
     const sql = this.state.storage.sql;
 
-    // Legacy state
-    const seqRows = [...sql.exec("SELECT MAX(seq) as max_seq FROM events")];
-    this.latestSeq = seqRows[0]?.max_seq ?? 0;
+    // Legacy state — use indexed lookups to avoid full table scans on free tier
+    const seqRows = [...sql.exec("SELECT seq FROM events ORDER BY seq DESC LIMIT 1")];
+    this.latestSeq = seqRows[0]?.seq ?? 0;
     const rootRows = [...sql.exec("SELECT root FROM roots ORDER BY id DESC LIMIT 1")];
     this.currentRoot = rootRows[0]?.root ?? await sha256("");
 
@@ -395,6 +253,16 @@ export class PersistiaWorld implements DurableObject {
     this.gossipManager = new GossipManager(sql);
     this.validatorRegistry = new ValidatorRegistry(sql, this.env.POW_DIFFICULTY ? parseInt(this.env.POW_DIFFICULTY) : undefined);
     this.accountManager = new AccountManager(sql);
+
+    // MPP (Machine Payment Protocol) handler
+    const mppConfig: MPPConfig = {
+      realm: this.shardName || "Persistia",
+      recipient: this.env.MPP_RECIPIENT || "persistia1default",
+      challengeTtlMs: 300_000, // 5 minutes
+      routes: this.env.MPP_ROUTES ? JSON.parse(this.env.MPP_ROUTES) : [],
+    };
+    this.mppHandler = new MPPHandler(sql, mppConfig);
+
     const anchorConfig: Partial<AnchorConfig> = {};
     if (this.env.ARWEAVE_GATEWAY) {
       anchorConfig.arweave = {
@@ -423,9 +291,31 @@ export class PersistiaWorld implements DurableObject {
       if (this.env.SEED_NODES) {
         const seeds = (this.env.SEED_NODES as string).split(",").map(s => s.trim()).filter(Boolean);
         if (seeds.length > 0) {
-          this.gossipManager.bootstrapFromSeeds(seeds).catch(() => {});
+          this.gossipManager.bootstrapFromSeeds(seeds)
+            .then(n => {
+              if (n > 0) {
+                console.log(`Bootstrapped ${n} peers from seeds`);
+                // Register seed peers in active_nodes to prevent bootstrap deadlock
+                for (const peer of this.gossipManager.getPeers()) {
+                  if (peer.pubkey && peer.url) {
+                    this.state.storage.sql.exec(
+                      `INSERT INTO active_nodes (pubkey, url, last_vertex_round, last_seen, is_self)
+                       VALUES (?, ?, 0, ?, 0)
+                       ON CONFLICT(pubkey) DO UPDATE SET url = ?, last_seen = ?`,
+                      peer.pubkey, peer.url, Date.now(), peer.url, Date.now(),
+                    );
+                  }
+                }
+                this.invalidateActiveCache();
+              }
+            })
+            .catch(e => console.warn(`Seed bootstrap failed: ${e.message}`));
         }
       }
+
+      // Re-verify existing gossip peers on startup (handles DO restarts/evictions)
+      this.gossipManager.reprobeFailedPeers()
+        .catch(e => console.warn(`Peer reprobe failed: ${e.message}`));
 
       // Register self in active_nodes — use actual last vertex round, not currentRound
       const selfVertexRows = [...sql.exec(
@@ -466,6 +356,16 @@ export class PersistiaWorld implements DurableObject {
   // ─── HTTP Router ─────────────────────────────────────────────────────────
 
   async fetch(req: Request): Promise<Response> {
+    // Retry initialization if constructor failed (e.g. SQL quota was exhausted)
+    try {
+      await this.ensureInitialized();
+    } catch (e: any) {
+      return new Response(JSON.stringify({ error: "DO not ready", detail: e.message }), {
+        status: 503,
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      });
+    }
+
     const url = new URL(req.url);
 
     // Pick up shard name from Worker relay header
@@ -505,6 +405,13 @@ export class PersistiaWorld implements DurableObject {
       if (url.pathname.startsWith("/anchor/")) {
         return this.handleAnchorRoute(req, url);
       }
+      if (url.pathname.startsWith("/mpp/")) {
+        return this.handleMPPRoute(req, url);
+      }
+
+      // MPP middleware: check if route requires payment
+      const mppResult = await this.mppHandler.middleware(req);
+      if (mppResult.response) return mppResult.response;
 
       switch (url.pathname) {
         case "/root":
@@ -612,6 +519,207 @@ export class PersistiaWorld implements DurableObject {
           });
         }
 
+        case "/query": {
+          const q = url.searchParams.get("q");
+          if (!q) return this.json({ error: "q parameter required (SQL query)" }, 400);
+          // Read-only: reject anything that could mutate
+          const normalized = q.trim().toUpperCase();
+          if (!normalized.startsWith("SELECT") && !normalized.startsWith("PRAGMA") && !normalized.startsWith("EXPLAIN")) {
+            return this.json({ error: "Only SELECT, PRAGMA, and EXPLAIN queries allowed" }, 403);
+          }
+          try {
+            const rows = [...this.state.storage.sql.exec(q)];
+            return this.json({ rows, count: rows.length });
+          } catch (e: any) {
+            return this.json({ error: e.message }, 400);
+          }
+        }
+
+        case "/schema": {
+          const tables = [...this.state.storage.sql.exec(
+            "SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name"
+          )];
+          const indexes = [...this.state.storage.sql.exec(
+            "SELECT name, tbl_name, sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL ORDER BY tbl_name"
+          )];
+          return this.json({ tables, indexes });
+        }
+
+        // ─── Light Client Header Endpoints (Handshake SPV-inspired) ──────
+        case "/headers": {
+          const after = parseInt(url.searchParams.get("after") || "0");
+          const limit = Math.min(parseInt(url.searchParams.get("limit") || "100"), 1000);
+          const headers = [...sql.exec(
+            "SELECT * FROM block_headers WHERE block_number > ? ORDER BY block_number ASC LIMIT ?",
+            after, limit,
+          )];
+          return this.json({ headers, count: headers.length });
+        }
+
+        case "/headers/latest": {
+          const rows = [...sql.exec("SELECT * FROM block_headers ORDER BY block_number DESC LIMIT 1")] as any[];
+          if (rows.length === 0) return this.json({ error: "No headers yet" }, 404);
+          return this.json(rows[0]);
+        }
+
+        // ─── Note/Nullifier Endpoints (Miden-inspired) ──────────────────
+        case "/notes/create": {
+          if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+          const body = await req.json() as any;
+          const { creator, recipient, asset_type, amount, script } = body;
+          if (!creator || !asset_type || !amount) {
+            return this.json({ error: "creator, asset_type, amount required" }, 400);
+          }
+          const noteId = await sha256(`note:${creator}:${asset_type}:${amount}:${Date.now()}:${Math.random()}`);
+          const commitment = await this.stateTree.computeCommitment(sql);
+          sql.exec(
+            `INSERT INTO notes (id, creator, recipient, asset_type, amount, script, shard, state_root, created_round, consumed, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+            noteId, creator, recipient || null, asset_type, String(amount),
+            script || "", this.shardName, commitment.root, this.lastCommittedRound, Date.now(),
+          );
+          return this.json({ ok: true, note_id: noteId });
+        }
+
+        case "/notes/consume": {
+          if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+          const body = await req.json() as any;
+          const { note_id, consumer } = body;
+          if (!note_id || !consumer) return this.json({ error: "note_id, consumer required" }, 400);
+          // Verify note exists and is unconsumed
+          const notes = [...sql.exec("SELECT * FROM notes WHERE id = ?", note_id)] as any[];
+          if (notes.length === 0) return this.json({ error: "Note not found" }, 404);
+          if (notes[0].consumed) return this.json({ error: "Note already consumed" }, 409);
+          // Check recipient restriction
+          if (notes[0].recipient && notes[0].recipient !== consumer) {
+            return this.json({ error: "Not authorized to consume this note" }, 403);
+          }
+          // Create nullifier (prevents double-spend)
+          const nullifier = await sha256(`nullifier:${note_id}:${consumer}`);
+          const existing = [...sql.exec("SELECT 1 FROM nullifiers WHERE nullifier = ?", nullifier)] as any[];
+          if (existing.length > 0) return this.json({ error: "Nullifier already exists (double spend)" }, 409);
+          sql.exec("UPDATE notes SET consumed = 1 WHERE id = ?", note_id);
+          sql.exec(
+            "INSERT INTO nullifiers (nullifier, note_id, consumed_by, consumed_at) VALUES (?, ?, ?, ?)",
+            nullifier, note_id, consumer, Date.now(),
+          );
+          // Mark nullifier in state tree for ZK proof inclusion
+          this.stateTree.markDirty(`nullifier:${nullifier}`, "1");
+          return this.json({ ok: true, nullifier });
+        }
+
+        case "/notes/list": {
+          const owner = url.searchParams.get("recipient") || url.searchParams.get("creator");
+          const field = url.searchParams.get("recipient") ? "recipient" : "creator";
+          if (!owner) return this.json({ error: "recipient or creator required" }, 400);
+          const notes = [...sql.exec(
+            `SELECT id, creator, recipient, asset_type, amount, script, shard, created_round, consumed, created_at FROM notes WHERE ${field} = ? ORDER BY created_at DESC LIMIT 100`,
+            owner,
+          )];
+          return this.json({ notes });
+        }
+
+        case "/nullifiers/check": {
+          const nullifier = url.searchParams.get("nullifier");
+          if (!nullifier) return this.json({ error: "nullifier required" }, 400);
+          const rows = [...sql.exec("SELECT * FROM nullifiers WHERE nullifier = ?", nullifier)] as any[];
+          return this.json({ exists: rows.length > 0, nullifier: rows[0] || null });
+        }
+
+        // ─── Covenant State Machine Endpoints (Handshake-inspired) ───────
+        case "/covenant/create": {
+          if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+          const body = await req.json() as any;
+          const { entity_type, entity_id, initial_state, transitions } = body;
+          if (!entity_type || !entity_id || !initial_state || !transitions) {
+            return this.json({ error: "entity_type, entity_id, initial_state, transitions required" }, 400);
+          }
+          const id = await sha256(`covenant:${entity_type}:${entity_id}`);
+          sql.exec(
+            `INSERT OR REPLACE INTO covenants (id, entity_type, entity_id, current_state, allowed_transitions, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            id, entity_type, entity_id, initial_state, JSON.stringify(transitions), Date.now(), Date.now(),
+          );
+          return this.json({ ok: true, covenant_id: id, state: initial_state });
+        }
+
+        case "/covenant/transition": {
+          if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+          const body = await req.json() as any;
+          const { entity_type, entity_id, new_state } = body;
+          if (!entity_type || !entity_id || !new_state) {
+            return this.json({ error: "entity_type, entity_id, new_state required" }, 400);
+          }
+          const covId = await sha256(`covenant:${entity_type}:${entity_id}`);
+          const rows = [...sql.exec("SELECT * FROM covenants WHERE id = ?", covId)] as any[];
+          if (rows.length === 0) return this.json({ error: "Covenant not found" }, 404);
+          const covenant = rows[0];
+          let transitions: Record<string, string[]>;
+          try { transitions = JSON.parse(covenant.allowed_transitions); } catch { return this.json({ error: "Invalid transitions config" }, 500); }
+          const allowed = transitions[covenant.current_state] || [];
+          if (!allowed.includes(new_state)) {
+            return this.json({
+              error: `Transition ${covenant.current_state} → ${new_state} not allowed`,
+              current_state: covenant.current_state,
+              allowed_transitions: allowed,
+            }, 403);
+          }
+          sql.exec(
+            "UPDATE covenants SET current_state = ?, updated_at = ? WHERE id = ?",
+            new_state, Date.now(), covId,
+          );
+          return this.json({ ok: true, previous_state: covenant.current_state, new_state });
+        }
+
+        case "/covenant/get": {
+          const entityType = url.searchParams.get("entity_type");
+          const entityId = url.searchParams.get("entity_id");
+          if (!entityType || !entityId) return this.json({ error: "entity_type, entity_id required" }, 400);
+          const covId = await sha256(`covenant:${entityType}:${entityId}`);
+          const rows = [...sql.exec("SELECT * FROM covenants WHERE id = ?", covId)] as any[];
+          if (rows.length === 0) return this.json({ error: "Covenant not found" }, 404);
+          return this.json({ ...rows[0], allowed_transitions: JSON.parse(rows[0].allowed_transitions) });
+        }
+
+        // ─── Private State Endpoints (Miden-inspired) ────────────────────
+        case "/private/commit": {
+          if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+          const body = await req.json() as any;
+          const { contract_address, key_hash, commitment } = body;
+          if (!contract_address || !key_hash || !commitment) {
+            return this.json({ error: "contract_address, key_hash, commitment required" }, 400);
+          }
+          sql.exec(
+            `INSERT OR REPLACE INTO private_state (contract_address, key_hash, commitment, updated_at) VALUES (?, ?, ?, ?)`,
+            contract_address, key_hash, commitment, Date.now(),
+          );
+          // Track in state tree for ZK proof (only commitment, not value)
+          this.stateTree.markDirty(`private:${contract_address}:${key_hash}`, commitment);
+          return this.json({ ok: true });
+        }
+
+        case "/private/verify": {
+          const contractAddr = url.searchParams.get("contract");
+          const keyHash = url.searchParams.get("key_hash");
+          if (!contractAddr || !keyHash) return this.json({ error: "contract, key_hash required" }, 400);
+          const rows = [...sql.exec(
+            "SELECT commitment, updated_at FROM private_state WHERE contract_address = ? AND key_hash = ?",
+            contractAddr, keyHash,
+          )] as any[];
+          if (rows.length === 0) return this.json({ exists: false });
+          return this.json({ exists: true, commitment: rows[0].commitment, updated_at: rows[0].updated_at });
+        }
+
+        case "/private/proof": {
+          const contractAddr = url.searchParams.get("contract");
+          const keyHash = url.searchParams.get("key_hash");
+          if (!contractAddr || !keyHash) return this.json({ error: "contract, key_hash required" }, 400);
+          const stateKey = `private:${contractAddr}:${keyHash}`;
+          const proof = await this.stateTree.generateProof(stateKey);
+          if (!proof) return this.json({ error: "Proof generation failed" }, 500);
+          return this.json(proof);
+        }
+
         case "/inventory": {
           const pubkey = url.searchParams.get("pubkey");
           if (!pubkey) return this.json({ error: "pubkey required" }, 400);
@@ -623,19 +731,35 @@ export class PersistiaWorld implements DurableObject {
           const { url: peerUrl, pubkey: peerPubkey } = await req.json() as any;
           if (!peerUrl) return this.json({ error: "url required" }, 400);
 
+          let resolvedPubkey = peerPubkey;
           if (peerPubkey) {
             this.gossipManager.addPeer(peerPubkey, peerUrl);
           } else {
-            // Fetch the node's identity
+            // Fetch the node's identity via /network endpoint
             try {
-              const res = await fetch(peerUrl);
+              const networkUrl = peerUrl.includes("?")
+                ? peerUrl.replace("?", "/network?")
+                : peerUrl.replace(/\/?$/, "/network");
+              const res = await fetch(networkUrl);
               if (res.ok) {
                 const info = await res.json() as any;
                 if (info.node_pubkey) {
+                  resolvedPubkey = info.node_pubkey;
                   this.gossipManager.addPeer(info.node_pubkey, peerUrl);
                 }
               }
             } catch {}
+          }
+
+          // Register peer in active_nodes so it counts toward consensus quorum
+          if (resolvedPubkey) {
+            this.state.storage.sql.exec(
+              `INSERT INTO active_nodes (pubkey, url, last_vertex_round, last_seen, is_self)
+               VALUES (?, ?, 0, ?, 0)
+               ON CONFLICT(pubkey) DO UPDATE SET url = ?, last_seen = ?`,
+              resolvedPubkey, peerUrl, Date.now(), peerUrl, Date.now(),
+            );
+            this.invalidateActiveCache();
           }
 
           // Ensure alarm is running now that we have peers
@@ -684,34 +808,72 @@ export class PersistiaWorld implements DurableObject {
   // ─── DO Alarm (round timer) ─────────────────────────────────────────────
 
   async alarm() {
-    // 1. Fire due cron triggers (works regardless of consensus mode)
-    await this.fireDueTriggers();
+    try {
+      // 1. Fire due cron triggers (works regardless of consensus mode)
+      await this.fireDueTriggers();
 
-    // 2. Process pending oracle requests
-    await this.processPendingOracles();
+      // 2. Process pending oracle requests
+      await this.processPendingOracles();
 
-    if (CONSENSUS_ENABLED && this.nodeIdentity) {
-      // 3. Pull from gossip peers (replaces old HTTP-only syncFromPeers)
-      await this.gossipSync();
+      if (CONSENSUS_ENABLED && this.nodeIdentity) {
+        // 3. Pull from gossip peers
+        await this.gossipSync();
 
-      // 4. Create vertex for current round if we haven't yet
-      const existing = [...this.state.storage.sql.exec(
-        "SELECT hash FROM dag_vertices WHERE author = ? AND round = ?",
-        this.nodeIdentity.pubkey, this.currentRound,
-      )];
-      if (existing.length === 0) {
-        await this.createAndBroadcastVertex();
+        // 4. Create vertex for current round if we haven't yet
+        const existing = [...this.state.storage.sql.exec(
+          "SELECT hash FROM dag_vertices WHERE author = ? AND round = ?",
+          this.nodeIdentity.pubkey, this.currentRound,
+        )];
+        if (existing.length === 0) {
+          await this.createAndBroadcastVertex();
+        }
+
+        // 5. Anchor state if due
+        await this.maybeAnchorState();
       }
 
-      // 5. Anchor state if due
-      await this.maybeAnchorState();
+      // 6. Housekeeping: prune stale rate-limit entries + old anchor bundles
+      this.validatorRegistry.pruneRateLimitLog();
+      this.anchorManager.pruneOldAnchors();
+
+      // 7. Prune old DAG data to stay within free-tier row limits
+      // Keep last 100 rounds of vertices, prune 200 per cycle to avoid heavy deletes
+      if (this.currentRound > 150) {
+        const pruneBelow = this.currentRound - 100;
+        this.state.storage.sql.exec(
+          "DELETE FROM dag_vertices WHERE rowid IN (SELECT rowid FROM dag_vertices WHERE round < ? LIMIT 200)",
+          pruneBelow,
+        );
+        this.state.storage.sql.exec(
+          "DELETE FROM consensus_events WHERE rowid IN (SELECT rowid FROM consensus_events WHERE round < ? LIMIT 200)",
+          pruneBelow,
+        );
+      }
+
+      // 7b. Prune old events (keep last 1000 for sync, rest recoverable from anchors)
+      const lastAnchorRows = [...sql.exec(
+        "SELECT MAX(finalized_seq) as max_seq FROM anchors WHERE status IN ('submitted','confirmed')"
+      )];
+      const lastAnchoredSeq = (lastAnchorRows[0]?.max_seq ?? 0) as number;
+      if (lastAnchoredSeq > 1000) {
+        const pruneSeq = lastAnchoredSeq - 1000;
+        sql.exec("DELETE FROM events WHERE seq < ? LIMIT 200", pruneSeq);
+      }
+
+      // 7c. Prune delivered oracle requests older than 1 hour
+      const oneHourAgo = Date.now() - 3_600_000;
+      sql.exec("DELETE FROM oracle_requests WHERE status = 'delivered' AND delivered_at < ? LIMIT 50", oneHourAgo);
+      sql.exec("DELETE FROM oracle_responses WHERE request_id NOT IN (SELECT id FROM oracle_requests) LIMIT 50");
+
+      // 8. Periodically reprobe failed peers (every ~5 min)
+      if (CONSENSUS_ENABLED && this.currentRound % 10 === 0) {
+        this.gossipManager.reprobeFailedPeers().catch(() => {});
+      }
+    } catch (e: any) {
+      console.error(`Alarm error: ${e.message}`);
     }
 
-    // 6. Housekeeping: prune stale rate-limit entries + old anchor bundles
-    this.validatorRegistry.pruneRateLimitLog();
-    this.anchorManager.pruneOldAnchors();
-
-    // 7. Re-schedule alarm
+    // 9. Re-schedule alarm even if there was an error
     this.scheduleAlarm();
   }
 
@@ -721,7 +883,23 @@ export class PersistiaWorld implements DurableObject {
     const nextTrigger = this.triggerManager.getNextFireTime();
     const roundTime = now + ROUND_INTERVAL_MS;
     const alarmTime = nextTrigger ? Math.min(roundTime, Math.max(nextTrigger, now + 1000)) : roundTime;
+    this._nextAlarmTime = alarmTime;
     this.state.storage.setAlarm(alarmTime);
+  }
+
+  /**
+   * Reactive alarm rescheduling: after round advancement or a commit, fire
+   * the alarm sooner (now + 100 ms) so the node can act on the new state
+   * without waiting for the next regular tick (up to ROUND_INTERVAL_MS away).
+   * Skipped when an alarm is already imminent (within 500 ms).
+   */
+  private scheduleReactiveAlarm() {
+    const now = Date.now();
+    const IMMINENT_THRESHOLD_MS = 500;
+    if (this._nextAlarmTime - now <= IMMINENT_THRESHOLD_MS) return; // already firing soon
+    const reactiveTime = now + 100;
+    this._nextAlarmTime = reactiveTime;
+    this.state.storage.setAlarm(reactiveTime);
   }
 
   // ─── DAG Routes ─────────────────────────────────────────────────────────
@@ -794,7 +972,7 @@ export class PersistiaWorld implements DurableObject {
 
         // Get the committed vertex for this round
         const commits = [...sql.exec(
-          "SELECT anchor_hash, committed_at FROM dag_commits WHERE round = ?", round
+          "SELECT anchor_hash, committed_at, signatures_json FROM dag_commits WHERE round = ?", round
         )] as any[];
         if (commits.length === 0) return this.json({ error: "Round not committed" }, 404);
 
@@ -803,11 +981,16 @@ export class PersistiaWorld implements DurableObject {
           "SELECT hash, author, round, events_json, refs_json, signature FROM dag_vertices WHERE round = ?", round
         )] as any[];
 
-        // Collect all signatures for this round's vertices
-        const signatures = vertices.map((v: any) => ({
-          pubkey: v.author,
-          signature: v.signature,
-        }));
+        // Use persisted signatures from dag_commits (survives pruning), fall back to live vertices
+        let signatures: any[];
+        if (anchor.signatures_json && anchor.signatures_json !== '[]') {
+          try { signatures = JSON.parse(anchor.signatures_json); } catch { signatures = []; }
+        } else {
+          signatures = vertices.map((v: any) => ({
+            pubkey: v.author,
+            signature: v.signature,
+          }));
+        }
 
         // Parse events from the anchor vertex
         const anchorVertex = vertices.find((v: any) => v.hash === anchor.anchor_hash);
@@ -908,6 +1091,42 @@ export class PersistiaWorld implements DurableObject {
 
       case "/admin/peers":
         return this.json({ peers: this.getActiveNodes() });
+
+      case "/admin/reset": {
+        if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+        // Nuclear reset — drops all data and reinitializes
+        await this.state.storage.deleteAll();
+        this.initDB();
+        this.currentRound = 0;
+        this.lastCommittedRound = -2;
+        this.finalizedSeq = 0;
+        this.finalizedRoot = await sha256("");
+        this.latestSeq = 0;
+        this.currentRoot = await sha256("");
+        await this.loadState();
+        return this.json({ ok: true, message: "Storage reset. Node will reinitialize on next alarm." });
+      }
+
+      case "/admin/prune": {
+        if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+        const sql = this.state.storage.sql;
+        const keep = parseInt(url.searchParams.get("keep") || "100");
+        const pruneBelow = Math.max(0, this.currentRound - keep);
+        let totalDeleted = 0;
+        // Delete in small batches
+        for (let i = 0; i < 20; i++) {
+          const result = sql.exec("DELETE FROM dag_vertices WHERE rowid IN (SELECT rowid FROM dag_vertices WHERE round < ? LIMIT 100)", pruneBelow);
+          totalDeleted += result.rowsWritten || 0;
+          if (!result.rowsWritten) break;
+        }
+
+        for (let i = 0; i < 10; i++) {
+          const result = sql.exec("DELETE FROM consensus_events WHERE rowid IN (SELECT rowid FROM consensus_events WHERE round < ? LIMIT 100)", pruneBelow);
+          totalDeleted += result.rowsWritten || 0;
+          if (!result.rowsWritten) break;
+        }
+        return this.json({ ok: true, pruned_below_round: pruneBelow, rows_deleted: totalDeleted });
+      }
 
       default:
         return this.json({ error: "Unknown admin endpoint" }, 404);
@@ -1085,6 +1304,124 @@ export class PersistiaWorld implements DurableObject {
           max_chain_length: latest[0]?.max_chain_length || 0,
           last_committed_round: this.lastCommittedRound,
           proof_gap: (this.lastCommittedRound || 0) - (latest[0]?.latest_block || 0),
+        });
+      }
+
+      // ─── Multi-Prover Claim-Based Coordination ─────────────────────────
+
+      case "/proof/claim": {
+        // Prover claims a block range to prove. Prevents duplicate work.
+        if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+        const body = await req.json() as any;
+        const { prover_id, block_start, block_end, ttl_seconds } = body;
+        if (!prover_id || block_start == null || block_end == null) {
+          return this.json({ error: "prover_id, block_start, block_end required" }, 400);
+        }
+        if (block_start > block_end) return this.json({ error: "block_start must be <= block_end" }, 400);
+        const ttl = (ttl_seconds || 300) * 1000; // default 5 min
+        const now = Date.now();
+
+        // Expire stale claims first
+        sql.exec("UPDATE proof_claims SET status = 'expired' WHERE status = 'claimed' AND expires_at < ?", now);
+
+        // Check for overlapping active claims
+        const overlaps = [...sql.exec(
+          `SELECT prover_id, block_start, block_end FROM proof_claims
+           WHERE status = 'claimed' AND block_start <= ? AND block_end >= ?`,
+          block_end, block_start,
+        )] as any[];
+        if (overlaps.length > 0) {
+          return this.json({ error: "Range overlaps existing claim", overlaps }, 409);
+        }
+
+        // Check if range already proven
+        const proven = [...sql.exec(
+          "SELECT block_number FROM zk_proofs WHERE block_number >= ? AND block_number <= ?",
+          block_start, block_end,
+        )] as any[];
+        if (proven.length === (block_end - block_start + 1)) {
+          return this.json({ error: "Range already fully proven", proven_blocks: proven.map((r: any) => r.block_number) }, 409);
+        }
+
+        sql.exec(
+          `INSERT OR REPLACE INTO proof_claims (block_start, block_end, prover_id, status, claimed_at, expires_at)
+           VALUES (?, ?, ?, 'claimed', ?, ?)`,
+          block_start, block_end, prover_id, now, now + ttl,
+        );
+        return this.json({ ok: true, block_start, block_end, expires_at: now + ttl });
+      }
+
+      case "/proof/release": {
+        // Prover releases a claim (completed or abandoned)
+        if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+        const body = await req.json() as any;
+        const { prover_id, block_start, block_end, proof_hash, status } = body;
+        if (!prover_id || block_start == null || block_end == null) {
+          return this.json({ error: "prover_id, block_start, block_end required" }, 400);
+        }
+        const newStatus = status === "completed" ? "completed" : "released";
+        if (newStatus === "completed" && proof_hash) {
+          sql.exec(
+            "UPDATE proof_claims SET status = ?, completed_at = ?, proof_hash = ? WHERE block_start = ? AND block_end = ? AND prover_id = ?",
+            newStatus, Date.now(), proof_hash, block_start, block_end, prover_id,
+          );
+        } else {
+          sql.exec(
+            "UPDATE proof_claims SET status = ? WHERE block_start = ? AND block_end = ? AND prover_id = ?",
+            newStatus, block_start, block_end, prover_id,
+          );
+        }
+        return this.json({ ok: true, status: newStatus });
+      }
+
+      case "/proof/claims": {
+        // List active claims and their status
+        sql.exec("UPDATE proof_claims SET status = 'expired' WHERE status = 'claimed' AND expires_at < ?", Date.now());
+        const statusFilter = url.searchParams.get("status");
+        const rows = statusFilter
+          ? [...sql.exec("SELECT * FROM proof_claims WHERE status = ? ORDER BY block_start", statusFilter)]
+          : [...sql.exec("SELECT * FROM proof_claims ORDER BY block_start DESC LIMIT 100")];
+        return this.json({ claims: rows });
+      }
+
+      case "/proof/next_unclaimed": {
+        // Returns the next block range that needs proving (not claimed, not proven)
+        sql.exec("UPDATE proof_claims SET status = 'expired' WHERE status = 'claimed' AND expires_at < ?", Date.now());
+        const batchSize = parseInt(url.searchParams.get("batch") || "1");
+        const afterBlock = parseInt(url.searchParams.get("after") || "0");
+
+        // Find committed rounds not yet proven or claimed
+        const committed = [...sql.exec(
+          `SELECT round FROM dag_commits
+           WHERE round > ?
+           AND round NOT IN (SELECT block_number FROM zk_proofs)
+           ORDER BY round ASC LIMIT ?`,
+          afterBlock, batchSize,
+        )] as any[];
+
+        if (committed.length === 0) {
+          return this.json({ available: false });
+        }
+
+        // Filter out claimed ranges
+        const unclaimed = [];
+        for (const row of committed) {
+          const claims = [...sql.exec(
+            "SELECT 1 FROM proof_claims WHERE status = 'claimed' AND block_start <= ? AND block_end >= ?",
+            row.round, row.round,
+          )] as any[];
+          if (claims.length === 0) unclaimed.push(row.round);
+        }
+
+        if (unclaimed.length === 0) {
+          return this.json({ available: false, reason: "all pending blocks are claimed" });
+        }
+
+        return this.json({
+          available: true,
+          block_start: unclaimed[0],
+          block_end: unclaimed[unclaimed.length - 1],
+          blocks: unclaimed,
         });
       }
 
@@ -1429,6 +1766,35 @@ export class PersistiaWorld implements DurableObject {
     }
   }
 
+  // ─── MPP Routes ──────────────────────────────────────────────────────────
+
+  private async handleMPPRoute(_req: Request, url: URL): Promise<Response> {
+    switch (url.pathname) {
+      case "/mpp/info":
+        return this.json(this.mppHandler.getPaymentInfo());
+
+      case "/mpp/receipts": {
+        const payer = url.searchParams.get("payer");
+        if (!payer) return this.json({ error: "payer required" }, 400);
+        return this.json(this.mppHandler.listReceipts(payer));
+      }
+
+      case "/mpp/receipt": {
+        const id = url.searchParams.get("id");
+        if (!id) return this.json({ error: "id required" }, 400);
+        const receipt = this.mppHandler.getReceipt(id);
+        if (!receipt) return this.json({ error: "not found" }, 404);
+        return this.json(receipt);
+      }
+
+      case "/mpp/status":
+        return this.json({ active_challenges: this.mppHandler.activeChallenges() });
+
+      default:
+        return this.json({ error: "unknown mpp route" }, 404);
+    }
+  }
+
   // ─── Anchor Routes ─────────────────────────────────────────────────────
 
   private async handleAnchorRoute(req: Request, url: URL): Promise<Response> {
@@ -1486,12 +1852,11 @@ export class PersistiaWorld implements DurableObject {
   // ─── Gossip Sync (called from alarm) ───────────────────────────────────
 
   private async gossipSync() {
-    // Use gossip manager for peer sync
+    // Use gossip manager for peer sync — skip per-vertex consensus, do it in batch after
     const result = await this.gossipManager.syncFromPeers(
       this.currentRound,
       ACTIVE_WINDOW,
       async (v: any) => {
-        // Reconstruct DAGVertex from sync data
         const vertex = {
           author: v.author,
           round: v.round,
@@ -1501,14 +1866,28 @@ export class PersistiaWorld implements DurableObject {
           timestamp: v.timestamp || 0,
           signature: v.signature,
         };
-        await this.receiveVertex(vertex);
+        await this.receiveVertex(vertex, true); // skip consensus during bulk sync
       },
     );
 
-    // Also sync from legacy active_nodes peers (backward compat)
-    await this.syncFromPeers();
-
+    // Run round advancement + commits once after all vertices are stored
     if (result.synced > 0) {
+      // Fast-forward: if synced vertices are far ahead, jump to their round range
+      // instead of advancing round-by-round (which would take forever with pruned history).
+      const maxSyncedRound = [...this.state.storage.sql.exec(
+        "SELECT MAX(round) as mr FROM dag_vertices"
+      )];
+      const peerMaxRound = (maxSyncedRound[0]?.mr ?? this.currentRound) as number;
+      if (peerMaxRound > this.currentRound + ACTIVE_WINDOW) {
+        // Jump to peerMaxRound - 2 so we can participate in current rounds
+        const jumpTo = peerMaxRound - 2;
+        console.log(`Fast-forward: round ${this.currentRound} → ${jumpTo} (peers at ${peerMaxRound})`);
+        this.currentRound = jumpTo;
+        this.setKV("current_round", this.currentRound.toString());
+      }
+      const advanced = this.tryAdvanceRound();
+      const committed = await this.tryCommitRounds();
+      if (advanced || committed) this.scheduleReactiveAlarm();
       this.broadcastToChannel("status", { type: "status.update", ...this.getConsensusStatus() });
     }
   }
@@ -1850,7 +2229,7 @@ export class PersistiaWorld implements DurableObject {
 
     // Gather pending events
     const pendingRows = [...this.state.storage.sql.exec(
-      "SELECT hash, type, payload, pubkey, signature, timestamp FROM pending_events ORDER BY timestamp ASC LIMIT 100",
+      "SELECT hash, type, payload, pubkey, signature, timestamp FROM pending_events ORDER BY timestamp ASC LIMIT 500",
     )];
 
     const events: SignedEvent[] = pendingRows.map((r: any) => ({
@@ -1891,15 +2270,17 @@ export class PersistiaWorld implements DurableObject {
     this.invalidateActiveCache();
 
     // Clear pending events that were included
-    for (const h of eventHashes) {
-      this.state.storage.sql.exec("DELETE FROM pending_events WHERE hash = ?", h);
+    if (eventHashes.length > 0) {
+      const placeholders = eventHashes.map(() => "?").join(",");
+      sql.exec(`DELETE FROM pending_events WHERE hash IN (${placeholders})`, ...eventHashes);
     }
 
     // Try round advancement + commits
-    this.tryAdvanceRound();
-    await this.tryCommitRounds();
+    const advanced = this.tryAdvanceRound();
+    const committed = await this.tryCommitRounds();
+    if (advanced || committed) this.scheduleReactiveAlarm();
 
-    // Broadcast to WS peers + gossip to remote nodes
+    // Broadcast: WS push to local validators + gossip flood to remote peers
     await this.broadcastVertexToPeers(vertex);
     this.gossipManager.gossipVertex(vertex).catch(() => {});
   }
@@ -1915,7 +2296,7 @@ export class PersistiaWorld implements DurableObject {
 
   // ─── Vertex Reception ───────────────────────────────────────────────────
 
-  private async receiveVertex(vertex: DAGVertex): Promise<{ ok: boolean; error?: string }> {
+  private async receiveVertex(vertex: DAGVertex, skipConsensus = false): Promise<{ ok: boolean; error?: string }> {
     // 1. Verify vertex signature
     const validSig = await verifyVertexSignature(vertex);
     if (!validSig) return { ok: false, error: "Invalid vertex signature" };
@@ -1926,8 +2307,15 @@ export class PersistiaWorld implements DurableObject {
       if (!validEvent) return { ok: false, error: "Invalid event signature in vertex" };
     }
 
-    // 3. Reject if too far ahead
-    if (vertex.round > this.currentRound + 5) {
+    // 3. Reject if too far ahead — unless we need to fast-forward
+    if (vertex.round > this.currentRound + ACTIVE_WINDOW) {
+      // Fast-forward: jump our round to catch up with the network
+      const jumpTo = vertex.round - 2;
+      console.log(`Fast-forward on vertex receipt: round ${this.currentRound} → ${jumpTo}`);
+      this.currentRound = jumpTo;
+      this.setKV("current_round", this.currentRound.toString());
+    }
+    if (vertex.round > this.currentRound + ACTIVE_WINDOW) {
       return { ok: false, error: "Vertex round too far ahead" };
     }
 
@@ -1976,21 +2364,28 @@ export class PersistiaWorld implements DurableObject {
       timestamp: vertex.timestamp,
     });
 
-    // 7. Update active_nodes
+    // 7. Update active_nodes — resolve author URL from gossip_peers if available
+    const authorUrl = this.gossipManager.getPeerUrl(vertex.author) || "";
     this.state.storage.sql.exec(
       `INSERT INTO active_nodes (pubkey, url, last_vertex_round, last_seen, is_self)
-       VALUES (?, '', ?, ?, 0)
-       ON CONFLICT(pubkey) DO UPDATE SET last_vertex_round = MAX(last_vertex_round, ?), last_seen = ?`,
-      vertex.author, vertex.round, Date.now(), vertex.round, Date.now(),
+       VALUES (?, ?, ?, ?, 0)
+       ON CONFLICT(pubkey) DO UPDATE SET
+         last_vertex_round = MAX(last_vertex_round, ?),
+         last_seen = ?,
+         url = CASE WHEN excluded.url != '' THEN excluded.url ELSE active_nodes.url END`,
+      vertex.author, authorUrl, vertex.round, Date.now(), vertex.round, Date.now(),
     );
     this.invalidateActiveCache();
 
-    // 8. Try round advancement + commits
-    this.tryAdvanceRound();
-    await this.tryCommitRounds();
+    // 8. Try round advancement + commits (skip during bulk sync for performance)
+    if (!skipConsensus) {
+      const advanced = this.tryAdvanceRound();
+      const committed = await this.tryCommitRounds();
+      if (advanced || committed) this.scheduleReactiveAlarm();
+    }
 
     // 9. DO should also produce a vertex if it hasn't for this round
-    await this.maybeCreateVertex();
+    if (!skipConsensus) await this.maybeCreateVertex();
 
     // Push status update to subscribers (replaces client polling)
     this.broadcastToChannel("status", { type: "status.update", ...this.getConsensusStatus() });
@@ -2013,25 +2408,20 @@ export class PersistiaWorld implements DurableObject {
       vertex.timestamp,
     );
 
-    // Materialized edges — batch insert
-    if (vertex.refs.length > 0) {
-      const placeholders = vertex.refs.map(() => "(?, ?)").join(", ");
-      const params = vertex.refs.flatMap(ref => [ref, hash]);
-      sql.exec(`INSERT OR IGNORE INTO dag_edges (parent_hash, child_hash) VALUES ${placeholders}`, ...params);
-    }
+    // dag_edges removed — topologicalSort uses in-memory refs_json
   }
 
   // ─── Round Advancement ──────────────────────────────────────────────────
 
-  private tryAdvanceRound() {
+  private tryAdvanceRound(): boolean {
     const activeCount = this.getActiveNodeCount();
-    if (activeCount < MIN_NODES_FOR_CONSENSUS) return;
+    if (activeCount < MIN_NODES_FOR_CONSENSUS) return false;
 
     const quorum = getQuorumSize(activeCount);
 
-    // Advance through all rounds that have quorum (not just one)
+    // Advance through rounds that have quorum — cap to prevent runaway
     let advanced = false;
-    for (let i = 0; i < 50; i++) { // cap to avoid infinite loop
+    for (let i = 0; i < 20; i++) {
       const countRows = [...this.state.storage.sql.exec(
         "SELECT COUNT(DISTINCT author) as cnt FROM dag_vertices WHERE round = ?",
         this.currentRound,
@@ -2049,16 +2439,18 @@ export class PersistiaWorld implements DurableObject {
       this.setKV("current_round", this.currentRound.toString());
       this.invalidateActiveCache();
     }
+    return advanced;
   }
 
   // ─── Commit Rule ────────────────────────────────────────────────────────
 
-  private async tryCommitRounds() {
+  private async tryCommitRounds(): Promise<boolean> {
     const activeCount = this.getActiveNodeCount();
-    if (activeCount < MIN_NODES_FOR_CONSENSUS) return;
+    if (activeCount < MIN_NODES_FOR_CONSENSUS) return false;
 
-    // Check all uncommitted even rounds
-    for (let r = this.lastCommittedRound + 2; r <= this.currentRound - 1; r += 2) {
+    // Check uncommitted even rounds — cap at 10 commits per cycle to avoid CPU exhaustion
+    let commitsThisCycle = 0;
+    for (let r = this.lastCommittedRound + 2; r <= this.currentRound - 1 && commitsThisCycle < 10; r += 2) {
       // Already committed?
       const existing = [...this.state.storage.sql.exec(
         "SELECT round FROM dag_commits WHERE round = ?", r,
@@ -2088,23 +2480,49 @@ export class PersistiaWorld implements DurableObject {
       const result = checkCommit(r, leader, verticesByRound, activeCount);
       if (result.committed && result.anchorHash) {
         await this.commitAnchor(r, result.anchorHash);
+        commitsThisCycle++;
       }
     }
+    return commitsThisCycle > 0;
   }
 
   private async commitAnchor(round: number, anchorHash: string) {
     const sql = this.state.storage.sql;
 
-    // Record commit
+    // Collect vertex signatures + data for this round (persisted for ZK prover after pruning)
+    const roundVertices = [...sql.exec(
+      "SELECT author, signature, round, events_json, refs_json, timestamp FROM dag_vertices WHERE round = ?", round
+    )] as any[];
+    const commitSigs = JSON.stringify(roundVertices.map((v: any) => {
+      let eventHashes: string[] = [];
+      try {
+        const events = JSON.parse(v.events_json || "[]");
+        eventHashes = events.map((e: any) => e.hash || "").filter(Boolean);
+      } catch {}
+      let refs: string[] = [];
+      try { refs = JSON.parse(v.refs_json || "[]"); } catch {}
+      return {
+        pubkey: v.author,
+        signature: v.signature,
+        round: v.round,
+        event_hashes: eventHashes,
+        refs,
+        timestamp: v.timestamp || 0,
+      };
+    }));
+
+    // Record commit with signatures
     sql.exec(
-      "INSERT OR IGNORE INTO dag_commits (round, anchor_hash, committed_at) VALUES (?, ?, ?)",
-      round, anchorHash, Date.now(),
+      "INSERT OR IGNORE INTO dag_commits (round, anchor_hash, committed_at, signatures_json) VALUES (?, ?, ?, ?)",
+      round, anchorHash, Date.now(), commitSigs,
     );
 
-    // Build vertex map for topological sort — single load, parse once, keep events
+    // Build vertex map for topological sort — load vertices within a bounded window
+    // Only need vertices back to lastCommittedRound (older ones are already finalized)
+    const minRound = Math.max(0, this.lastCommittedRound - 2);
     const allVertices = [...sql.exec(
-      "SELECT hash, author, round, events_json, refs_json FROM dag_vertices WHERE round <= ?",
-      round,
+      "SELECT hash, author, round, events_json, refs_json FROM dag_vertices WHERE round >= ? AND round <= ?",
+      minRound, round,
     )];
     const vertexMap = new Map<string, VertexNode>();
     const eventsMap = new Map<string, any[]>(); // hash → parsed events (avoid re-query + re-parse)
@@ -2121,18 +2539,29 @@ export class PersistiaWorld implements DurableObject {
       eventsMap.set(row.hash, events);
     }
 
-    // Get already-finalized event hashes in one query (not per-event)
+    // Get already-finalized event hashes — scoped to relevant rounds
     const finalizedVertices = new Set<string>(
-      [...sql.exec("SELECT DISTINCT vertex_hash FROM consensus_events")].map((r: any) => r.vertex_hash),
+      [...sql.exec("SELECT DISTINCT vertex_hash FROM consensus_events WHERE round >= ?", minRound)].map((r: any) => r.vertex_hash),
     );
     const finalizedEventHashes = new Set<string>(
-      [...sql.exec("SELECT event_hash FROM consensus_events")].map((r: any) => r.event_hash),
+      [...sql.exec("SELECT event_hash FROM consensus_events WHERE round >= ?", minRound)].map((r: any) => r.event_hash),
     );
 
     // Topological sort from anchor
     const orderedVertices = topologicalSort(anchorHash, vertexMap, finalizedVertices);
 
     // Extract and apply events in order — use pre-loaded eventsMap instead of re-querying
+    const newlyFinalizedHashes: string[] = [];
+
+    // Batch accumulators: SQL rows and WS broadcast entries are collected during the loop,
+    // then flushed once after the loop.  For N events this reduces sql.exec calls from
+    // 2N individual INSERTs to 2 bulk INSERT … VALUES (…) statements, and WS sends from
+    // N individual broadcast calls to 1 "finalized_batch" message.
+    const consensusRows: [string, string, number, number][] = []; // [event_hash, vertex_hash, round, finalized_at]
+    const eventRows: [string, string, string, string, number, string][] = []; // [type, payload, pubkey, sig, ts, hash]
+    const finalizedBroadcasts: object[] = [];
+
+    const nowMs = Date.now();
     for (const vNode of orderedVertices) {
       const events = eventsMap.get(vNode.hash);
       if (!events) continue;
@@ -2151,37 +2580,66 @@ export class PersistiaWorld implements DurableObject {
         const payload = typeof event.payload === "string" ? JSON.parse(event.payload) : event.payload;
         await this.applyEvent(event.type, payload, event.pubkey);
 
-        // Record in consensus log
-        this.finalizedSeq++;
-        sql.exec(
-          "INSERT OR IGNORE INTO consensus_events (event_hash, vertex_hash, round, finalized_at) VALUES (?, ?, ?, ?)",
-          eventHash, vNode.hash, round, Date.now(),
-        );
+        // Track for batch pending cleanup
+        newlyFinalizedHashes.push(eventHash);
 
-        // Also append to legacy events table
-        sql.exec(
-          "INSERT OR IGNORE INTO events (type, payload, pubkey, signature, timestamp, hash) VALUES (?, ?, ?, ?, ?, ?)",
+        // Accumulate consensus_events row
+        this.finalizedSeq++;
+        consensusRows.push([eventHash, vNode.hash, round, nowMs]);
+
+        // Accumulate legacy events row
+        eventRows.push([
           event.type,
           typeof event.payload === "string" ? event.payload : JSON.stringify(event.payload),
           event.pubkey, event.signature, event.timestamp, eventHash,
-        );
+        ]);
         this.latestSeq++;
 
         // Advance finalized root
         this.finalizedRoot = await sha256(this.finalizedRoot + eventHash);
 
-        // Broadcast finality to clients
-        this.broadcast({
-          type: "finalized",
-          event: { type: event.type, payload, pubkey: event.pubkey, hash: eventHash, consensus_seq: this.finalizedSeq },
+        // Accumulate broadcast entry (sent as one batch message after the loop)
+        finalizedBroadcasts.push({
+          type: event.type,
+          payload,
+          pubkey: event.pubkey,
+          hash: eventHash,
+          consensus_seq: this.finalizedSeq,
         });
       }
     }
 
+    // ── Batch SQL flush ──────────────────────────────────────────────────────
+    // Insert all consensus_events rows in a single multi-row VALUES statement.
+    if (consensusRows.length > 0) {
+      const placeholders = consensusRows.map(() => "(?, ?, ?, ?)").join(", ");
+      sql.exec(
+        `INSERT OR IGNORE INTO consensus_events (event_hash, vertex_hash, round, finalized_at) VALUES ${placeholders}`,
+        ...consensusRows.flat(),
+      );
+    }
+
+    // Insert all legacy events rows in a single multi-row VALUES statement.
+    if (eventRows.length > 0) {
+      const placeholders = eventRows.map(() => "(?, ?, ?, ?, ?, ?)").join(", ");
+      sql.exec(
+        `INSERT OR IGNORE INTO events (type, payload, pubkey, signature, timestamp, hash) VALUES ${placeholders}`,
+        ...eventRows.flat(),
+      );
+    }
+
+    // ── Batch WebSocket broadcast ────────────────────────────────────────────
+    // Send all finalized events as one "finalized_batch" message instead of one
+    // "finalized" message per event.
+    if (finalizedBroadcasts.length > 0) {
+      this.broadcast({ type: "finalized_batch", events: finalizedBroadcasts });
+    }
+
     // Remove finalized events from pending pool
-    sql.exec(
-      "DELETE FROM pending_events WHERE hash IN (SELECT event_hash FROM consensus_events)",
-    );
+    if (newlyFinalizedHashes.length > 0) {
+      const placeholders = newlyFinalizedHashes.map(() => "?").join(",");
+      sql.exec(`DELETE FROM pending_events WHERE hash IN (${placeholders})`, ...newlyFinalizedHashes);
+    }
 
     // Update state
     this.lastCommittedRound = round;
@@ -2204,6 +2662,33 @@ export class PersistiaWorld implements DurableObject {
       finalized_seq: this.finalizedSeq,
       root: this.finalizedRoot,
     });
+
+    // ── Light Client Header Generation ─────────────────────────────────────
+    // Produce a compact block header for light client sync (Handshake SPV-inspired)
+    {
+      const prevHeaders = [...sql.exec(
+        "SELECT block_number, state_root FROM block_headers ORDER BY block_number DESC LIMIT 1",
+      )] as any[];
+      const prevHeaderHash = prevHeaders.length > 0
+        ? await sha256(`header:${prevHeaders[0].block_number}:${prevHeaders[0].state_root}`)
+        : await sha256("genesis");
+      const activeNodes = this.getActiveNodes();
+      const validatorSetHash = await sha256(activeNodes.map(n => n.pubkey).sort().join(","));
+      sql.exec(
+        "INSERT OR IGNORE INTO block_headers (block_number, state_root, prev_header_hash, validator_set_hash, timestamp, tx_count) VALUES (?, ?, ?, ?, ?, ?)",
+        round, this.finalizedRoot, prevHeaderHash, validatorSetHash, nowMs, finalizedBroadcasts.length,
+      );
+    }
+
+    // ── Reputation Decay (Handshake name-expiry inspired) ────────────────
+    // Every 50 committed rounds, decay inactive validators by 1%
+    if (round % 50 === 0) {
+      sql.exec(
+        `UPDATE validators SET reputation = MAX(0, reputation - CAST(reputation * 0.01 AS INTEGER))
+         WHERE status = 'active' AND last_active_round < ?`,
+        round - 100,
+      );
+    }
 
     // Reward validators who participated in this committed round
     const commitParticipants = [...this.state.storage.sql.exec(
@@ -2228,21 +2713,7 @@ export class PersistiaWorld implements DurableObject {
       }
     }
 
-    // Fall back to HTTP for peers with URLs but no active WS connection
-    const peers = this.getActiveNodes().filter(n => !n.is_self && n.url && !wsPeers.has(n.pubkey));
-    for (const peer of peers) {
-      try {
-        const vertexUrl = new URL(peer.url || this.nodeUrl);
-        vertexUrl.pathname = vertexUrl.pathname.replace(/\/$/, "") + "/dag/vertex";
-        await fetch(vertexUrl.toString(), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(vertex),
-        });
-      } catch {
-        // peer unreachable
-      }
-    }
+    // HTTP fallback removed — gossipManager.gossipVertex handles remote flood with signed envelopes
   }
 
   private async syncFromPeers() {
@@ -2267,8 +2738,12 @@ export class PersistiaWorld implements DurableObject {
             timestamp: 0,
             signature: v.signature,
           };
-          await this.receiveVertex(vertex);
+          await this.receiveVertex(vertex, true); // skip consensus during bulk sync
         }
+        // Run consensus once after bulk sync
+        const advanced = this.tryAdvanceRound();
+        const committed = await this.tryCommitRounds();
+        if (advanced || committed) this.scheduleReactiveAlarm();
         break; // synced from one peer is enough
       } catch {
         // try next peer

@@ -20,7 +20,7 @@ We asked: what if the infrastructure layer was already solved? Cloudflare operat
 
 Persistia implements Bullshark, a DAG-based BFT consensus protocol. Each validator is a Cloudflare Durable Object — a stateful, single-threaded compute unit with a co-located SQLite database.
 
-The protocol operates in rounds. Every 30 seconds, each validator:
+The protocol operates in rounds. Every 12 seconds, each validator:
 
 1. Bundles pending events into a **DAG vertex** with cryptographic references to vertices from prior rounds
 2. Broadcasts the vertex to peers via HTTP gossip
@@ -51,13 +51,13 @@ When a client submits a signed event, the receiving node validates rules and add
 
 This is the fastest feedback loop, but provides no ordering guarantee. The event could be reverted if it fails validation at commit time or is never included in a vertex.
 
-### Level 1: DAG Inclusion — ~30 seconds
+### Level 1: DAG Inclusion — ~12 seconds
 
-On the next alarm cycle, the node bundles pending events into a DAG vertex (up to 100 events per vertex), signs it with its Ed25519 key, and gossips it to all peers. The vertex is now part of the DAG with causal references to prior rounds.
+On the next alarm cycle, the node bundles pending events into a DAG vertex (up to 500 events per vertex), signs it with its Ed25519 key, and gossips it to all peers. The vertex is now part of the DAG with causal references to prior rounds.
 
 The event is in a signed vertex that all honest nodes will eventually see. But the vertex hasn't been committed — a Byzantine author could equivocate (produce two conflicting vertices for the same round).
 
-### Level 2: BFT Commit — ~60–90 seconds
+### Level 2: BFT Commit — ~24–36 seconds
 
 This is the core finality guarantee. Bullshark's commit rule works on even-numbered rounds:
 
@@ -84,12 +84,12 @@ State roots and metadata are anchored to **Arweave** (permanent, immutable stora
 | Level | Name | Latency | Revertible? |
 |-------|------|---------|-------------|
 | 0 | Optimistic | instant | Yes — not ordered yet |
-| 1 | DAG Inclusion | ~30s | Yes — vertex not committed |
-| 2 | **BFT Commit** | ~60–90s | No (unless >1/3 Byzantine) |
+| 1 | DAG Inclusion | ~12s | Yes — vertex not committed |
+| 2 | **BFT Commit** | ~24–36s | No (unless >1/3 Byzantine) |
 | 3 | ZK Proven | ~5–15 min | No (cryptographic) |
 | 4 | DA Anchored | ~5–10 min | No (permanent external storage) |
 
-For context: Ethereum reaches finality in ~12 minutes (2 epochs). Cosmos chains finalize in ~6 seconds. Persistia's 60–90 second BFT finality sits between them, with the option to reach ~2–3 seconds on a paid Cloudflare plan by reducing the alarm interval.
+For context: Ethereum reaches finality in ~12 minutes (2 epochs). Cosmos chains finalize in ~6 seconds. Persistia's ~24–36 second BFT finality is practical for most applications, running on $0 infrastructure. The round interval is tunable — at 2s rounds, finality drops to ~4–6 seconds but requires faster proof generation to keep up.
 
 ## Throughput
 
@@ -99,13 +99,13 @@ Persistia's throughput is shaped by Cloudflare's execution model rather than tra
 
 Each Durable Object processes events sequentially. The binding constraints:
 
-- **Alarm interval**: 30 seconds on the free tier (can drop to 1 second on paid)
-- **Events per vertex**: Up to 100 events bundled per vertex per round
-- **Rounds per alarm**: Nodes advance through multiple rounds per alarm cycle via gossip catch-up — typically 20–40 rounds per 30-second cycle during active operation
+- **Alarm interval**: 12 seconds (tunable; currently set to match prover throughput)
+- **Events per vertex**: Up to 500 events bundled per vertex per round
+- **Reactive rescheduling**: When consensus advances, the alarm fires within 100ms instead of waiting for the next tick
 
-On the current free-tier configuration with 3 validators, each producing a vertex with up to 100 events per round, the baseline throughput is **~10 transactions per second**. Events are accepted continuously via WebSocket and HTTP; the alarm interval only gates vertex creation and commit finalization, not event ingestion.
+On the current configuration with 3 validators, each producing a vertex with up to 500 events per round at 12-second intervals, the baseline throughput is **~42 transactions per second**. Events are accepted continuously via WebSocket and HTTP; the alarm interval only gates vertex creation and commit finalization, not event ingestion. SQL commits are batched (2 bulk INSERTs instead of N individual ones), and WebSocket broadcasts are batched into a single message per commit cycle.
 
-With optimized settings (1-second alarm interval, 1000 events per vertex, pipelined vertex creation), a single shard can reach **1,000–3,000 TPS**.
+At the faster 2-second round interval, throughput reaches **~250 TPS** per shard. The current 12s interval is tuned so a single ZK prover running batch-32 mode can keep pace with block production.
 
 ### Horizontal Scaling via Sharding
 
@@ -113,9 +113,10 @@ Persistia's shard routing (`?shard=X`) means each shard is an independent consen
 
 | Configuration | Shards | Estimated TPS |
 |--------------|--------|---------------|
-| Free tier (current) | 1 | ~10 |
-| Optimized free | 1 | ~500 |
-| Paid plan | 1 | ~1,000–3,000 |
+| Current (12s rounds, free tier) | 1 | ~42 |
+| Fast rounds (2s) | 1 | ~250 |
+| Optimized (2s + pipelining) | 1 | ~500–750 |
+| Advanced (multi-vertex) | 1 | ~1,000–3,000 |
 | Paid + 10 shards | 10 | ~10,000 |
 | Paid + 100 shards | 100 | ~100,000 |
 
@@ -184,6 +185,50 @@ Persistia ships with a live dashboard that renders the Bullshark DAG as it forms
 
 This isn't a block explorer bolted on after the fact — it's a first-class view into the consensus process. You can watch quorum form, see which validators are active, track the ZK proof chain's progress, and monitor deployed contracts. It makes the abstract concrete: you see the DAG that textbooks describe.
 
+## No Indexer Required: SQL Over the Chain
+
+Most blockchains store state in a Merkle trie optimized for proof generation, not queries. Want to find all NFTs owned by an address? All events emitted by a contract? Transaction history for a wallet? You need an **indexer** — a separate service (The Graph, Helius, Goldsky) that replays every block, denormalizes data into a queryable database, and serves it via GraphQL or REST. This adds infrastructure, cost, latency, and a trust dependency on the indexer operator.
+
+Persistia doesn't have this problem. Each validator node runs SQLite as its primary state store. The chain state *is* a relational database. And we expose it directly:
+
+```
+GET /query?q=SELECT author, COUNT(*) as vertices FROM dag_vertices GROUP BY author
+GET /query?q=SELECT * FROM contracts WHERE deployer = 'abc...'
+GET /query?q=SELECT * FROM token_balances WHERE amount != '0'
+GET /schema  -- returns all tables and indexes
+```
+
+Any `SELECT`, `PRAGMA`, or `EXPLAIN` query runs directly against the node's SQLite instance. Mutations are rejected — the query endpoint is read-only. No separate indexing service. No subgraph deployment. No sync lag.
+
+### What You Can Query
+
+| Table | Contents |
+|-------|----------|
+| `dag_vertices` | Every vertex in the DAG with author, round, events, references |
+| `dag_commits` | Committed rounds with anchor hashes and validator signatures |
+| `consensus_events` | Finalized event log with ordering and vertex attribution |
+| `contracts` | Deployed WASM contracts with deployer, hash, and bytecode |
+| `contract_state` | Key-value state for each contract |
+| `token_balances` | Token balances by address and denomination |
+| `blocks` | Game world state (block placements) |
+| `inventory` | Player inventories |
+| `zk_proofs` | ZK proof chain with block ranges and verification status |
+
+### Comparison
+
+| Query | Ethereum | Persistia |
+|-------|----------|-----------|
+| Events by contract | Deploy a subgraph, wait for sync | `SELECT * FROM consensus_events WHERE ...` |
+| NFTs owned by address | Alchemy NFT API ($) | `SELECT * FROM ownership WHERE owner_pubkey = ?` |
+| Token balance | `eth_call` + ABI decode | `SELECT * FROM token_balances WHERE address = ?` |
+| Transaction history | Etherscan API | `SELECT * FROM events WHERE pubkey = ? ORDER BY seq` |
+| Contract storage | Multicall + slot math | `SELECT * FROM contract_state WHERE contract_address = ?` |
+| Custom aggregation | Write a custom indexer | Write a SQL query |
+
+This is possible because Persistia chose SQLite over a Merkle trie as the primary state representation. The Merkle tree exists for proof generation (incremental, dirty-node tracking), but the authoritative state lives in relational tables that support arbitrary queries natively.
+
+For cross-shard aggregation — querying state across multiple independent consensus domains — you'd query each shard's `/query` endpoint and merge results client-side. Within a single shard, the node *is* the indexer.
+
 ## What's Novel
 
 To summarize what makes Persistia different from existing approaches:
@@ -193,11 +238,12 @@ To summarize what makes Persistia different from existing approaches:
 | **Infrastructure** | Cloudflare Workers + Durable Objects | Dedicated servers |
 | **Validator requirement** | Deploy a Worker | Stake tokens + run hardware |
 | **Consensus** | Bullshark DAG-BFT | Various (Tendermint, HotStuff, Nakamoto) |
-| **BFT finality** | ~60–90s (free tier), ~2–3s (paid) | 6s–12min depending on chain |
-| **Throughput** | ~10 TPS (free) to ~100k TPS (sharded paid) | 15–4000 TPS |
+| **BFT finality** | ~24–36s (12s rounds) / ~4–6s (2s rounds) | 6s–12min depending on chain |
+| **Throughput** | ~42 TPS (12s) / ~250 TPS (2s) to ~100k TPS (sharded) | 15–4000 TPS |
 | **State proofs** | SP1 STARK recursive proofs | Optional or none |
 | **Smart contracts** | WASM with fuel metering, no floats | EVM / WASM / Move |
 | **State anchoring** | Arweave + Berachain | Self-hosted or single DA layer |
+| **State queries** | SQL over HTTP (`/query`) | Requires external indexer |
 | **Token** | None (reputation-based) | Required for staking/gas |
 | **Operational cost** | Cloudflare free tier ($0) | $500–$5000+/month per validator |
 

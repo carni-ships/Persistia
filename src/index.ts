@@ -1,7 +1,7 @@
-import { PersistiaWorld } from "./PersistiaDO";
+import { PersistiaWorldV4 } from "./PersistiaDO";
 import DASHBOARD_HTML from "../client/dashboard.html";
 import GAME_HTML from "../client/game.html";
-export { PersistiaWorld };
+export { PersistiaWorldV4 };
 
 const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
@@ -102,6 +102,48 @@ export default {
       return corsResponse(JSON.stringify({
         note: "Shards are created on demand via ?shard= parameter",
         default: "global-world",
+      }));
+    }
+
+    // ─── Join network ─────────────────────────────────────────────────
+    // POST /join — External node announces itself to all seed shards.
+    // Body: { "url": "https://my-node.example.workers.dev", "shard": "node-1" }
+    // The seed nodes add the joiner as a peer, and respond with network info.
+    if (url.pathname === "/join" && request.method === "POST") {
+      const body = await request.json() as any;
+      const joinerUrl = body.url;
+      const joinerShard = body.shard || "global-world";
+      if (!joinerUrl) {
+        return corsResponse(JSON.stringify({ error: "url required (your node's public URL)" }), 400);
+      }
+
+      // Register joiner on all 3 seed shards
+      const shards = ["node-1", "node-2", "node-3"];
+      const results: any[] = [];
+      for (const seed of shards) {
+        try {
+          const seedId = env.PERSISTIA_WORLD.idFromName(seed);
+          const seedStub = env.PERSISTIA_WORLD.get(seedId);
+          const addRes = await seedStub.fetch(new Request(`${url.origin}/addNode?shard=${seed}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ url: `${joinerUrl}/?shard=${joinerShard}` }),
+          }));
+          const r = await addRes.json() as any;
+          results.push({ shard: seed, ok: r.ok ?? true });
+        } catch (e: any) {
+          results.push({ shard: seed, ok: false, error: e.message });
+        }
+      }
+
+      // Also tell the joiner about the seed nodes (reverse peering)
+      const seedUrls = shards.map(s => `${url.origin}/?shard=${s}`);
+
+      return corsResponse(JSON.stringify({
+        ok: true,
+        message: "Node registered with seed shards. Add these as your SEED_NODES.",
+        seed_nodes: seedUrls,
+        results,
       }));
     }
 

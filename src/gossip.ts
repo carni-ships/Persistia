@@ -52,7 +52,7 @@ export interface SyncResponsePayload {
 
 const MAX_PEERS = 50;
 const MAX_FAILURES = 5;          // remove peer after this many consecutive failures
-const GOSSIP_TIMEOUT_MS = 5000;
+const GOSSIP_TIMEOUT_MS = 2000;
 const DEDUP_WINDOW = 1000;       // keep last N nonces for dedup
 const PEER_EXCHANGE_INTERVAL = 3; // exchange peers every N sync cycles
 const FLOOD_CONCURRENCY = 6;     // max parallel outbound connections per flood
@@ -143,6 +143,11 @@ export class GossipManager {
     return this.getPeers().filter(p => p.failures < MAX_FAILURES);
   }
 
+  getPeerUrl(pubkey: string): string | null {
+    const rows = [...this.sql.exec("SELECT url FROM gossip_peers WHERE pubkey = ?", pubkey)] as any[];
+    return rows.length > 0 && rows[0].url ? rows[0].url : null;
+  }
+
   private markPeerSuccess(pubkey: string) {
     this.sql.exec(
       "UPDATE gossip_peers SET last_seen = ?, failures = 0 WHERE pubkey = ?",
@@ -155,11 +160,45 @@ export class GossipManager {
       "UPDATE gossip_peers SET failures = failures + 1 WHERE pubkey = ?",
       pubkey,
     );
-    // Auto-remove after too many failures
+    // Auto-remove after too many failures — but only if we have enough healthy peers
     const rows = [...this.sql.exec("SELECT failures FROM gossip_peers WHERE pubkey = ?", pubkey)] as any[];
-    if (rows.length > 0 && rows[0].failures >= MAX_FAILURES) {
+    const healthyCount = this.getHealthyPeers().length;
+    if (rows.length > 0 && rows[0].failures >= MAX_FAILURES && healthyCount >= 2) {
       this.sql.exec("DELETE FROM gossip_peers WHERE pubkey = ?", pubkey);
     }
+  }
+
+  /**
+   * Re-probe peers that have been marked as failed.
+   * Resets failure counters for peers that respond to /network.
+   * Called on startup to recover from DO restarts.
+   */
+  async reprobeFailedPeers(): Promise<number> {
+    const failedPeers = [...this.sql.exec(
+      "SELECT pubkey, url FROM gossip_peers WHERE failures >= ? AND url != ''",
+      MAX_FAILURES,
+    )] as any[];
+
+    let recovered = 0;
+    for (const peer of failedPeers) {
+      try {
+        const networkUrl = peer.url.includes("?")
+          ? peer.url.replace("?", "/network?")
+          : peer.url.replace(/\/?$/, "/network");
+        const res = await fetchWithTimeout(networkUrl, { method: "GET" }, GOSSIP_TIMEOUT_MS);
+        if (res.ok) {
+          this.sql.exec(
+            "UPDATE gossip_peers SET failures = 0, last_seen = ? WHERE pubkey = ?",
+            Date.now(), peer.pubkey,
+          );
+          recovered++;
+        }
+      } catch {
+        // Still dead
+      }
+    }
+    if (recovered > 0) console.log(`Reprobed ${recovered}/${failedPeers.length} failed peers`);
+    return recovered;
   }
 
   // ─── Envelope Construction ──────────────────────────────────────────────
@@ -282,7 +321,8 @@ export class GossipManager {
     let synced = 0;
     let peersContacted = 0;
 
-    for (const peer of peers) {
+    // Per-peer sync helper
+    const syncOnePeer = async (peer: GossipPeer): Promise<{ synced: number; contacted: boolean }> => {
       try {
         const afterRound = Math.max(0, peer.last_sync_round || (currentRound - activeWindow));
         const res = await fetchWithTimeout(
@@ -293,16 +333,16 @@ export class GossipManager {
 
         if (!res.ok) {
           this.markPeerFailure(peer.pubkey);
-          continue;
+          return { synced: 0, contacted: false };
         }
 
         const data = await res.json() as SyncResponsePayload;
-        peersContacted++;
+        let peerSynced = 0;
 
         for (const v of data.vertices || []) {
           try {
             await onVertex(v);
-            synced++;
+            peerSynced++;
           } catch {
             // skip invalid vertices
           }
@@ -313,8 +353,23 @@ export class GossipManager {
           "UPDATE gossip_peers SET last_sync_round = ?, last_seen = ?, failures = 0 WHERE pubkey = ?",
           data.latest_round || currentRound, Date.now(), peer.pubkey,
         );
+
+        return { synced: peerSynced, contacted: true };
       } catch {
         this.markPeerFailure(peer.pubkey);
+        return { synced: 0, contacted: false };
+      }
+    };
+
+    // Process peers in batches of FLOOD_CONCURRENCY
+    for (let i = 0; i < peers.length; i += FLOOD_CONCURRENCY) {
+      const batch = peers.slice(i, i + FLOOD_CONCURRENCY);
+      const results = await Promise.allSettled(batch.map(syncOnePeer));
+      for (const result of results) {
+        if (result.status === "fulfilled") {
+          synced += result.value.synced;
+          if (result.value.contacted) peersContacted++;
+        }
       }
     }
 

@@ -102,3 +102,97 @@ pub fn required_quorum(active_nodes: u32) -> u32 {
     let f = (active_nodes - 1) / 3;
     2 * f + 1
 }
+
+// ─── Client-Side Proving Types (Miden-inspired) ──────────────────────────────
+
+/// A client-side proof that a single transaction is valid.
+/// The user generates this proof locally; the block prover only verifies it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClientProofEvidence {
+    /// The transaction hash
+    pub tx_hash: Vec<u8>,
+    /// The user's public key
+    pub sender_pubkey: [u8; 32],
+    /// Pre-state root of the affected account/contract
+    pub pre_state_root: [u8; 32],
+    /// Post-state root after the transaction
+    pub post_state_root: [u8; 32],
+    /// Compressed proof bytes (SP1 compressed proof)
+    pub proof_bytes: Vec<u8>,
+    /// Public values from the client proof
+    pub public_values: Vec<u8>,
+}
+
+/// Block evidence that includes client-side proofs instead of raw mutations.
+/// Used when the block aggregator only needs to verify proofs, not re-execute.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AggregatedBlockEvidence {
+    pub block_number: u64,
+    pub new_state_root: [u8; 32],
+    /// Client proofs for individual transactions in this block
+    pub client_proofs: Vec<ClientProofEvidence>,
+    /// BFT signatures on the block
+    pub signatures: Vec<NodeSignature>,
+    pub active_nodes: u32,
+}
+
+// ─── Tree-Structured Proof Aggregation (Miden-inspired) ──────────────────────
+
+/// A node in the proof aggregation tree.
+/// Leaf nodes contain block proofs; internal nodes aggregate children.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AggregationTreeNode {
+    /// Tree level: 0 = leaf (individual block proof), higher = aggregation
+    pub level: u32,
+    /// Block range covered by this node
+    pub block_start: u64,
+    pub block_end: u64,
+    /// State root at the end of this node's range
+    pub state_root: [u8; 32],
+    /// Number of blocks proven by this subtree
+    pub proven_blocks: u64,
+    /// Left child hash (for verification)
+    pub left_child_hash: Option<Vec<u8>>,
+    /// Right child hash (for verification)
+    pub right_child_hash: Option<Vec<u8>>,
+}
+
+/// Input for tree-structured proof aggregation.
+/// The prover combines two child proofs into one parent proof.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TreeAggregationInput {
+    /// Left subtree's output (block range + state root)
+    pub left: AggregationTreeNode,
+    /// Right subtree's output (block range + state root)
+    pub right: AggregationTreeNode,
+    /// Whether to recursively verify child proofs
+    pub verify_children: bool,
+    /// Left child proof's public values
+    pub left_public_values: Vec<u8>,
+    /// Right child proof's public values
+    pub right_public_values: Vec<u8>,
+}
+
+// ─── Sparse Merkle Tree Proof Types (Urkel-inspired) ─────────────────────────
+
+/// A sparse Merkle proof that supports both inclusion and non-inclusion.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SparseMerkleProof {
+    pub key: Vec<u8>,
+    pub value: Option<Vec<u8>>,    // None for non-inclusion proofs
+    pub siblings: Vec<[u8; 32]>,
+    pub directions: Vec<u8>,       // 0 = left, 1 = right
+    pub root: [u8; 32],
+    pub inclusion: bool,
+    /// For non-inclusion: the closest existing key at the divergence point
+    pub closest_key: Option<Vec<u8>>,
+    pub diverge_depth: Option<u32>,
+}
+
+/// Nullifier for cross-shard note consumption (append-only, ZK-friendly).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NullifierEntry {
+    pub nullifier: [u8; 32],
+    pub note_id: Vec<u8>,
+    pub consumed_by: [u8; 32],
+}

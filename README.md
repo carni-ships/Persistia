@@ -4,12 +4,13 @@ A decentralized BFT consensus ledger running on Cloudflare Workers with zero-kno
 
 ## Architecture
 
-- **Consensus**: Bullshark DAG-based BFT with 30s rounds, quorum-gated advancement, leader-based commit rule
+- **Consensus**: Bullshark DAG-based BFT with 12s rounds, quorum-gated advancement, leader-based commit rule
 - **Infrastructure**: Cloudflare Workers + Durable Objects — each validator is a DO shard
 - **Smart Contracts**: WASM runtime with register-based ABI, fuel metering, float ban, cross-contract calls
 - **ZK Proofs**: SP1 STARK recursive proof chain with batch proving (up to 32 blocks per proof)
-- **Anchoring**: Dual-layer to Arweave (via Irys) and Celestia simultaneously
+- **Anchoring**: Dual-layer to Arweave (via Irys) and Berachain (EVM L1)
 - **Wallet**: Ed25519 keys with Bech32 addresses (`persistia1...`), token transfers, nonce-based replay protection
+- **MPP**: Machine Payment Protocol (HTTP 402) for paid API access
 
 ## Quick Start
 
@@ -37,11 +38,15 @@ Consensus activates automatically when 3+ nodes are registered and producing ver
 
 ### Dashboard
 
-Open `client/dashboard.html` and point it at your node URL. Shows real-time DAG visualization, validator status, ZK proof progress, and contract deployments.
+Visit `https://your-worker.workers.dev/dashboard?shard=node-1` for real-time DAG visualization, validator status, ZK proof progress, and contract deployments.
 
 ### Wallet
 
-Open `client/wallet.html` to manage Ed25519 keys, view balances, and send token transfers. Use the faucet endpoint to get test tokens.
+Visit `https://your-worker.workers.dev/wallet` to manage Ed25519 keys, view balances, and send token transfers. Use the faucet endpoint to get test tokens.
+
+### Join an Existing Network
+
+See [`join/README.md`](join/README.md) to deploy your own validator node and connect to the live network.
 
 ## Project Structure
 
@@ -55,7 +60,8 @@ src/
   contract-executor.ts    # WASM smart contract runtime
   state-proofs.ts         # Incremental Merkle tree and state commitments
   anchoring.ts            # Arweave + Celestia state anchoring
-  cross-shard.ts          # Cross-shard message relay
+  cross-shard.ts          # Cross-shard message relay (notes + nullifiers)
+  mpp.ts                  # Machine Payment Protocol (HTTP 402)
   oracle.ts               # Decentralized oracle with multi-node aggregation
   triggers.ts             # Scheduled contract execution (cron)
   validator-registry.ts   # PoW-based Sybil resistance and reputation tracking
@@ -76,6 +82,11 @@ contracts/
     program/              # SP1 guest program (what the proof verifies)
     prover/               # SP1 prover binary (generates proofs)
     types/                # Shared Rust types for ZK system
+
+join/
+  README.md               # How to join the network
+  setup.sh                # Automated node setup script
+  wrangler.toml           # Wrangler config for external nodes
 
 blog/
   introducing-persistia.md  # Technical blog post
@@ -104,6 +115,15 @@ blog/
 | `/gossip/sync` | GET | Pull vertices from peer |
 | `/anchor/latest` | GET | Latest state anchor |
 | `/network` | GET | Node identity and capabilities |
+| `/join` | POST | Register an external node with seed shards |
+| `/validator/register` | POST | Register as validator (with PoW) |
+| `/validator/list` | GET | Active validators and quorum info |
+| `/mpp/info` | GET | Payment requirements for protected routes |
+| `/mpp/receipts?payer=X` | GET | Payment receipts for an address |
+| `/headers/latest` | GET | Latest light client block header |
+| `/notes/create` | POST | Create a cross-shard note |
+| `/notes/consume` | POST | Consume a note (with nullifier) |
+| `/covenant/create` | POST | Create a covenant state machine |
 
 ## Smart Contracts
 

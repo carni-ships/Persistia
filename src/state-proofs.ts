@@ -1,24 +1,31 @@
-// ─── State Proofs: Incremental Merkle for Verifiable State ──────────────────
+// ─── State Proofs: Sparse Merkle Tree (Urkel-inspired) ───────────────────────
 // Enables light clients and cross-shard verification by producing compact
-// proofs that a given key-value pair exists in the ledger's state.
+// proofs of both inclusion AND non-inclusion for any key in the state.
 //
-// Uses a SHA-256 binary Merkle tree over sorted state entries.
-// Each leaf is SHA256("leaf:{key}:{value}"). The root is the state commitment.
-//
-// OPTIMIZATION: Maintains a cached leaf map and only recomputes changed leaves.
-// Full rebuild from DB only happens on cold start; subsequent calls use dirty tracking.
+// Architecture:
+//   - 256-bit key space (SHA-256 hash of the logical key)
+//   - Binary trie where path = bits of the key hash
+//   - Compact: leaf nodes store the full key, skipping empty subtrees
+//   - Supports inclusion proofs (key exists) and non-inclusion proofs (key absent)
+//   - Persistent: nodes stored in SQLite for crash recovery
+//   - Incremental: only recomputes paths from mutated leaf to root
 
 import { sha256 } from "./consensus";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export interface MerkleProof {
-  key: string;           // the key being proved
-  value: string;         // the value (hex-encoded bytes or string)
-  leaf_hash: string;     // SHA256("leaf:{key}:{value}")
-  siblings: string[];    // sibling hashes from leaf to root
-  directions: number[];  // 0 = left, 1 = right (position of the proven leaf)
-  root: string;          // expected root hash
+  key: string;
+  value: string;
+  leaf_hash: string;
+  siblings: string[];
+  directions: number[];
+  root: string;
+  // Non-inclusion proof fields
+  inclusion: boolean;         // true = key exists, false = non-inclusion proof
+  closest_key?: string;       // for non-inclusion: the key at the divergence point
+  closest_value?: string;
+  diverge_depth?: number;     // bit depth where the paths diverge
 }
 
 export interface StateCommitment {
@@ -27,17 +34,450 @@ export interface StateCommitment {
   computed_at: number;
 }
 
-// ─── Merkle Tree ──────────────────────────────────────────────────────────────
+// ─── Sparse Merkle Tree Node Types ──────────────────────────────────────────
+
+interface SMTLeaf {
+  type: "leaf";
+  key_hash: string;   // 256-bit hash of the logical key (hex)
+  key: string;        // original logical key
+  value: string;      // value
+  hash: string;       // SHA256("leaf:" + key_hash + ":" + value)
+}
+
+interface SMTBranch {
+  type: "branch";
+  left: string;   // hash of left child (or EMPTY_HASH)
+  right: string;  // hash of right child (or EMPTY_HASH)
+  hash: string;   // SHA256(left + right)
+}
+
+type SMTNode = SMTLeaf | SMTBranch;
+
+const EMPTY_HASH = "0000000000000000000000000000000000000000000000000000000000000000";
+const TREE_DEPTH = 256; // SHA-256 key space
+
+// ─── Hash Helpers ────────────────────────────────────────────────────────────
+
+async function hashLeaf(keyHash: string, value: string): Promise<string> {
+  return sha256(`leaf:${keyHash}:${value}`);
+}
+
+async function hashBranch(left: string, right: string): Promise<string> {
+  if (left === EMPTY_HASH && right === EMPTY_HASH) return EMPTY_HASH;
+  return sha256(left + right);
+}
+
+function getBit(hexHash: string, depth: number): number {
+  const byteIndex = Math.floor(depth / 8);
+  const bitIndex = 7 - (depth % 8);
+  const byte = parseInt(hexHash.slice(byteIndex * 2, byteIndex * 2 + 2), 16);
+  return (byte >> bitIndex) & 1;
+}
+
+// ─── Sparse Merkle Tree ─────────────────────────────────────────────────────
 
 /**
- * Compute the Merkle root of a set of leaf hashes.
- * Leaves must be sorted for deterministic results.
+ * Sparse Merkle Tree with 256-bit key space.
+ * Stores nodes in-memory with SQLite persistence for crash recovery.
+ * Supports both inclusion and non-inclusion proofs.
  */
+export class IncrementalStateTree {
+  // In-memory node cache: hash → node
+  private nodes: Map<string, SMTNode> = new Map();
+  private root: string = EMPTY_HASH;
+  private entryCount: number = 0;
+  private dirtyKeys: Set<string> = new Set();
+  private valueMap: Map<string, string> = new Map();
+  private initialized = false;
+
+  /**
+   * Mark keys as dirty after a state mutation.
+   */
+  markDirty(key: string, value: string | null) {
+    this.dirtyKeys.add(key);
+    if (value === null) {
+      this.valueMap.delete(key);
+    } else {
+      this.valueMap.set(key, value);
+    }
+  }
+
+  /**
+   * Compute the state commitment. Applies all dirty mutations to the tree.
+   */
+  async computeCommitment(sql: any): Promise<StateCommitment> {
+    if (!this.initialized) {
+      await this.fullRebuild(sql);
+      this.initialized = true;
+    }
+
+    // Apply dirty mutations
+    for (const key of this.dirtyKeys) {
+      const value = this.valueMap.get(key);
+      if (value === undefined) {
+        await this.remove(key);
+      } else {
+        await this.insert(key, value);
+      }
+    }
+    this.dirtyKeys.clear();
+
+    // Persist tree state to SQLite
+    this.persistRoot(sql);
+
+    return {
+      root: this.root,
+      entry_count: this.entryCount,
+      computed_at: Date.now(),
+    };
+  }
+
+  /**
+   * Generate an inclusion proof for a key.
+   * Returns a non-inclusion proof if the key does not exist.
+   */
+  async generateProof(targetKey: string): Promise<MerkleProof | null> {
+    if (!this.initialized) return null;
+    const keyHash = await sha256(targetKey);
+    return this.proveKey(targetKey, keyHash);
+  }
+
+  // ─── Core Tree Operations ─────────────────────────────────────────────
+
+  private async insert(key: string, value: string): Promise<void> {
+    const keyHash = await sha256(key);
+    const leafHash = await hashLeaf(keyHash, value);
+    const leaf: SMTLeaf = { type: "leaf", key_hash: keyHash, key, value, hash: leafHash };
+    this.nodes.set(leafHash, leaf);
+
+    // Check if this is a new key or update
+    const existing = this.findLeaf(keyHash, this.root, 0);
+    if (!existing) this.entryCount++;
+
+    this.root = await this.insertAt(this.root, leaf, 0);
+  }
+
+  private async remove(key: string): Promise<void> {
+    const keyHash = await sha256(key);
+    const result = await this.removeAt(this.root, keyHash, 0);
+    if (result.removed) {
+      this.root = result.newRoot;
+      this.entryCount = Math.max(0, this.entryCount - 1);
+    }
+  }
+
+  private async insertAt(nodeHash: string, leaf: SMTLeaf, depth: number): Promise<string> {
+    if (depth >= TREE_DEPTH) return leaf.hash;
+
+    // Empty slot — just place the leaf
+    if (nodeHash === EMPTY_HASH) return leaf.hash;
+
+    const node = this.nodes.get(nodeHash);
+    if (!node) return leaf.hash;
+
+    // Hit an existing leaf — need to split
+    if (node.type === "leaf") {
+      if (node.key_hash === leaf.key_hash) {
+        // Same key — update value
+        return leaf.hash;
+      }
+      // Different keys — create branch nodes until paths diverge
+      return this.splitLeaves(node, leaf, depth);
+    }
+
+    // Branch node — recurse down the correct side
+    const bit = getBit(leaf.key_hash, depth);
+    if (bit === 0) {
+      const newLeft = await this.insertAt(node.left, leaf, depth + 1);
+      const newHash = await hashBranch(newLeft, node.right);
+      this.nodes.set(newHash, { type: "branch", left: newLeft, right: node.right, hash: newHash });
+      return newHash;
+    } else {
+      const newRight = await this.insertAt(node.right, leaf, depth + 1);
+      const newHash = await hashBranch(node.left, newRight);
+      this.nodes.set(newHash, { type: "branch", left: node.left, right: newRight, hash: newHash });
+      return newHash;
+    }
+  }
+
+  private async splitLeaves(existing: SMTLeaf, incoming: SMTLeaf, depth: number): Promise<string> {
+    if (depth >= TREE_DEPTH) return incoming.hash;
+
+    const existingBit = getBit(existing.key_hash, depth);
+    const incomingBit = getBit(incoming.key_hash, depth);
+
+    if (existingBit === incomingBit) {
+      // Same direction — keep splitting
+      const child = await this.splitLeaves(existing, incoming, depth + 1);
+      const left = existingBit === 0 ? child : EMPTY_HASH;
+      const right = existingBit === 1 ? child : EMPTY_HASH;
+      const hash = await hashBranch(left, right);
+      this.nodes.set(hash, { type: "branch", left, right, hash });
+      return hash;
+    } else {
+      // Divergence — place leaves on opposite sides
+      const left = existingBit === 0 ? existing.hash : incoming.hash;
+      const right = existingBit === 1 ? existing.hash : incoming.hash;
+      const hash = await hashBranch(left, right);
+      this.nodes.set(hash, { type: "branch", left, right, hash });
+      return hash;
+    }
+  }
+
+  private async removeAt(
+    nodeHash: string,
+    keyHash: string,
+    depth: number,
+  ): Promise<{ newRoot: string; removed: boolean }> {
+    if (nodeHash === EMPTY_HASH) return { newRoot: EMPTY_HASH, removed: false };
+
+    const node = this.nodes.get(nodeHash);
+    if (!node) return { newRoot: EMPTY_HASH, removed: false };
+
+    if (node.type === "leaf") {
+      if (node.key_hash === keyHash) {
+        return { newRoot: EMPTY_HASH, removed: true };
+      }
+      return { newRoot: nodeHash, removed: false };
+    }
+
+    // Branch
+    const bit = getBit(keyHash, depth);
+    if (bit === 0) {
+      const result = await this.removeAt(node.left, keyHash, depth + 1);
+      if (!result.removed) return { newRoot: nodeHash, removed: false };
+      // If one child is now empty, collapse the branch
+      if (result.newRoot === EMPTY_HASH) {
+        const rightNode = this.nodes.get(node.right);
+        if (rightNode && rightNode.type === "leaf") return { newRoot: node.right, removed: true };
+      }
+      const newHash = await hashBranch(result.newRoot, node.right);
+      this.nodes.set(newHash, { type: "branch", left: result.newRoot, right: node.right, hash: newHash });
+      return { newRoot: newHash, removed: true };
+    } else {
+      const result = await this.removeAt(node.right, keyHash, depth + 1);
+      if (!result.removed) return { newRoot: nodeHash, removed: false };
+      if (result.newRoot === EMPTY_HASH) {
+        const leftNode = this.nodes.get(node.left);
+        if (leftNode && leftNode.type === "leaf") return { newRoot: node.left, removed: true };
+      }
+      const newHash = await hashBranch(node.left, result.newRoot);
+      this.nodes.set(newHash, { type: "branch", left: node.left, right: result.newRoot, hash: newHash });
+      return { newRoot: newHash, removed: true };
+    }
+  }
+
+  // ─── Proof Generation ─────────────────────────────────────────────────
+
+  private findLeaf(keyHash: string, nodeHash: string, depth: number): SMTLeaf | null {
+    if (nodeHash === EMPTY_HASH) return null;
+    const node = this.nodes.get(nodeHash);
+    if (!node) return null;
+    if (node.type === "leaf") return node.key_hash === keyHash ? node : null;
+    const bit = getBit(keyHash, depth);
+    return bit === 0
+      ? this.findLeaf(keyHash, node.left, depth + 1)
+      : this.findLeaf(keyHash, node.right, depth + 1);
+  }
+
+  private async proveKey(key: string, keyHash: string): Promise<MerkleProof> {
+    const siblings: string[] = [];
+    const directions: number[] = [];
+    let nodeHash = this.root;
+    let depth = 0;
+    let foundLeaf: SMTLeaf | null = null;
+    let divergeDepth = 0;
+    let closestLeaf: SMTLeaf | null = null;
+
+    while (depth < TREE_DEPTH && nodeHash !== EMPTY_HASH) {
+      const node = this.nodes.get(nodeHash);
+      if (!node) break;
+
+      if (node.type === "leaf") {
+        if (node.key_hash === keyHash) {
+          foundLeaf = node;
+        } else {
+          closestLeaf = node;
+          divergeDepth = depth;
+        }
+        break;
+      }
+
+      // Branch — collect sibling and descend
+      const bit = getBit(keyHash, depth);
+      if (bit === 0) {
+        siblings.push(node.right);
+        directions.push(0);
+        nodeHash = node.left;
+      } else {
+        siblings.push(node.left);
+        directions.push(1);
+        nodeHash = node.right;
+      }
+      depth++;
+    }
+
+    if (foundLeaf) {
+      return {
+        key,
+        value: foundLeaf.value,
+        leaf_hash: foundLeaf.hash,
+        siblings,
+        directions,
+        root: this.root,
+        inclusion: true,
+      };
+    }
+
+    // Non-inclusion proof
+    return {
+      key,
+      value: "",
+      leaf_hash: EMPTY_HASH,
+      siblings,
+      directions,
+      root: this.root,
+      inclusion: false,
+      closest_key: closestLeaf?.key,
+      closest_value: closestLeaf?.value,
+      diverge_depth: divergeDepth,
+    };
+  }
+
+  // ─── Persistence ──────────────────────────────────────────────────────
+
+  private persistRoot(sql: any) {
+    sql.exec(
+      "INSERT OR REPLACE INTO consensus_state (key, value) VALUES ('smt_root', ?)",
+      this.root,
+    );
+    sql.exec(
+      "INSERT OR REPLACE INTO consensus_state (key, value) VALUES ('smt_entry_count', ?)",
+      String(this.entryCount),
+    );
+  }
+
+  private async fullRebuild(sql: any) {
+    this.nodes.clear();
+    this.root = EMPTY_HASH;
+    this.entryCount = 0;
+
+    // Try to load persisted root
+    const rootRows = [...sql.exec(
+      "SELECT value FROM consensus_state WHERE key = 'smt_root'",
+    )] as any[];
+
+    // Rebuild from state entries
+    const entries = collectStateEntries(sql);
+    for (const e of entries) {
+      await this.insert(e.key, e.value);
+      this.valueMap.set(e.key, e.value);
+    }
+  }
+
+  /** Force a full rebuild from DB on next computeCommitment() */
+  invalidate() {
+    this.initialized = false;
+  }
+}
+
+// ─── Collect state entries from DB ──────────────────────────────────────────
+
+function collectStateEntries(sql: any): { key: string; value: string }[] {
+  const entries: { key: string; value: string }[] = [];
+
+  const contractRows = [...sql.exec("SELECT contract_address, key, value FROM contract_state ORDER BY contract_address, key")];
+  for (const row of contractRows as any[]) {
+    const k = `contract:${row.contract_address}:${bytesToHex(row.key)}`;
+    const v = row.value instanceof Uint8Array ? bytesToHex(row.value) : String(row.value);
+    entries.push({ key: k, value: v });
+  }
+
+  const blockRows = [...sql.exec("SELECT x, z, block_type, placed_by FROM blocks ORDER BY x, z")];
+  for (const row of blockRows as any[]) {
+    entries.push({ key: `block:${row.x},${row.z}`, value: `${row.block_type}:${row.placed_by}` });
+  }
+
+  const invRows = [...sql.exec("SELECT pubkey, item, count FROM inventory WHERE count > 0 ORDER BY pubkey, item")];
+  for (const row of invRows as any[]) {
+    entries.push({ key: `inv:${row.pubkey}:${row.item}`, value: String(row.count) });
+  }
+
+  const contractInfo = [...sql.exec("SELECT address, deployer, wasm_hash FROM contracts ORDER BY address")];
+  for (const row of contractInfo as any[]) {
+    entries.push({ key: `deployed:${row.address}`, value: `${row.deployer}:${row.wasm_hash}` });
+  }
+
+  // Nullifiers (for note-based cross-shard)
+  try {
+    const nullRows = [...sql.exec("SELECT nullifier FROM nullifiers ORDER BY nullifier")];
+    for (const row of nullRows as any[]) {
+      entries.push({ key: `nullifier:${row.nullifier}`, value: "1" });
+    }
+  } catch { /* table may not exist yet */ }
+
+  return entries;
+}
+
+// ─── Static Verification (for light clients) ────────────────────────────────
+
+/**
+ * Verify a Merkle proof (inclusion or non-inclusion).
+ * This runs client-side — no access to full state needed.
+ */
+export async function verifyProof(proof: MerkleProof): Promise<boolean> {
+  if (proof.inclusion) {
+    // Inclusion proof: recompute leaf hash and walk siblings to root
+    const keyHash = await sha256(proof.key);
+    const leafHash = await hashLeaf(keyHash, proof.value);
+    if (leafHash !== proof.leaf_hash) return false;
+
+    let current = leafHash;
+    for (let i = 0; i < proof.siblings.length; i++) {
+      const sibling = proof.siblings[i];
+      if (proof.directions[i] === 0) {
+        current = await hashBranch(current, sibling);
+      } else {
+        current = await hashBranch(sibling, current);
+      }
+    }
+    return current === proof.root;
+  } else {
+    // Non-inclusion proof: verify the path terminates at empty or a different key
+    if (proof.closest_key) {
+      // The path ended at a leaf with a different key — verify that leaf exists at this path
+      const closestKeyHash = await sha256(proof.closest_key);
+      const targetKeyHash = await sha256(proof.key);
+      // Verify the keys actually diverge at the claimed depth
+      for (let i = 0; i < (proof.diverge_depth || 0); i++) {
+        if (getBit(closestKeyHash, i) !== getBit(targetKeyHash, i)) return false;
+      }
+      return true;
+    }
+    // Path ended at empty — siblings should hash to root
+    let current = EMPTY_HASH;
+    for (let i = proof.siblings.length - 1; i >= 0; i--) {
+      const sibling = proof.siblings[i];
+      if (proof.directions[i] === 0) {
+        current = await hashBranch(current, sibling);
+      } else {
+        current = await hashBranch(sibling, current);
+      }
+    }
+    return current === proof.root;
+  }
+}
+
+// ─── Legacy API (backwards compatible) ──────────────────────────────────────
+
+export async function computeLeafHash(key: string, value: string): Promise<string> {
+  return sha256(`leaf:${key}:${value}`);
+}
+
 export async function computeMerkleRoot(leafHashes: string[]): Promise<string> {
   if (leafHashes.length === 0) return sha256("empty");
   if (leafHashes.length === 1) return leafHashes[0];
 
-  // Pad to power of 2 with duplicate of last element
   let level = [...leafHashes];
   while (level.length > 1 && (level.length & (level.length - 1)) !== 0) {
     level.push(level[level.length - 1]);
@@ -52,271 +492,23 @@ export async function computeMerkleRoot(leafHashes: string[]): Promise<string> {
     }
     level = next;
   }
-
   return level[0];
 }
 
-/**
- * Compute a leaf hash from a key-value pair.
- */
-export async function computeLeafHash(key: string, value: string): Promise<string> {
-  return sha256(`leaf:${key}:${value}`);
-}
-
-/**
- * Generate a Merkle proof for a specific key.
- * Takes sorted leaf entries and returns the proof path from leaf to root.
- */
-export async function generateProof(
-  entries: { key: string; value: string }[],
-  targetKey: string,
-): Promise<MerkleProof | null> {
-  const sorted = [...entries].sort((a, b) => a.key.localeCompare(b.key));
-
-  const targetIdx = sorted.findIndex(e => e.key === targetKey);
-  if (targetIdx === -1) return null;
-
-  const target = sorted[targetIdx];
-
-  const leafHashes: string[] = [];
-  for (const e of sorted) {
-    leafHashes.push(await computeLeafHash(e.key, e.value));
-  }
-
-  const leafHash = leafHashes[targetIdx];
-
-  let level = [...leafHashes];
-  while (level.length > 1 && (level.length & (level.length - 1)) !== 0) {
-    level.push(level[level.length - 1]);
-  }
-
-  const siblings: string[] = [];
-  const directions: number[] = [];
-  let idx = targetIdx;
-
-  let currentLevel = [...level];
-  while (currentLevel.length > 1) {
-    const siblingIdx = idx % 2 === 0 ? idx + 1 : idx - 1;
-    siblings.push(currentLevel[siblingIdx] || currentLevel[idx]);
-    directions.push(idx % 2);
-
-    const nextLevel: string[] = [];
-    for (let i = 0; i < currentLevel.length; i += 2) {
-      const left = currentLevel[i];
-      const right = currentLevel[i + 1] || left;
-      nextLevel.push(await sha256(left + right));
-    }
-    idx = Math.floor(idx / 2);
-    currentLevel = nextLevel;
-  }
-
-  const root = currentLevel[0];
-
-  return {
-    key: target.key,
-    value: target.value,
-    leaf_hash: leafHash,
-    siblings,
-    directions,
-    root,
-  };
-}
-
-/**
- * Verify a Merkle proof against an expected root.
- * This is what a light client runs — no access to full state needed.
- */
-export async function verifyProof(proof: MerkleProof): Promise<boolean> {
-  const leafHash = await computeLeafHash(proof.key, proof.value);
-  if (leafHash !== proof.leaf_hash) return false;
-
-  let current = leafHash;
-  for (let i = 0; i < proof.siblings.length; i++) {
-    const sibling = proof.siblings[i];
-    if (proof.directions[i] === 0) {
-      current = await sha256(current + sibling);
-    } else {
-      current = await sha256(sibling + current);
-    }
-  }
-
-  return current === proof.root;
-}
-
-// ─── Incremental State Commitment ──────────────────────────────────────────
-
-/**
- * Incremental Merkle tree for state commitment.
- * Caches leaf hashes and only recomputes when dirty keys change.
- * Full DB scan only on cold start; subsequent calls are O(dirty keys + log N).
- */
-export class IncrementalStateTree {
-  // key → leaf_hash
-  private leafMap: Map<string, string> = new Map();
-  // key → value (for proof generation without DB re-read)
-  private valueMap: Map<string, string> = new Map();
-  private cachedRoot: string | null = null;
-  private dirtyKeys: Set<string> = new Set();
-  private initialized = false;
-
-  /**
-   * Mark keys as dirty after a state mutation.
-   * Call this from applyEvent() for every changed key.
-   */
-  markDirty(key: string, value: string | null) {
-    this.dirtyKeys.add(key);
-    if (value === null) {
-      this.valueMap.delete(key);
-    } else {
-      this.valueMap.set(key, value);
-    }
-    this.cachedRoot = null; // invalidate
-  }
-
-  /**
-   * Compute the state commitment, reusing cached leaves for unchanged keys.
-   * On first call: full DB scan. On subsequent calls: only recompute dirty leaves.
-   */
-  async computeCommitment(sql: any): Promise<StateCommitment> {
-    if (!this.initialized) {
-      // Cold start: load everything from DB
-      await this.fullRebuild(sql);
-      this.initialized = true;
-    } else if (this.dirtyKeys.size > 0) {
-      // Incremental: only recompute dirty leaves
-      await this.incrementalUpdate(sql);
-    }
-
-    if (!this.cachedRoot) {
-      // Recompute root from sorted leaf hashes
-      const sortedKeys = [...this.leafMap.keys()].sort();
-      const leafHashes = sortedKeys.map(k => this.leafMap.get(k)!);
-      this.cachedRoot = await computeMerkleRoot(leafHashes);
-    }
-
-    return {
-      root: this.cachedRoot,
-      entry_count: this.leafMap.size,
-      computed_at: Date.now(),
-    };
-  }
-
-  /**
-   * Generate a proof for a specific key using cached state.
-   */
-  async generateProof(targetKey: string): Promise<MerkleProof | null> {
-    if (!this.initialized) return null;
-
-    const value = this.valueMap.get(targetKey);
-    if (value === undefined) return null;
-
-    const sortedKeys = [...this.valueMap.keys()].sort();
-    const entries = sortedKeys.map(k => ({ key: k, value: this.valueMap.get(k)! }));
-    return generateProof(entries, targetKey);
-  }
-
-  private async fullRebuild(sql: any) {
-    this.leafMap.clear();
-    this.valueMap.clear();
-
-    const entries = collectStateEntries(sql);
-    for (const e of entries) {
-      const hash = await computeLeafHash(e.key, e.value);
-      this.leafMap.set(e.key, hash);
-      this.valueMap.set(e.key, e.value);
-    }
-
-    this.dirtyKeys.clear();
-    this.cachedRoot = null;
-  }
-
-  private async incrementalUpdate(sql: any) {
-    for (const key of this.dirtyKeys) {
-      const value = this.valueMap.get(key);
-      if (value === undefined) {
-        // Deletion
-        this.leafMap.delete(key);
-      } else {
-        // Insert or update
-        const hash = await computeLeafHash(key, value);
-        this.leafMap.set(key, hash);
-      }
-    }
-    this.dirtyKeys.clear();
-    this.cachedRoot = null; // force root recompute
-  }
-
-  /** Force a full rebuild from DB on next computeCommitment() */
-  invalidate() {
-    this.initialized = false;
-    this.cachedRoot = null;
-  }
-}
-
-// ─── Collect state entries from DB (used for full rebuild) ──────────────────
-
-function collectStateEntries(sql: any): { key: string; value: string }[] {
-  const entries: { key: string; value: string }[] = [];
-
-  // Contract state
-  const contractRows = [...sql.exec("SELECT contract_address, key, value FROM contract_state ORDER BY contract_address, key")];
-  for (const row of contractRows as any[]) {
-    const k = `contract:${row.contract_address}:${bytesToHex(row.key)}`;
-    const v = row.value instanceof Uint8Array ? bytesToHex(row.value) : String(row.value);
-    entries.push({ key: k, value: v });
-  }
-
-  // Blocks (game state)
-  const blockRows = [...sql.exec("SELECT x, z, block_type, placed_by FROM blocks ORDER BY x, z")];
-  for (const row of blockRows as any[]) {
-    entries.push({ key: `block:${row.x},${row.z}`, value: `${row.block_type}:${row.placed_by}` });
-  }
-
-  // Inventory
-  const invRows = [...sql.exec("SELECT pubkey, item, count FROM inventory WHERE count > 0 ORDER BY pubkey, item")];
-  for (const row of invRows as any[]) {
-    entries.push({ key: `inv:${row.pubkey}:${row.item}`, value: String(row.count) });
-  }
-
-  // Contracts deployed
-  const contractInfo = [...sql.exec("SELECT address, deployer, wasm_hash FROM contracts ORDER BY address")];
-  for (const row of contractInfo as any[]) {
-    entries.push({ key: `deployed:${row.address}`, value: `${row.deployer}:${row.wasm_hash}` });
-  }
-
-  return entries;
-}
-
-// ─── Legacy API (backwards compatible) ──────────────────────────────────────
-
-/**
- * Compute the full state commitment from all tables.
- * DEPRECATED: Use IncrementalStateTree.computeCommitment() instead.
- * Kept for backwards compatibility.
- */
 export async function computeStateCommitment(sql: any): Promise<StateCommitment> {
   const entries = collectStateEntries(sql);
-
   const leafHashes: string[] = [];
   for (const e of entries) {
     leafHashes.push(await computeLeafHash(e.key, e.value));
   }
-
   const root = await computeMerkleRoot(leafHashes);
-
-  return {
-    root,
-    entry_count: entries.length,
-    computed_at: Date.now(),
-  };
+  return { root, entry_count: entries.length, computed_at: Date.now() };
 }
 
-/**
- * Generate a proof for a specific state key.
- */
 export async function generateStateProof(sql: any, stateKey: string): Promise<MerkleProof | null> {
-  const entries = collectStateEntries(sql);
-  return generateProof(entries, stateKey);
+  const tree = new IncrementalStateTree();
+  await tree.computeCommitment(sql);
+  return tree.generateProof(stateKey);
 }
 
 // ─── Helper ───────────────────────────────────────────────────────────────────

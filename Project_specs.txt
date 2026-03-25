@@ -1,5 +1,5 @@
 **Persistia Ledger Specification**  
-**Version:** 0.2 (Ledger-only, game-agnostic)  
+**Version:** 0.7.0  
 **Date:** March 24, 2026  
 **Purpose:** A decentralized, Mina-style succinct ledger for persistent shared state (voxel worlds, asset ownership, transfers, and simple programmable rules). Runs across independent Cloudflare accounts with no single point of failure.
 

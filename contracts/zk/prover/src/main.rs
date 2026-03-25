@@ -99,6 +99,10 @@ enum Commands {
         /// Batch N blocks into one proof for amortized proving cost
         #[arg(long, default_value = "1")]
         batch: u64,
+
+        /// Start proving from this block (skip earlier blocks)
+        #[arg(long, default_value = "0")]
+        start: u64,
     },
 
     /// Verify a proof locally
@@ -117,6 +121,111 @@ enum Commands {
         /// Block/round number
         #[arg(long)]
         block: u64,
+    },
+
+    // ─── Multi-Prover Architecture Commands ─────────────────────────────
+
+    /// Prove a segment of blocks without chaining (Option 1: Segmented Proving)
+    Segment {
+        /// Persistia node URL
+        #[arg(long, default_value = "http://localhost:8787")]
+        node: String,
+
+        /// First block in segment
+        #[arg(long)]
+        start: u64,
+
+        /// Last block in segment (inclusive)
+        #[arg(long)]
+        end: u64,
+
+        /// Output directory for segment proofs
+        #[arg(long, default_value = "./segments")]
+        output_dir: PathBuf,
+    },
+
+    /// Merge multiple segment proofs into a single chained proof (Option 1: Segmented Proving)
+    Merge {
+        /// Directory containing segment proofs to merge
+        #[arg(long, default_value = "./segments")]
+        segment_dir: PathBuf,
+
+        /// Output path for the merged proof
+        #[arg(long, default_value = "merged.proof")]
+        output: PathBuf,
+
+        /// Optional previous proof to chain from
+        #[arg(long)]
+        prev_proof: Option<PathBuf>,
+    },
+
+    /// Assemble execution proofs into a recursive IVC chain (Option 2: Pipeline Proving)
+    Stitch {
+        /// Directory containing execution proofs (block_N.exec files)
+        #[arg(long, default_value = "./exec_proofs")]
+        exec_dir: PathBuf,
+
+        /// Directory to write chained proofs
+        #[arg(long, default_value = "./proofs")]
+        proof_dir: PathBuf,
+
+        /// Persistia node URL (for submitting completed proofs)
+        #[arg(long, default_value = "http://localhost:8787")]
+        node: String,
+
+        /// Optional previous chained proof to resume from
+        #[arg(long)]
+        prev_proof: Option<PathBuf>,
+    },
+
+    /// Watch node using claim-based coordination (Option 4: Multi-Prover Claims)
+    WatchClaim {
+        /// Persistia node URL
+        #[arg(long, default_value = "http://localhost:8787")]
+        node: String,
+
+        /// Unique prover identifier
+        #[arg(long)]
+        prover_id: String,
+
+        /// Directory to store proofs
+        #[arg(long, default_value = "./proofs")]
+        proof_dir: PathBuf,
+
+        /// Poll interval in seconds
+        #[arg(long, default_value = "10")]
+        interval: u64,
+
+        /// Number of blocks to claim per batch
+        #[arg(long, default_value = "1")]
+        batch: u64,
+
+        /// Claim TTL in seconds (how long before claim expires)
+        #[arg(long, default_value = "300")]
+        ttl: u64,
+    },
+
+    /// Tree-structured proof aggregation (Miden-inspired parallel proving)
+    TreeProve {
+        /// Persistia node URL
+        #[arg(long, default_value = "http://localhost:8787")]
+        node: String,
+
+        /// Directory for leaf proofs and aggregated proofs
+        #[arg(long, default_value = "./tree_proofs")]
+        proof_dir: PathBuf,
+
+        /// First block to prove
+        #[arg(long)]
+        start: u64,
+
+        /// Last block to prove (inclusive)
+        #[arg(long)]
+        end: u64,
+
+        /// Leaf size: number of blocks per leaf proof
+        #[arg(long, default_value = "4")]
+        leaf_size: u64,
     },
 }
 
@@ -214,11 +323,28 @@ async fn fetch_block_input(
         vec![]
     };
 
-    // Build vertex messages from /dag/vertices response, fallback to block["vertices"]
+    // Build vertex messages from /dag/vertices response, fallback to block["vertices"],
+    // then reconstruct from persisted signature data (when vertices are pruned)
     let vertices: serde_json::Value = vertices_resp.json().await?;
     let mut vertex_messages = extract_vertex_messages(&vertices);
     if vertex_messages.is_empty() {
         vertex_messages = extract_vertex_messages(&block["vertices"]);
+    }
+    if vertex_messages.is_empty() {
+        // Reconstruct from persisted signature entries (have round, event_hashes, refs, timestamp)
+        if let Some(sigs) = block["signatures"].as_array() {
+            vertex_messages = extract_vertex_messages(&serde_json::Value::Array(
+                sigs.iter().map(|s| {
+                    serde_json::json!({
+                        "author": s["pubkey"],
+                        "round": s["round"],
+                        "event_hashes": s["event_hashes"],
+                        "refs": s["refs"],
+                        "timestamp": s["timestamp"],
+                    })
+                }).collect()
+            ));
+        }
     }
 
     let signatures = extract_signatures_with_messages(&block, &vertex_messages);
@@ -325,6 +451,21 @@ async fn fetch_block_evidence(
     let mut vertex_messages = extract_vertex_messages(&vertices);
     if vertex_messages.is_empty() {
         vertex_messages = extract_vertex_messages(&block["vertices"]);
+    }
+    if vertex_messages.is_empty() {
+        if let Some(sigs) = block["signatures"].as_array() {
+            vertex_messages = extract_vertex_messages(&serde_json::Value::Array(
+                sigs.iter().map(|s| {
+                    serde_json::json!({
+                        "author": s["pubkey"],
+                        "round": s["round"],
+                        "event_hashes": s["event_hashes"],
+                        "refs": s["refs"],
+                        "timestamp": s["timestamp"],
+                    })
+                }).collect()
+            ));
+        }
     }
 
     let signatures = extract_signatures_with_messages(&block, &vertex_messages);
@@ -512,6 +653,7 @@ async fn main() -> anyhow::Result<()> {
             proof_dir,
             interval,
             batch,
+            start,
         } => {
             std::fs::create_dir_all(&proof_dir)?;
             println!("Watching {} for new blocks (every {}s, batch={})", node, interval, batch);
@@ -521,7 +663,7 @@ async fn main() -> anyhow::Result<()> {
             // Setup once (expensive — key generation)
             let client = ProverClient::from_env();
             let (pk, vk) = client.setup(ELF);
-            let mut last_proven_block: u64 = 0;
+            let mut last_proven_block: u64 = start;
             let mut last_proof: Option<SP1ProofWithPublicValues> = None;
 
             // Resume from existing proofs
@@ -542,7 +684,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
-                if let Some(path) = max_path {
+                if let Some(path) = max_path.filter(|_| max_block >= start) {
                     match load_proof(&path) {
                         Ok(proof) => {
                             last_proven_block = max_block;
@@ -812,6 +954,758 @@ async fn main() -> anyhow::Result<()> {
                     println!("Verification: FAILED — {}", e);
                     std::process::exit(1);
                 }
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // Option 1: Segmented Proving — prove a range without IVC chaining
+        // ═══════════════════════════════════════════════════════════════════
+
+        Commands::Segment { node, start, end, output_dir } => {
+            std::fs::create_dir_all(&output_dir)?;
+            println!("Segment proving blocks {}..{} from {}", start, end, node);
+
+            let client = ProverClient::from_env();
+            let (pk, vk) = client.setup(ELF);
+
+            // Collect all block evidence for the segment
+            let mut evidences = Vec::new();
+            let mut cursor = start;
+            while cursor <= end {
+                // Find next committed round >= cursor
+                let target = if cursor == start {
+                    match http.get(node_url_with_params(&node, "/dag/next_committed", &[("after", &(cursor.saturating_sub(1)).to_string())])).send().await {
+                        Ok(resp) => match resp.json::<serde_json::Value>().await {
+                            Ok(r) => r["round"].as_u64().unwrap_or(cursor),
+                            Err(_) => break,
+                        },
+                        Err(_) => break,
+                    }
+                } else {
+                    match http.get(node_url_with_params(&node, "/dag/next_committed", &[("after", &cursor.to_string())])).send().await {
+                        Ok(resp) => match resp.json::<serde_json::Value>().await {
+                            Ok(r) => match r["round"].as_u64() {
+                                Some(round) if round <= end => round,
+                                _ => break,
+                            },
+                            Err(_) => break,
+                        },
+                        Err(_) => break,
+                    }
+                };
+
+                match fetch_block_evidence(&http, &node, target).await {
+                    Ok(ev) => {
+                        println!("  Fetched block {}", target);
+                        cursor = target;
+                        evidences.push(ev);
+                    }
+                    Err(e) => {
+                        eprintln!("  Failed to fetch block {}: {}", target, e);
+                        break;
+                    }
+                }
+                cursor += 1;
+            }
+
+            if evidences.is_empty() {
+                anyhow::bail!("No blocks found in range {}..{}", start, end);
+            }
+
+            let first_block = evidences.first().unwrap().block_number;
+            let last_block = evidences.last().unwrap().block_number;
+            println!("Proving segment: {} blocks ({}..{})", evidences.len(), first_block, last_block);
+
+            // Build a non-recursive (segment) proof — no prev_proof, not chained
+            let input = StateTransitionInput {
+                prev_state_root: [0u8; 32],
+                new_state_root: [0u8; 32],
+                block_number: 0,
+                mutations: vec![],
+                signatures: vec![],
+                active_nodes: 0,
+                recursive: false,
+                prev_proof_public_values: vec![],
+                batch_blocks: evidences,
+            };
+
+            let mut stdin = SP1Stdin::new();
+            stdin.write(&input);
+
+            match client.prove(&pk, &stdin).compressed().run() {
+                Ok(proof) => {
+                    client.verify(&proof, &vk)?;
+                    let path = output_dir.join(format!("segment_{}_{}.proof", first_block, last_block));
+                    save_proof(&path, &proof)?;
+                    let result: StateTransitionOutput = bincode::deserialize(proof.public_values.as_slice())?;
+                    println!("Segment proof saved to {:?}", path);
+                    println!("  State root:    {}", hex::encode(result.state_root));
+                    println!("  Blocks:        {}..{}", first_block, last_block);
+                    println!("  Proven blocks: {}", result.proven_blocks);
+                }
+                Err(e) => {
+                    eprintln!("Failed to prove segment: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // Option 1b: Merge — combine segment proofs into a single IVC chain
+        // ═══════════════════════════════════════════════════════════════════
+
+        Commands::Merge { segment_dir, output, prev_proof } => {
+            println!("Merging segment proofs from {:?}", segment_dir);
+
+            let client = ProverClient::from_env();
+            let (pk, vk) = client.setup(ELF);
+
+            // Collect and sort segment proofs by block range
+            let mut segments: Vec<(u64, u64, PathBuf)> = Vec::new();
+            for entry in std::fs::read_dir(&segment_dir)?.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if let Some(rest) = name.strip_prefix("segment_") {
+                        if let Some(rest) = rest.strip_suffix(".proof") {
+                            let parts: Vec<&str> = rest.split('_').collect();
+                            if parts.len() == 2 {
+                                if let (Ok(s), Ok(e)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
+                                    segments.push((s, e, entry.path()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            segments.sort_by_key(|(s, _, _)| *s);
+
+            if segments.is_empty() {
+                anyhow::bail!("No segment proofs found in {:?}", segment_dir);
+            }
+
+            println!("Found {} segments:", segments.len());
+            for (s, e, path) in &segments {
+                println!("  {}..{} — {:?}", s, e, path);
+            }
+
+            // Load initial chain proof if provided
+            let mut chain_proof: Option<SP1ProofWithPublicValues> = match &prev_proof {
+                Some(path) => {
+                    println!("Chaining from previous proof: {:?}", path);
+                    Some(load_proof(path)?)
+                }
+                None => None,
+            };
+
+            // Re-prove each segment recursively, chaining them together
+            for (seg_start, seg_end, seg_path) in &segments {
+                println!("\nMerging segment {}..{}", seg_start, seg_end);
+                let seg_proof = load_proof(seg_path)?;
+
+                // Extract the segment's public values to get its block data
+                let seg_output: StateTransitionOutput =
+                    bincode::deserialize(seg_proof.public_values.as_slice())?;
+
+                let recursive = chain_proof.is_some();
+                let prev_state_root = if let Some(ref cp) = chain_proof {
+                    let prev_out: StateTransitionOutput = bincode::deserialize(cp.public_values.as_slice())?;
+                    prev_out.state_root
+                } else {
+                    [0u8; 32]
+                };
+
+                let prev_pv = chain_proof.as_ref()
+                    .map(|p| p.public_values.as_slice().to_vec())
+                    .unwrap_or_default();
+
+                // Create a merge input that wraps the segment output
+                let input = StateTransitionInput {
+                    prev_state_root,
+                    new_state_root: seg_output.state_root,
+                    block_number: seg_output.block_number,
+                    mutations: vec![],
+                    signatures: vec![],
+                    active_nodes: 0,
+                    recursive,
+                    prev_proof_public_values: prev_pv,
+                    batch_blocks: vec![], // segment already proven — just chain
+                };
+
+                let stdin = prepare_stdin_with_proof(&input, chain_proof.as_ref(), &vk);
+
+                match client.prove(&pk, &stdin).compressed().run() {
+                    Ok(proof) => {
+                        let result: StateTransitionOutput = bincode::deserialize(proof.public_values.as_slice())?;
+                        println!("  Merged — chain: {} blocks, root: {}", result.proven_blocks, hex::encode(result.state_root));
+                        chain_proof = Some(proof);
+                    }
+                    Err(e) => {
+                        eprintln!("  Failed to merge segment {}..{}: {}", seg_start, seg_end, e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            if let Some(final_proof) = &chain_proof {
+                client.verify(final_proof, &vk)?;
+                save_proof(&output, final_proof)?;
+                let result: StateTransitionOutput = bincode::deserialize(final_proof.public_values.as_slice())?;
+                println!("\nMerged proof saved to {:?}", output);
+                println!("  State root:    {}", hex::encode(result.state_root));
+                println!("  Proven blocks: {}", result.proven_blocks);
+                println!("  Genesis root:  {}", hex::encode(result.genesis_root));
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // Option 2: Pipeline Proving — stitch execution proofs into IVC
+        // ═══════════════════════════════════════════════════════════════════
+
+        Commands::Stitch { exec_dir, proof_dir, node, prev_proof } => {
+            std::fs::create_dir_all(&proof_dir)?;
+            println!("Pipeline stitcher: reading exec proofs from {:?}, outputting to {:?}", exec_dir, proof_dir);
+
+            let client = ProverClient::from_env();
+            let (pk, vk) = client.setup(ELF);
+
+            // Load previous chain state
+            let mut chain_proof: Option<SP1ProofWithPublicValues> = match &prev_proof {
+                Some(path) => {
+                    println!("Resuming chain from: {:?}", path);
+                    Some(load_proof(path)?)
+                }
+                None => {
+                    // Try to resume from proof_dir
+                    let mut max_block = 0u64;
+                    let mut max_path = None;
+                    if let Ok(entries) = std::fs::read_dir(&proof_dir) {
+                        for entry in entries.flatten() {
+                            if let Some(name) = entry.file_name().to_str() {
+                                if let Some(num) = name
+                                    .strip_prefix("block_")
+                                    .and_then(|s| s.strip_suffix(".proof"))
+                                    .and_then(|s| s.parse::<u64>().ok())
+                                {
+                                    if num > max_block {
+                                        max_block = num;
+                                        max_path = Some(entry.path());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    match max_path {
+                        Some(path) => {
+                            println!("Resuming from block {} in proof_dir", max_block);
+                            Some(load_proof(&path)?)
+                        }
+                        None => None,
+                    }
+                }
+            };
+
+            let mut last_stitched_block = if let Some(ref cp) = chain_proof {
+                let out: StateTransitionOutput = bincode::deserialize(cp.public_values.as_slice())?;
+                out.block_number
+            } else {
+                0u64
+            };
+
+            // Collect and sort exec proofs
+            let mut exec_proofs: Vec<(u64, PathBuf)> = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&exec_dir) {
+                for entry in entries.flatten() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        if let Some(num) = name
+                            .strip_prefix("block_")
+                            .and_then(|s| s.strip_suffix(".exec"))
+                            .and_then(|s| s.parse::<u64>().ok())
+                        {
+                            if num > last_stitched_block {
+                                exec_proofs.push((num, entry.path()));
+                            }
+                        }
+                    }
+                }
+            }
+            exec_proofs.sort_by_key(|(n, _)| *n);
+
+            if exec_proofs.is_empty() {
+                println!("No new exec proofs to stitch (last stitched: block {})", last_stitched_block);
+            }
+
+            for (block_num, exec_path) in &exec_proofs {
+                println!("\nStitching block {} into IVC chain", block_num);
+                let exec_proof = load_proof(exec_path)?;
+                let exec_output: StateTransitionOutput =
+                    bincode::deserialize(exec_proof.public_values.as_slice())?;
+
+                let recursive = chain_proof.is_some();
+                let prev_state_root = if let Some(ref cp) = chain_proof {
+                    let prev_out: StateTransitionOutput = bincode::deserialize(cp.public_values.as_slice())?;
+                    prev_out.state_root
+                } else {
+                    [0u8; 32]
+                };
+
+                let prev_pv = chain_proof.as_ref()
+                    .map(|p| p.public_values.as_slice().to_vec())
+                    .unwrap_or_default();
+
+                let input = StateTransitionInput {
+                    prev_state_root,
+                    new_state_root: exec_output.state_root,
+                    block_number: exec_output.block_number,
+                    mutations: vec![],
+                    signatures: vec![],
+                    active_nodes: 0,
+                    recursive,
+                    prev_proof_public_values: prev_pv,
+                    batch_blocks: vec![],
+                };
+
+                let stdin = prepare_stdin_with_proof(&input, chain_proof.as_ref(), &vk);
+
+                match client.prove(&pk, &stdin).compressed().run() {
+                    Ok(proof) => {
+                        let result: StateTransitionOutput = bincode::deserialize(proof.public_values.as_slice())?;
+                        let chain_path = proof_dir.join(format!("block_{}.proof", block_num));
+                        save_proof(&chain_path, &proof)?;
+                        println!(
+                            "  Block {} stitched — root: {} | chain: {} blocks",
+                            block_num, hex::encode(result.state_root), result.proven_blocks,
+                        );
+
+                        // Submit to node
+                        let proof_hash = compute_proof_hash(&proof);
+                        submit_proof_to_node(
+                            &http, &node, *block_num, &proof_hash,
+                            &result.state_root, result.proven_blocks, "compressed-stitched",
+                        ).await;
+
+                        chain_proof = Some(proof);
+                        last_stitched_block = *block_num;
+                    }
+                    Err(e) => {
+                        eprintln!("  Failed to stitch block {}: {}", block_num, e);
+                        break;
+                    }
+                }
+            }
+
+            println!("\nStitching complete. Last block: {}", last_stitched_block);
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // Option 4: Claim-Based Coordination — provers claim work from node
+        // ═══════════════════════════════════════════════════════════════════
+
+        Commands::WatchClaim { node, prover_id, proof_dir, interval, batch, ttl } => {
+            std::fs::create_dir_all(&proof_dir)?;
+            println!("Claim-based prover '{}' watching {} (batch={}, ttl={}s)", prover_id, node, batch, ttl);
+
+            let client = ProverClient::from_env();
+            let (pk, vk) = client.setup(ELF);
+            let mut last_proof: Option<SP1ProofWithPublicValues> = None;
+            let mut last_proven_block: u64 = 0;
+
+            // Resume from existing proofs
+            if let Ok(entries) = std::fs::read_dir(&proof_dir) {
+                let mut max_block = 0u64;
+                let mut max_path = None;
+                for entry in entries.flatten() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        if let Some(num) = name
+                            .strip_prefix("block_")
+                            .and_then(|s| s.strip_suffix(".proof"))
+                            .and_then(|s| s.parse::<u64>().ok())
+                        {
+                            if num > max_block {
+                                max_block = num;
+                                max_path = Some(entry.path());
+                            }
+                        }
+                    }
+                }
+                if let Some(path) = max_path {
+                    match load_proof(&path) {
+                        Ok(proof) => {
+                            last_proven_block = max_block;
+                            last_proof = Some(proof);
+                            println!("Resuming from block {} (recursive chain)", max_block);
+                        }
+                        Err(e) => eprintln!("Warning: could not load proof at {:?}: {}", path, e),
+                    }
+                }
+            }
+
+            loop {
+                // Ask node for next unclaimed work
+                let unclaimed = match http.get(
+                    node_url_with_params(&node, "/proof/next_unclaimed", &[
+                        ("batch", &batch.to_string()),
+                        ("after", &last_proven_block.to_string()),
+                    ])
+                ).send().await {
+                    Ok(resp) => match resp.json::<serde_json::Value>().await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("  Parse error: {} — retrying", e);
+                            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                            continue;
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("  Network error: {} — retrying", e);
+                        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                        continue;
+                    }
+                };
+
+                if !unclaimed["available"].as_bool().unwrap_or(false) {
+                    tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                    continue;
+                }
+
+                let block_start = unclaimed["block_start"].as_u64().unwrap();
+                let block_end = unclaimed["block_end"].as_u64().unwrap();
+
+                // Claim the range
+                let claim_resp = match http.post(node_url(&node, "/proof/claim"))
+                    .json(&serde_json::json!({
+                        "prover_id": prover_id,
+                        "block_start": block_start,
+                        "block_end": block_end,
+                        "ttl_seconds": ttl,
+                    }))
+                    .send().await
+                {
+                    Ok(resp) => match resp.json::<serde_json::Value>().await {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    },
+                    Err(e) => {
+                        eprintln!("  Claim failed: {}", e);
+                        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                        continue;
+                    }
+                };
+
+                if claim_resp.get("error").is_some() {
+                    eprintln!("  Claim rejected: {}", claim_resp["error"]);
+                    tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                    continue;
+                }
+
+                println!("\nClaimed blocks {}..{}", block_start, block_end);
+
+                // Fetch and prove the claimed range
+                let mut evidences = Vec::new();
+                let blocks: Vec<u64> = unclaimed["blocks"].as_array()
+                    .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
+                    .unwrap_or_else(|| (block_start..=block_end).collect());
+
+                let mut fetch_failed = false;
+                for &block in &blocks {
+                    match fetch_block_evidence(&http, &node, block).await {
+                        Ok(ev) => evidences.push(ev),
+                        Err(e) => {
+                            eprintln!("  Failed to fetch block {}: {}", block, e);
+                            fetch_failed = true;
+                            break;
+                        }
+                    }
+                }
+
+                if fetch_failed || evidences.is_empty() {
+                    // Release the claim
+                    let _ = http.post(node_url(&node, "/proof/release"))
+                        .json(&serde_json::json!({
+                            "prover_id": prover_id,
+                            "block_start": block_start,
+                            "block_end": block_end,
+                            "status": "released",
+                        }))
+                        .send().await;
+                    continue;
+                }
+
+                let recursive = last_proof.is_some();
+                let prev_state_root = if let Some(ref prev) = last_proof {
+                    let prev_output: StateTransitionOutput = bincode::deserialize(prev.public_values.as_slice())?;
+                    prev_output.state_root
+                } else {
+                    [0u8; 32]
+                };
+                let prev_pv = last_proof.as_ref()
+                    .map(|p| p.public_values.as_slice().to_vec())
+                    .unwrap_or_default();
+
+                let input = StateTransitionInput {
+                    prev_state_root,
+                    new_state_root: [0u8; 32],
+                    block_number: 0,
+                    mutations: vec![],
+                    signatures: vec![],
+                    active_nodes: 0,
+                    recursive,
+                    prev_proof_public_values: prev_pv,
+                    batch_blocks: evidences,
+                };
+
+                let stdin = prepare_stdin_with_proof(&input, last_proof.as_ref(), &vk);
+
+                match client.prove(&pk, &stdin).compressed().run() {
+                    Ok(proof) => {
+                        let result: StateTransitionOutput = bincode::deserialize(proof.public_values.as_slice())?;
+                        let path = proof_dir.join(format!("block_{}.proof", block_end));
+                        save_proof(&path, &proof)?;
+
+                        let proof_hash = compute_proof_hash(&proof);
+                        println!(
+                            "  Blocks {}..{} proven — root: {} | chain: {} blocks",
+                            block_start, block_end,
+                            hex::encode(result.state_root), result.proven_blocks,
+                        );
+
+                        // Submit proof and release claim as completed
+                        submit_proof_to_node(
+                            &http, &node, block_end, &proof_hash,
+                            &result.state_root, result.proven_blocks, "compressed-claimed",
+                        ).await;
+
+                        let _ = http.post(node_url(&node, "/proof/release"))
+                            .json(&serde_json::json!({
+                                "prover_id": prover_id,
+                                "block_start": block_start,
+                                "block_end": block_end,
+                                "status": "completed",
+                                "proof_hash": proof_hash,
+                            }))
+                            .send().await;
+
+                        last_proof = Some(proof);
+                        last_proven_block = block_end;
+                    }
+                    Err(e) => {
+                        eprintln!("  Failed to prove blocks {}..{}: {}", block_start, block_end, e);
+                        // Release claim on failure
+                        let _ = http.post(node_url(&node, "/proof/release"))
+                            .json(&serde_json::json!({
+                                "prover_id": prover_id,
+                                "block_start": block_start,
+                                "block_end": block_end,
+                                "status": "released",
+                            }))
+                            .send().await;
+                    }
+                }
+
+                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // Tree-Structured Proof Aggregation (Miden-inspired)
+        // Proves blocks in a binary tree: leaf proofs run in parallel,
+        // then pairs are aggregated bottom-up. O(N/P + log N) with P provers.
+        // ═══════════════════════════════════════════════════════════════════
+
+        Commands::TreeProve { node, proof_dir, start, end, leaf_size } => {
+            std::fs::create_dir_all(&proof_dir)?;
+            let leaf_dir = proof_dir.join("leaves");
+            let agg_dir = proof_dir.join("aggregated");
+            std::fs::create_dir_all(&leaf_dir)?;
+            std::fs::create_dir_all(&agg_dir)?;
+
+            let client = ProverClient::from_env();
+            let (pk, vk) = client.setup(ELF);
+
+            // Phase 1: Create leaf proofs (each covers `leaf_size` blocks)
+            println!("Phase 1: Generating leaf proofs (leaf_size={})", leaf_size);
+            let mut leaf_proofs: Vec<(u64, u64, PathBuf)> = Vec::new();
+            let mut cursor = start;
+
+            while cursor <= end {
+                let leaf_end = std::cmp::min(cursor + leaf_size - 1, end);
+                let leaf_path = leaf_dir.join(format!("leaf_{}_{}.proof", cursor, leaf_end));
+
+                // Check if leaf already exists
+                if leaf_path.exists() {
+                    println!("  Leaf {}..{} already exists, skipping", cursor, leaf_end);
+                    leaf_proofs.push((cursor, leaf_end, leaf_path));
+                    cursor = leaf_end + 1;
+                    continue;
+                }
+
+                // Fetch block evidence for this leaf range
+                let mut evidences = Vec::new();
+                let mut block_cursor = cursor;
+                while block_cursor <= leaf_end {
+                    let target = match http.get(
+                        node_url_with_params(&node, "/dag/next_committed", &[("after", &(block_cursor.saturating_sub(1)).to_string())])
+                    ).send().await {
+                        Ok(resp) => match resp.json::<serde_json::Value>().await {
+                            Ok(r) => match r["round"].as_u64() {
+                                Some(round) if round <= leaf_end => round,
+                                _ => break,
+                            },
+                            Err(_) => break,
+                        },
+                        Err(_) => break,
+                    };
+
+                    match fetch_block_evidence(&http, &node, target).await {
+                        Ok(ev) => {
+                            block_cursor = target + 1;
+                            evidences.push(ev);
+                        }
+                        Err(e) => {
+                            eprintln!("  Failed to fetch block {}: {}", target, e);
+                            break;
+                        }
+                    }
+                }
+
+                if evidences.is_empty() {
+                    cursor = leaf_end + 1;
+                    continue;
+                }
+
+                let actual_start = evidences.first().unwrap().block_number;
+                let actual_end = evidences.last().unwrap().block_number;
+                println!("  Proving leaf {}..{} ({} blocks)", actual_start, actual_end, evidences.len());
+
+                let input = StateTransitionInput {
+                    prev_state_root: [0u8; 32],
+                    new_state_root: [0u8; 32],
+                    block_number: 0,
+                    mutations: vec![],
+                    signatures: vec![],
+                    active_nodes: 0,
+                    recursive: false,
+                    prev_proof_public_values: vec![],
+                    batch_blocks: evidences,
+                };
+
+                let mut stdin = SP1Stdin::new();
+                stdin.write(&input);
+
+                match client.prove(&pk, &stdin).compressed().run() {
+                    Ok(proof) => {
+                        let result: StateTransitionOutput = bincode::deserialize(proof.public_values.as_slice())?;
+                        let path = leaf_dir.join(format!("leaf_{}_{}.proof", actual_start, actual_end));
+                        save_proof(&path, &proof)?;
+                        println!("    Leaf proven — root: {}, blocks: {}", hex::encode(result.state_root), result.proven_blocks);
+                        leaf_proofs.push((actual_start, actual_end, path));
+                    }
+                    Err(e) => {
+                        eprintln!("    Failed to prove leaf: {}", e);
+                    }
+                }
+
+                cursor = leaf_end + 1;
+            }
+
+            if leaf_proofs.is_empty() {
+                anyhow::bail!("No leaf proofs generated");
+            }
+
+            // Phase 2: Binary tree aggregation — combine pairs bottom-up
+            println!("\nPhase 2: Tree aggregation ({} leaves)", leaf_proofs.len());
+            let mut current_level: Vec<(u64, u64, PathBuf)> = leaf_proofs;
+            let mut level = 0u32;
+
+            while current_level.len() > 1 {
+                level += 1;
+                let mut next_level: Vec<(u64, u64, PathBuf)> = Vec::new();
+                println!("  Level {} — aggregating {} proofs into {}", level, current_level.len(), (current_level.len() + 1) / 2);
+
+                let mut i = 0;
+                while i < current_level.len() {
+                    if i + 1 < current_level.len() {
+                        // Pair: aggregate left and right
+                        let (l_start, l_end, ref l_path) = current_level[i];
+                        let (r_start, r_end, ref r_path) = current_level[i + 1];
+
+                        let agg_path = agg_dir.join(format!("agg_L{}_{}-{}.proof", level, l_start, r_end));
+
+                        if agg_path.exists() {
+                            println!("    Agg {}..{} already exists, skipping", l_start, r_end);
+                            next_level.push((l_start, r_end, agg_path));
+                            i += 2;
+                            continue;
+                        }
+
+                        let left_proof = load_proof(l_path)?;
+                        let right_proof = load_proof(r_path)?;
+
+                        let left_output: StateTransitionOutput = bincode::deserialize(left_proof.public_values.as_slice())?;
+                        let right_output: StateTransitionOutput = bincode::deserialize(right_proof.public_values.as_slice())?;
+
+                        println!("    Aggregating {}..{} + {}..{}", l_start, l_end, r_start, r_end);
+
+                        // Create a chain: left as base, right chained on top
+                        let input = StateTransitionInput {
+                            prev_state_root: left_output.state_root,
+                            new_state_root: right_output.state_root,
+                            block_number: right_output.block_number,
+                            mutations: vec![],
+                            signatures: vec![],
+                            active_nodes: 0,
+                            recursive: true,
+                            prev_proof_public_values: left_proof.public_values.as_slice().to_vec(),
+                            batch_blocks: vec![],
+                        };
+
+                        let stdin = prepare_stdin_with_proof(&input, Some(&left_proof), &vk);
+
+                        match client.prove(&pk, &stdin).compressed().run() {
+                            Ok(proof) => {
+                                let result: StateTransitionOutput = bincode::deserialize(proof.public_values.as_slice())?;
+                                save_proof(&agg_path, &proof)?;
+                                println!("    Aggregated — root: {}, total: {} blocks", hex::encode(result.state_root), result.proven_blocks);
+                                next_level.push((l_start, r_end, agg_path));
+                            }
+                            Err(e) => {
+                                eprintln!("    Aggregation failed: {}", e);
+                                // Fall back: push both individually
+                                next_level.push(current_level[i].clone());
+                                next_level.push(current_level[i + 1].clone());
+                            }
+                        }
+                        i += 2;
+                    } else {
+                        // Odd one out — promote to next level
+                        println!("    Promoting unpaired proof {}..{}", current_level[i].0, current_level[i].1);
+                        next_level.push(current_level[i].clone());
+                        i += 1;
+                    }
+                }
+                current_level = next_level;
+            }
+
+            // Final result
+            if let Some((final_start, final_end, ref final_path)) = current_level.first() {
+                let final_proof = load_proof(final_path)?;
+                client.verify(&final_proof, &vk)?;
+                let result: StateTransitionOutput = bincode::deserialize(final_proof.public_values.as_slice())?;
+
+                let root_path = proof_dir.join(format!("tree_{}_{}.proof", final_start, final_end));
+                std::fs::copy(final_path, &root_path)?;
+
+                println!("\nTree proof complete!");
+                println!("  Range:       {}..{}", final_start, final_end);
+                println!("  State root:  {}", hex::encode(result.state_root));
+                println!("  Proven blocks: {}", result.proven_blocks);
+                println!("  Tree levels: {}", level);
+                println!("  Output:      {:?}", root_path);
+
+                // Submit to node
+                let proof_hash = compute_proof_hash(&final_proof);
+                submit_proof_to_node(
+                    &http, &node, *final_end, &proof_hash,
+                    &result.state_root, result.proven_blocks, "compressed-tree",
+                ).await;
             }
         }
     }
