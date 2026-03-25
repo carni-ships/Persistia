@@ -113,18 +113,139 @@ The ledger’s canonical state = latest valid Berachain anchor. Any node can boo
 - **Scale**: Unlimited nodes; spatial sharding (one DO per zone) for 1000+ players.  
 - **Monitoring**: Each node logs root hashes; public dashboard can aggregate them.
 
-### 11. Upgrade Path (already planned)
-1. Replace Merkle with SP1 recursive proof (1 day).  
-2. Add Rust contract execution.  
-3. Full Godot voxel client integration.  
-4. Multi-shard + automatic node discovery.  
-5. Optional EVM bridge for true NFT settlement.
+### 11. Completed Milestones
+1. ✅ SHA-256 Merkle root state commitments
+2. ✅ SP1 recursive ZK proof chain (IVC) with batch proving
+3. ✅ WASM smart contract runtime (NEAR-style register ABI, fuel metering)
+4. ✅ Rust SDK + CosmWasm compatibility layer
+5. ✅ Bullshark DAG-BFT consensus with quorum-gated commits
+6. ✅ Multi-shard gossip + automatic node discovery
+7. ✅ Berachain state anchoring (HYTE format + HyberDB)
+8. ✅ Ed25519 wallet with Bech32 addresses, token transfers, nonce replay protection
+9. ✅ Machine Payment Protocol (HTTP 402)
+10. ✅ Decentralized oracles with multi-node aggregation
+11. ✅ Scheduled contract execution (triggers/cron)
+12. ✅ Cross-shard messaging with notes + nullifiers
+13. ✅ HTTP-native light client (BFT certificates + Merkle proofs)
+14. ✅ Fully on-chain app hosting (frontend served from contract state)
+15. ✅ Real-time DAG dashboard, ZK verifier, wallet UI
 
-This spec is complete, self-contained, and directly implementable from the v0.1 code we already dropped. The ledger side is now fully decoupled from any specific game — you can plug in Minecraft voxels, EVE-style markets, GTA vehicles, or anything else that needs persistent shared state.
+### 12. Roadmap: Appchain Rollup Framework
 
-Want me to:
-- Update the existing code files to match this exact spec?
-- Give the full SP1 circuit skeleton (Rust)?
-- Or spec out the next phase (full recursive zk + contract upload)?
+Persistia's next phase is evolution into an **appchain rollup framework** — enabling anyone to deploy a customizable BFT chain with a single command, secured by restaked tokens, with built-in cross-chain oracle and automation services.
 
-Just say the word and we keep building. The ledger is ready to outlive any single account.
+#### Phase 1: PoS Staking Module (~200 LOC)
+Convert the current reputation-based validator model to Proof-of-Stake:
+- Replace PoW admission with token staking (lock tokens → become validator)
+- Stake-weighted quorum (existing reputation-weighted quorum logic, swap weight source)
+- Unbonding periods (7-28 day configurable timelock before stake withdrawal)
+- Slashing for equivocation (extend existing `recordEquivocation()` to burn staked tokens)
+- Delegation support (delegators earn proportional rewards, validators set commission %)
+- Validator set rotation (committee selection for large validator sets)
+
+Key changes:
+- `ValidatorRecord`: add `stake_amount`, `bonded_at`, `unbonding_deadline`, `delegators`
+- `quorumForActiveSet()`: weight by stake instead of reputation
+- New `staking_events` table for audit trail
+- New `/validator/stake`, `/validator/unstake`, `/validator/delegate` endpoints
+
+#### Phase 2: Multi-Chain Anchor Configuration (~100 LOC)
+Extend state anchoring beyond Berachain to any EVM-compatible chain:
+- Generalize `BerachainConfig` → `ExternalChainConfig[]` (chain_id, rpc_url, contract_address)
+- Support Ethereum mainnet, Arbitrum, Base, Optimism, Polygon, etc.
+- Add calldata compression (brotli/zlib) for lower anchor costs
+- Monitor target chain finality before marking anchors "confirmed"
+- Anchor to multiple chains simultaneously for redundancy
+
+#### Phase 3: Outbound Transaction Execution (~300 LOC)
+Enable Persistia validators to submit transactions to external chains:
+- Multi-chain RPC manager (Ethereum, Berachain, Solana, Cosmos IBC)
+- Transaction building per target chain (EVM calldata encoding, Solana instructions)
+- Shared key management for outbound signing (threshold signatures or HSM integration)
+- Nonce management across chains (prevent stuck/duplicate transactions)
+- BFT consensus on outbound transactions (N/M validators must agree before submission)
+
+This is the foundation for cross-chain oracle delivery and automation.
+
+#### Phase 4: Cross-Chain Oracle Services (~150 LOC)
+Extend the existing oracle system to serve external chains (Chainlink CRE competitor):
+- **Oracle data feeds**: Validators fetch data, aggregate via BFT consensus, post results to target chains
+- **Payment model**: Charge per oracle request (settle via token transfer or MPP)
+- **Source reputation**: Weight data sources by historical accuracy
+- **Fallback sources**: Try alternative URLs/feeds if primary fails
+- **Historical data**: Return price history / TWAP over configurable windows
+- **SLA guarantees**: Timeout compensation, guaranteed precision, freshness bounds
+- **ZK attestation**: Each oracle result accompanied by SP1 proof that N/M validators agreed
+
+#### Phase 5: Cross-Chain Automation (~200 LOC)
+Extend triggers to execute on external chains:
+- Smart contracts on other chains register trigger conditions with Persistia
+- Persistia monitors conditions via oracle polling (e.g., "when ETH < $2000")
+- When condition met, validators reach BFT consensus and submit transaction to target chain
+- Use cases: liquidations, rebalancing, yield harvesting, governance execution
+- Payment: pre-funded balance on Persistia or per-execution fees
+
+#### Phase 6: Gateway Contracts (Solidity)
+Deploy Persistia gateway contracts on target chains for inbound request listening:
+- `PersistiaGateway.sol`: Receives oracle requests, trigger registrations, message relay
+- Emits events that Persistia validators watch via oracle system
+- Verifies Persistia BFT commit certificates for trustless result delivery
+- Optional: Verify SP1 ZK proofs on-chain for fully trustless bridging
+
+#### Phase 7: Restaking Security Layer (~200 LOC + Solidity)
+Allow appchains to be secured by restaked tokens from external chains:
+- Deploy `PersistiaStaking.sol` on Berachain/Ethereum
+- Stakers lock ETH, BERA, or any ERC-20 in the contract
+- Persistia validators observe the lock via oracle (multi-node consensus on L1 state)
+- Validator admitted with weight proportional to restaked amount
+- Slashing: Persistia submits ZK proof of misbehavior to L1 staking contract
+- Shared security: One restaked position can secure multiple Persistia appchains simultaneously
+- Compatible with EigenLayer/Symbiotic AVS model
+
+#### Phase 8: Appchain Template & SDK
+Make deploying a custom Persistia appchain turnkey:
+- `persistia init` CLI tool: generates wrangler.toml, consensus config, staking params
+- Configurable parameters: round time, quorum threshold, staking token, anchor chain(s)
+- Pre-built modules: DEX, lending, NFT marketplace, DAO governance
+- One-command deploy: `persistia deploy --chain my-appchain --stake-token BERA --anchor ethereum`
+
+### 13. Strategic Positioning
+
+Persistia occupies a unique position as three interlocking products:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  APPCHAIN ROLLUP FRAMEWORK                                  │
+│  "Deploy your own BFT chain with one command"               │
+│  Differentiator: $0 infra cost, instant deploy, built-in    │
+│  oracles/triggers/payments/frontend hosting                  │
+├─────────────────────────────────────────────────────────────┤
+│  CROSS-CHAIN EXECUTION RUNTIME                              │
+│  "BFT-secured oracle & automation for any chain"            │
+│  Differentiator: ZK-proven outputs, edge-native (300+       │
+│  locations), lower cost than Chainlink/Gelato                │
+├─────────────────────────────────────────────────────────────┤
+│  RESTAKING SECURITY LAYER                                   │
+│  "Secure appchains with ETH/BERA/any token"                 │
+│  Differentiator: Shared security across appchains +         │
+│  oracle network, ZK-proven slashing                         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+These create a flywheel: more appchains → more validators needed → more restaking demand → better oracle security → more external chains integrate → more appchain demand.
+
+### 14. Competitive Comparison
+
+| Property | Persistia | OP Stack | Cosmos SDK | Arbitrum Orbit | Chainlink |
+|----------|-----------|----------|------------|----------------|-----------|
+| Deploy time | Minutes | Days-weeks | Days-weeks | Days | N/A |
+| Infra cost | $0 (CF free tier) | $500+/mo | $500+/mo | $500+/mo | N/A |
+| Consensus | BFT (instant finality) | L1 finality | Tendermint BFT | L1 finality | OCR committee |
+| Contracts | WASM | EVM | CosmWasm/EVM | EVM | N/A |
+| Built-in oracles | Yes | No | No | No | Core product |
+| Built-in cron | Yes | No | No | No | Automation product |
+| Built-in payments | Yes (MPP) | No | No | No | No |
+| Frontend hosting | Yes (on-chain) | No | No | No | No |
+| ZK proofs | Yes (SP1 IVC) | Proposed | No | Proposed | No |
+| Restaking | Planned | No | No | No | Staking (LINK) |
+| Cross-chain relay | Planned | Via bridges | IBC | Via bridges | CCIP |
