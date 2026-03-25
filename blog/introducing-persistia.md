@@ -458,7 +458,19 @@ The codebase is structured as:
 - `contracts/cosmwasm-compat/` — Rust: CosmWasm compatibility layer
 - `client/` — Dashboard, wallet, and client library
 
-We're actively working on expanding the contract ecosystem, improving proof generation throughput, and building the Berachain verification bridge. If you're interested in building on infrastructure that doesn't require you to run infrastructure, Persistia is worth a look.
+## What's Next: Appchain Rollup Framework
+
+Persistia today is a single network. The next step is making it a **framework** — so anyone can deploy their own BFT chain with a single command, secured by restaked tokens, with built-in cross-chain services.
+
+Three interlocking products:
+
+- **Appchain Rollups.** Fork Persistia, configure your consensus parameters (round time, staking token, anchor chain), and `npx wrangler deploy`. You get BFT consensus, WASM contracts, oracles, cron, payments, and frontend hosting — all for $0 on Cloudflare's free tier. No other rollup framework offers this: OP Stack and Cosmos SDK require dedicated servers and weeks of setup. Persistia collapses that to minutes.
+
+- **Cross-Chain Execution Runtime.** Persistia validators already run 24/7 on Cloudflare's edge, fetch external data with multi-node consensus, and execute scheduled tasks. The leap: instead of only serving Persistia contracts, these validators can execute tasks for *any* chain — oracle data feeds, automated liquidations, verified off-chain computation, cross-chain message relay. Same capabilities as Chainlink's CRE, but with BFT consensus on every output and ZK proofs for trustless verification.
+
+- **Restaking Security.** Rather than bootstrapping a new token for each appchain, validators can stake existing tokens (ETH, BERA, any ERC-20) on L1. Persistia observes the stake via its oracle system, admits the validator with proportional weight, and slashes via ZK-proven misbehavior evidence submitted to the L1 staking contract. One restaked position can secure multiple appchains simultaneously.
+
+These create a flywheel: more appchains deployed means more validators needed, which increases restaking demand, which improves oracle security, which attracts more external chains, which drives more appchain demand. The infrastructure layer is already built — what comes next is making it composable.
 
 ---
 
