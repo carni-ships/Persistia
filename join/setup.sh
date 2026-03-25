@@ -29,7 +29,7 @@ command -v npm >/dev/null 2>&1 || { echo "Error: npm required."; exit 1; }
 # 2. Clone the repo if not already in it
 if [ ! -f "../src/index.ts" ]; then
   echo "Error: Run this script from the join/ directory inside the Persistia repo."
-  echo "  git clone https://github.com/user/persistia && cd persistia/join && ./setup.sh"
+  echo "  git clone https://github.com/carni-ships/Persistia && cd Persistia/join && ./setup.sh"
   exit 1
 fi
 
