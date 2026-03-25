@@ -963,28 +963,35 @@ function drawDAGFrame() {
     ctx.globalAlpha = 1;
   }
 
-  // ─── Legend ───────────────────────────────────────────────────────────────
+  // ─── Legend (isolated canvas state to prevent ghosting) ─────────────────
+  ctx.save();
+  ctx.globalAlpha = 1;
+  ctx.setLineDash([]);
+  ctx.lineDashOffset = 0;
+
   const legendX = 6, legendY = H - 154;
   const lw = 200, lh = 148;
-  // Fully opaque clear to prevent ghosting from semi-transparent canvas clear
-  ctx.fillStyle = '#0d1117';
+
+  // Opaque background — clearRect then fill to fully eliminate trail artifacts
+  ctx.clearRect(legendX, legendY, lw, lh);
+  ctx.fillStyle = '#12121c';
   ctx.fillRect(legendX, legendY, lw, lh);
-  // Background
-  ctx.fillStyle = 'rgba(18,18,28,1)';
-  ctx.strokeStyle = 'rgba(108,92,231,0.2)';
+  ctx.strokeStyle = 'rgba(108,92,231,0.25)';
   ctx.lineWidth = 1;
   ctx.beginPath();
   ctx.roundRect(legendX, legendY, lw, lh, 6);
-  ctx.fill();
   ctx.stroke();
 
+  const lTextX = legendX + 28;
   ctx.font = 'bold 9px JetBrains Mono';
   ctx.fillStyle = '#8a8aaa';
   ctx.textAlign = 'left';
-  ctx.fillText('LEGEND', legendX + 10, legendY + 16);
+  ctx.textBaseline = 'middle';
+  ctx.fillText('LEGEND', legendX + 10, legendY + 12);
 
-  let ly = legendY + 30;
+  let ly = legendY + 28;
   const lSpacing = 17;
+  const labelStyle = () => { ctx.fillStyle = '#b0b0c8'; ctx.font = '8.5px JetBrains Mono'; ctx.textAlign = 'left'; };
 
   // Pending vertex (circle)
   ctx.fillStyle = '#6c5ce7';
@@ -992,13 +999,11 @@ function drawDAGFrame() {
   ctx.arc(legendX + 16, ly, 5, 0, Math.PI * 2);
   ctx.fill();
   ctx.fillStyle = '#fff';
-  ctx.font = 'bold 6px JetBrains Mono';
+  ctx.font = 'bold 7px JetBrains Mono';
   ctx.textAlign = 'center';
-  ctx.fillText('3', legendX + 16, ly + 2);
-  ctx.fillStyle = '#9a9ab8';
-  ctx.font = '8px JetBrains Mono';
-  ctx.textAlign = 'left';
-  ctx.fillText('Pending vertex (events)', legendX + 28, ly + 3);
+  ctx.fillText('3', legendX + 16, ly);
+  labelStyle();
+  ctx.fillText('Pending vertex (events)', lTextX, ly);
 
   ly += lSpacing;
   // Committed vertex (diamond)
@@ -1010,56 +1015,54 @@ function drawDAGFrame() {
   ctx.lineTo(legendX + 11, ly);
   ctx.closePath();
   ctx.fill();
-  ctx.fillStyle = '#9a9ab8';
-  ctx.font = '8px JetBrains Mono';
-  ctx.fillText('Committed vertex', legendX + 28, ly + 3);
+  labelStyle();
+  ctx.fillText('Committed vertex', lTextX, ly);
 
   ly += lSpacing;
   // Edge reference
-  ctx.strokeStyle = 'rgba(108,92,231,0.35)';
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.moveTo(legendX + 10, ly);
-  ctx.lineTo(legendX + 22, ly);
-  ctx.stroke();
-  ctx.fillStyle = '#9a9ab8';
-  ctx.fillText('DAG reference (edge)', legendX + 28, ly + 3);
-
-  ly += lSpacing;
-  // Commit edge
-  ctx.strokeStyle = 'rgba(0,210,160,0.5)';
+  ctx.strokeStyle = 'rgba(108,92,231,0.5)';
   ctx.lineWidth = 1.5;
   ctx.beginPath();
   ctx.moveTo(legendX + 10, ly);
   ctx.lineTo(legendX + 22, ly);
   ctx.stroke();
-  ctx.fillStyle = '#9a9ab8';
-  ctx.lineWidth = 1;
-  ctx.fillText('Commit edge', legendX + 28, ly + 3);
+  labelStyle();
+  ctx.fillText('DAG reference (edge)', lTextX, ly);
+
+  ly += lSpacing;
+  // Commit edge
+  ctx.strokeStyle = 'rgba(0,210,160,0.6)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(legendX + 10, ly);
+  ctx.lineTo(legendX + 22, ly);
+  ctx.stroke();
+  labelStyle();
+  ctx.fillText('Commit edge', lTextX, ly);
 
   ly += lSpacing;
   // Even round column
-  ctx.fillStyle = 'rgba(0,210,160,0.12)';
-  ctx.fillRect(legendX + 10, ly - 5, 12, 10);
-  ctx.fillStyle = 'rgba(0,210,160,0.5)';
-  ctx.font = '7px JetBrains Mono';
-  ctx.fillText('R2', legendX + 12, ly + 3);
-  ctx.fillStyle = '#9a9ab8';
-  ctx.font = '8px JetBrains Mono';
-  ctx.fillText('Even round (commit)', legendX + 28, ly + 3);
+  ctx.fillStyle = 'rgba(0,210,160,0.15)';
+  ctx.fillRect(legendX + 10, ly - 6, 12, 12);
+  ctx.fillStyle = 'rgba(0,210,160,0.6)';
+  ctx.font = 'bold 7px JetBrains Mono';
+  ctx.textAlign = 'center';
+  ctx.fillText('R2', legendX + 16, ly);
+  labelStyle();
+  ctx.fillText('Even round (commit)', lTextX, ly);
 
   ly += lSpacing;
   // Validator color
   ctx.fillStyle = '#ff6b6b';
   ctx.beginPath();
-  ctx.arc(legendX + 13, ly, 3, 0, Math.PI * 2);
+  ctx.arc(legendX + 13, ly, 3.5, 0, Math.PI * 2);
   ctx.fill();
   ctx.fillStyle = '#ffd93d';
   ctx.beginPath();
-  ctx.arc(legendX + 19, ly, 3, 0, Math.PI * 2);
+  ctx.arc(legendX + 20, ly, 3.5, 0, Math.PI * 2);
   ctx.fill();
-  ctx.fillStyle = '#9a9ab8';
-  ctx.fillText('Color = validator ID', legendX + 28, ly + 3);
+  labelStyle();
+  ctx.fillText('Color = validator ID', lTextX, ly);
 
   ly += lSpacing;
   // Number inside vertex
@@ -1070,11 +1073,11 @@ function drawDAGFrame() {
   ctx.fillStyle = '#fff';
   ctx.font = 'bold 7px JetBrains Mono';
   ctx.textAlign = 'center';
-  ctx.fillText('N', legendX + 16, ly + 2.5);
-  ctx.fillStyle = '#9a9ab8';
-  ctx.font = '8px JetBrains Mono';
-  ctx.textAlign = 'left';
-  ctx.fillText('N = event count', legendX + 28, ly + 3);
+  ctx.fillText('N', legendX + 16, ly);
+  labelStyle();
+  ctx.fillText('N = event count', lTextX, ly);
+
+  ctx.restore();
 }
 
 // ─── WebSocket (live updates) ────────────────────────────────────────────────
