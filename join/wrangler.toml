@@ -1,5 +1,5 @@
 name = "persistia-node"
-main = "src/index.ts"
+main = "../src/index.ts"
 compatibility_date = "2026-03-01"
 compatibility_flags = ["nodejs_compat"]
 
@@ -17,8 +17,15 @@ new_sqlite_classes = ["PersistiaWorldV4"]
 
 # ─── Required: Set these for your node ─────────────────────────────────
 [vars]
-# Your node's public URL (your worker's *.workers.dev URL)
+# Your node's public URL — set this to your worker's *.workers.dev URL.
+# This is how other nodes will reach you via gossip.
 # NODE_URL = "https://persistia-node.YOUR_SUBDOMAIN.workers.dev"
 
-# Seed nodes to bootstrap into the network
+# Seed nodes to bootstrap into the existing Persistia network.
+# These are the genesis nodes — your node will sync chain state from them.
 SEED_NODES = "https://persistia.carnation-903.workers.dev/?shard=node-1,https://persistia.carnation-903.workers.dev/?shard=node-2,https://persistia.carnation-903.workers.dev/?shard=node-3"
+
+# Shard names — leave empty for single-node external deployments.
+# The seed node uses "node-1,node-2,node-3" for its multi-shard setup.
+# External nodes should NOT set this (they run a single DO).
+# SHARD_NAMES = ""

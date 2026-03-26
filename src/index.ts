@@ -124,8 +124,10 @@ export default {
 
     // ─── Join network ─────────────────────────────────────────────────
     // POST /join — External node announces itself to all seed shards.
-    // Body: { "url": "https://my-node.example.workers.dev", "shard": "node-1" }
-    // The seed nodes add the joiner as a peer, and respond with network info.
+    // Body: { "url": "https://my-node.example.workers.dev", "shard": "global-world",
+    //         "pubkey": "...", "pow_nonce": "...", "signature": "..." }
+    // The seed nodes add the joiner as a peer. If pubkey + pow_nonce are provided,
+    // also registers as a validator on each shard.
     if (url.pathname === "/join" && request.method === "POST") {
       const body = await request.json() as any;
       const joinerUrl = body.url;
@@ -134,31 +136,65 @@ export default {
         return corsResponse(JSON.stringify({ error: "url required (your node's public URL)" }), 400);
       }
 
-      // Register joiner on all 3 seed shards
+      // Determine the effective peer URL for this joiner
+      // External nodes use their root URL directly (no shard routing)
+      const peerUrl = joinerShard === "global-world"
+        ? joinerUrl
+        : `${joinerUrl}/?shard=${joinerShard}`;
+
+      // Register joiner on all seed shards
       const shards = ["node-1", "node-2", "node-3"];
       const results: any[] = [];
       for (const seed of shards) {
         try {
           const seedId = env.PERSISTIA_WORLD.idFromName(seed);
           const seedStub = env.PERSISTIA_WORLD.get(seedId);
+
+          // Add as peer
           const addRes = await seedStub.fetch(new Request(`${url.origin}/addNode?shard=${seed}`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ url: `${joinerUrl}/?shard=${joinerShard}` }),
+            headers: { "Content-Type": "application/json", "X-Shard-Name": seed },
+            body: JSON.stringify({ url: peerUrl, pubkey: body.pubkey }),
           }));
           const r = await addRes.json() as any;
-          results.push({ shard: seed, ok: r.ok ?? true });
+          const seedResult: any = { shard: seed, peer: r.ok ?? true };
+
+          // Register as validator if PoW provided
+          if (body.pubkey && body.pow_nonce && body.signature) {
+            try {
+              const valRes = await seedStub.fetch(new Request(`${url.origin}/validator/register?shard=${seed}`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json", "X-Shard-Name": seed },
+                body: JSON.stringify({
+                  pubkey: body.pubkey,
+                  url: peerUrl,
+                  pow_nonce: body.pow_nonce,
+                  signature: body.signature,
+                }),
+              }));
+              const vr = await valRes.json() as any;
+              seedResult.validator = vr.ok ?? false;
+              if (vr.error) seedResult.validator_error = vr.error;
+            } catch (e: any) {
+              seedResult.validator = false;
+              seedResult.validator_error = e.message;
+            }
+          }
+
+          results.push(seedResult);
         } catch (e: any) {
-          results.push({ shard: seed, ok: false, error: e.message });
+          results.push({ shard: seed, peer: false, error: e.message });
         }
       }
 
-      // Also tell the joiner about the seed nodes (reverse peering)
+      // Tell the joiner about the seed nodes (reverse peering)
       const seedUrls = shards.map(s => `${url.origin}/?shard=${s}`);
 
       return corsResponse(JSON.stringify({
         ok: true,
-        message: "Node registered with seed shards. Add these as your SEED_NODES.",
+        message: body.pow_nonce
+          ? "Node registered as peer and validator on seed shards."
+          : "Node registered as peer. To become a validator, include pubkey + pow_nonce + signature.",
         seed_nodes: seedUrls,
         results,
       }));

@@ -443,46 +443,55 @@ export class PersistiaWorldV4 implements DurableObject {
 
   private updateShardAwareUrl(requestUrl: URL) {
     const sql = this.state.storage.sql;
-    // Build shard-qualified URL: https://host/?shard=node-1
-    const shardUrl = `${requestUrl.origin}/?shard=${this.shardName}`;
+
+    let resolvedUrl: string;
+    if (this.env.NODE_URL) {
+      // External node: use explicitly configured URL (no shard routing)
+      resolvedUrl = this.env.NODE_URL;
+    } else {
+      // Multi-shard deployment: construct shard-qualified URL
+      resolvedUrl = `${requestUrl.origin}/?shard=${this.shardName}`;
+    }
 
     // Update node identity URL
-    this.nodeIdentity!.url = shardUrl;
-    this.nodeUrl = shardUrl;
-    sql.exec("UPDATE node_identity SET node_url = ?", shardUrl);
+    this.nodeIdentity!.url = resolvedUrl;
+    this.nodeUrl = resolvedUrl;
+    sql.exec("UPDATE node_identity SET node_url = ?", resolvedUrl);
 
     // Update self in active_nodes
     sql.exec(
       "UPDATE active_nodes SET url = ? WHERE pubkey = ? AND is_self = 1",
-      shardUrl, this.nodeIdentity!.pubkey,
+      resolvedUrl, this.nodeIdentity!.pubkey,
     );
     this.invalidateActiveCache();
 
     // Auto-seed sibling shards — discover peers we lost after deploy
-    const siblingShards = (this.env.SHARD_NAMES || "node-1,node-2,node-3")
-      .split(",").map((s: string) => s.trim()).filter((s: string) => s && s !== this.shardName);
-    const siblingUrls = siblingShards.map((s: string) => `${requestUrl.origin}/?shard=${s}`);
+    // (only relevant for multi-shard deployments, not external nodes)
+    if (!this.env.NODE_URL) {
+      const siblingShards = (this.env.SHARD_NAMES || "node-1,node-2,node-3")
+        .split(",").map((s: string) => s.trim()).filter((s: string) => s && s !== this.shardName);
+      const siblingUrls = siblingShards.map((s: string) => `${requestUrl.origin}/?shard=${s}`);
 
-    // Bootstrap from siblings in the background
-    if (siblingUrls.length > 0) {
-      this.gossipManager.bootstrapFromSeeds(siblingUrls)
-        .then(n => {
-          if (n > 0) {
-            console.log(`Shard ${this.shardName}: discovered ${n} sibling peers`);
-            for (const peer of this.gossipManager.getPeers()) {
-              if (peer.pubkey && peer.url) {
-                sql.exec(
-                  `INSERT INTO active_nodes (pubkey, url, last_vertex_round, last_seen, is_self)
-                   VALUES (?, ?, 0, ?, 0)
-                   ON CONFLICT(pubkey) DO UPDATE SET url = ?, last_seen = ?`,
-                  peer.pubkey, peer.url, Date.now(), peer.url, Date.now(),
-                );
+      if (siblingUrls.length > 0) {
+        this.gossipManager.bootstrapFromSeeds(siblingUrls)
+          .then(n => {
+            if (n > 0) {
+              console.log(`Shard ${this.shardName}: discovered ${n} sibling peers`);
+              for (const peer of this.gossipManager.getPeers()) {
+                if (peer.pubkey && peer.url) {
+                  sql.exec(
+                    `INSERT INTO active_nodes (pubkey, url, last_vertex_round, last_seen, is_self)
+                     VALUES (?, ?, 0, ?, 0)
+                     ON CONFLICT(pubkey) DO UPDATE SET url = ?, last_seen = ?`,
+                    peer.pubkey, peer.url, Date.now(), peer.url, Date.now(),
+                  );
+                }
               }
+              this.invalidateActiveCache();
             }
-            this.invalidateActiveCache();
-          }
-        })
-        .catch(e => console.warn(`Sibling bootstrap failed: ${e.message}`));
+          })
+          .catch(e => console.warn(`Sibling bootstrap failed: ${e.message}`));
+      }
     }
   }
 
@@ -2381,16 +2390,15 @@ export class PersistiaWorldV4 implements DurableObject {
       }
 
       case "/gossip/sync": {
-        // Rate-limit sync requests by IP (no pubkey available on GET)
-        // Sync is expensive — cap at 10 requests/min per caller
+        // Rate-limit sync requests by IP — higher limit for bootstrapping nodes
         const syncCaller = req.headers.get("CF-Connecting-IP") || "unknown";
-        if (!this.validatorRegistry.checkRateLimit(`sync:${syncCaller}`, 60_000, 10)) {
+        if (!this.validatorRegistry.checkRateLimit(`sync:${syncCaller}`, 60_000, 30)) {
           return this.json({ error: "Sync rate limited" }, 429);
         }
 
         // Respond to sync requests from peers
         const afterRound = parseInt(url.searchParams.get("after_round") || "0");
-        const limit = Math.min(parseInt(url.searchParams.get("limit") || "500"), 500);
+        const limit = Math.min(parseInt(url.searchParams.get("limit") || "2000"), 2000);
 
         const vertices = [...this.state.storage.sql.exec(
           "SELECT hash, author, round, events_json, refs_json, signature, timestamp FROM dag_vertices WHERE round >= ? ORDER BY round ASC, hash ASC LIMIT ?",

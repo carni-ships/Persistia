@@ -144,13 +144,13 @@
     .main {
       display: grid;
       grid-template-columns: 1fr 320px;
-      grid-template-rows: 1fr auto;
+      grid-template-rows: 1fr 240px;
       height: calc(100vh - 130px);
       gap: 1px;
       background: var(--border);
     }
 
-    .main .dag-panel { grid-column: 1; grid-row: 1; }
+    .main .dag-panel { grid-column: 1; grid-row: 1; min-height: 0; }
     .main .events-panel { grid-column: 2; grid-row: 1 / 3; }
     .main .bottom-row {
       grid-column: 1; grid-row: 2;
@@ -158,6 +158,8 @@
       grid-template-columns: 1fr 1fr;
       gap: 1px;
       background: var(--border);
+      max-height: 240px;
+      overflow: hidden;
     }
 
     .panel {
@@ -197,7 +199,7 @@
       display: block;
     }
 
-    .dag-panel .panel-body { overflow: hidden; }
+    .dag-panel .panel-body { overflow: auto; }
 
     /* ─── Event Log ──────────────────────────────────────── */
     .event-list {
@@ -885,7 +887,22 @@ function drawDAGFrame() {
   const container = canvas.parentElement;
   const dpr = window.devicePixelRatio || 1;
   const cw = container.clientWidth;
-  const ch = container.clientHeight;
+
+  const vertices = dagData.vertices;
+
+  // Pre-compute author count to determine needed canvas height
+  let neededH;
+  const ROW_H = 50;
+  const PAD_T = 40;
+  if (vertices.length === 0) {
+    neededH = container.clientHeight;
+  } else {
+    const rounds = [...new Set(vertices.map(v => v.round))].sort((a,b) => a-b);
+    const recentCutoff = rounds.length > 0 ? rounds[rounds.length - 1] - 20 : 0;
+    const recentAuthors = new Set(vertices.filter(v => v.round >= recentCutoff).map(v => v.author));
+    neededH = Math.max(container.clientHeight, PAD_T + recentAuthors.size * ROW_H + 20);
+  }
+  const ch = neededH;
 
   if (canvas.width !== cw * dpr || canvas.height !== ch * dpr) {
     canvas.width = cw * dpr;
@@ -902,7 +919,6 @@ function drawDAGFrame() {
   ctx.fillStyle = 'rgba(13,17,23,0.92)';
   ctx.fillRect(0, 0, W, H);
 
-  const vertices = dagData.vertices;
   if (vertices.length === 0) {
     ctx.fillStyle = '#7a7a8e';
     ctx.font = '12px JetBrains Mono';
@@ -919,9 +935,7 @@ function drawDAGFrame() {
   const authors = [...recentAuthors];
 
   const COL_W = 60;
-  const ROW_H = 50;
   const PAD_L = 70;
-  const PAD_T = 40;
   const maxCols = Math.floor((W - PAD_L - 220) / COL_W); // 220 = legend width + padding
   const visibleRounds = rounds.slice(-maxCols);
   const minRound = visibleRounds[0] || 0;
