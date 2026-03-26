@@ -262,4 +262,4 @@ The generator creates Ed25519 agents, builds structures, then transitions to org
 
 ## License
 
-[Apache 2.0](LICENSE)
+[AGPL v3](LICENSE)

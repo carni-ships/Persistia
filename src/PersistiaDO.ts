@@ -843,16 +843,32 @@ export class PersistiaWorldV4 implements DurableObject {
         // 3. Pull from gossip peers
         await this.gossipSync();
 
-        // 4. Create vertex for current round if we haven't yet
+        // 4. Refresh self-node last_seen so dashboard shows node as active
+        this.state.storage.sql.exec(
+          `UPDATE active_nodes SET last_seen = ? WHERE pubkey = ? AND is_self = 1`,
+          Date.now(), this.nodeIdentity.pubkey,
+        );
+        this.invalidateActiveCache();
+
+        // 5. Create vertex for current round if we haven't yet
         const existing = [...this.state.storage.sql.exec(
           "SELECT hash FROM dag_vertices WHERE author = ? AND round = ?",
           this.nodeIdentity.pubkey, this.currentRound,
         )];
         if (existing.length === 0) {
           await this.createAndBroadcastVertex();
+        } else {
+          // Already created a vertex for this round but round didn't advance (no quorum).
+          // Force-advance the round so nodes don't get permanently stuck after deploys.
+          // The vertex we create at the new round will reference peers' vertices,
+          // eventually building enough cross-references for quorum to form.
+          this.currentRound++;
+          this.setKV("current_round", this.currentRound.toString());
+          this.invalidateActiveCache();
+          await this.createAndBroadcastVertex();
         }
 
-        // 5. Anchor state if due
+        // 6. Anchor state if due
         await this.maybeAnchorState();
       }
 
@@ -862,8 +878,9 @@ export class PersistiaWorldV4 implements DurableObject {
 
       // 7. Prune old DAG data to stay within free-tier row limits
       // Keep last 100 rounds of vertices, prune 200 per cycle to avoid heavy deletes
+      // IMPORTANT: Never prune rounds that haven't been committed yet
       if (this.currentRound > 150) {
-        const pruneBelow = this.currentRound - 100;
+        const pruneBelow = Math.min(this.currentRound - 100, this.lastCommittedRound);
         this.state.storage.sql.exec(
           "DELETE FROM dag_vertices WHERE rowid IN (SELECT rowid FROM dag_vertices WHERE round < ? LIMIT 200)",
           pruneBelow,
@@ -1187,6 +1204,61 @@ export class PersistiaWorldV4 implements DurableObject {
         this.currentRoot = await sha256("");
         await this.loadState();
         return this.json({ ok: true, message: "Storage reset. Node will reinitialize on next alarm." });
+      }
+
+      case "/admin/skip-to-round": {
+        if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+        const skipRound = parseInt(url.searchParams.get("round") || "0");
+        if (skipRound <= this.lastCommittedRound) return this.json({ error: "Round must be after current last_committed_round" }, 400);
+        this.lastCommittedRound = skipRound;
+        this.setKV("last_committed_round", skipRound.toString());
+        return this.json({ ok: true, last_committed_round: skipRound });
+      }
+
+      case "/admin/try-commit": {
+        if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+        try {
+          const activeCount = this.getActiveNodeCount();
+          const activePubkeys = this.getActivePubkeys();
+          const diagnostics: any[] = [];
+          for (let r = this.lastCommittedRound + 2; r <= this.currentRound - 1 && diagnostics.length < 5; r += 2) {
+            const existing = [...this.state.storage.sql.exec("SELECT round FROM dag_commits WHERE round = ?", r)];
+            const verts = [...this.state.storage.sql.exec("SELECT hash, author, refs_json FROM dag_vertices WHERE round = ? OR round = ?", r, r + 1)] as any[];
+            const leader = await selectLeader(r, activePubkeys);
+            const roundVerts = verts.filter((v: any) => v.round === r);
+            const nextVerts = verts.filter((v: any) => v.round === r + 1);
+            const anchorExists = roundVerts.some((v: any) => v.author === leader);
+            const refsToAnchor = anchorExists ? nextVerts.filter((v: any) => {
+              const refs = JSON.parse(v.refs_json);
+              return refs.some((ref: string) => roundVerts.find((rv: any) => rv.author === leader && rv.hash === ref));
+            }).length : 0;
+            diagnostics.push({
+              round: r,
+              already_committed: existing.length > 0,
+              leader: leader.slice(0, 12),
+              round_verts: roundVerts.length,
+              next_round_verts: nextVerts.length,
+              anchor_exists: anchorExists,
+              refs_to_anchor: refsToAnchor,
+              quorum: getQuorumSize(activeCount),
+            });
+          }
+          const committed = await this.tryCommitRounds();
+          return this.json({ ok: true, committed, last_committed_round: this.lastCommittedRound, activeCount, activePubkeys: activePubkeys.map((p: string) => p.slice(0, 12)), diagnostics });
+        } catch (e: any) {
+          return this.json({ ok: false, error: e.message, stack: e.stack });
+        }
+      }
+
+      case "/admin/set-round": {
+        if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+        const setRound = parseInt(url.searchParams.get("round") || "0");
+        if (setRound < this.lastCommittedRound) return this.json({ error: "Round must be >= last_committed_round" }, 400);
+        const prevRound = this.currentRound;
+        this.currentRound = setRound;
+        this.setKV("current_round", setRound.toString());
+        this.scheduleAlarm();
+        return this.json({ ok: true, previous_round: prevRound, current_round: setRound });
       }
 
       case "/admin/prune": {
@@ -2157,21 +2229,36 @@ export class PersistiaWorldV4 implements DurableObject {
     );
 
     // Run round advancement + commits once after all vertices are stored
-    if (result.synced > 0) {
-      // Fast-forward: if synced vertices are far ahead, jump to their round range
-      // instead of advancing round-by-round (which would take forever with pruned history).
-      const maxSyncedRound = [...this.state.storage.sql.exec(
-        "SELECT MAX(round) as mr FROM dag_vertices"
-      )];
-      const peerMaxRound = (maxSyncedRound[0]?.mr ?? this.currentRound) as number;
-      if (peerMaxRound > this.currentRound + ACTIVE_WINDOW) {
-        // Jump to peerMaxRound - 2 so we can participate in current rounds
-        const jumpTo = peerMaxRound - 2;
+    const maxSyncedRound = [...this.state.storage.sql.exec(
+      "SELECT MAX(round) as mr FROM dag_vertices"
+    )];
+    const peerMaxRound = (maxSyncedRound[0]?.mr ?? this.currentRound) as number;
+
+    if (peerMaxRound > this.currentRound) {
+      // Fast-forward: if we can't advance through quorum round-by-round,
+      // jump to where peers are so we can participate in current rounds.
+      // This handles post-deploy restarts where nodes are at different rounds
+      // and intermediate rounds lack quorum.
+      const advanced = this.tryAdvanceRound();
+      if (!advanced && peerMaxRound > this.currentRound + 2) {
+        const jumpTo = peerMaxRound - 1;
         console.log(`Fast-forward: round ${this.currentRound} → ${jumpTo} (peers at ${peerMaxRound})`);
         this.currentRound = jumpTo;
         this.setKV("current_round", this.currentRound.toString());
+        this.invalidateActiveCache();
+        // Also skip commits past the gap to prevent commit stall
+        if (this.lastCommittedRound < jumpTo - 2) {
+          // Find the latest dag_commit in the DB to recover from partial commits
+          const latestCommit = [...this.state.storage.sql.exec(
+            "SELECT MAX(round) as mr FROM dag_commits"
+          )];
+          const latestCommitRound = (latestCommit[0]?.mr ?? this.lastCommittedRound) as number;
+          if (latestCommitRound > this.lastCommittedRound) {
+            this.lastCommittedRound = latestCommitRound;
+            this.setKV("last_committed_round", latestCommitRound.toString());
+          }
+        }
       }
-      const advanced = this.tryAdvanceRound();
       const committed = await this.tryCommitRounds();
       if (advanced || committed) this.scheduleReactiveAlarm();
       this.broadcastToChannel("status", { type: "status.update", ...this.getConsensusStatus() });
@@ -2736,11 +2823,18 @@ export class PersistiaWorldV4 implements DurableObject {
     // Check uncommitted even rounds — cap at 10 commits per cycle to avoid CPU exhaustion
     let commitsThisCycle = 0;
     for (let r = this.lastCommittedRound + 2; r <= this.currentRound - 1 && commitsThisCycle < 10; r += 2) {
-      // Already committed?
+      // Already committed? If so, advance lastCommittedRound past it
+      // (handles the case where commitAnchor partially succeeded — wrote dag_commits but crashed before updating KV)
       const existing = [...this.state.storage.sql.exec(
         "SELECT round FROM dag_commits WHERE round = ?", r,
       )];
-      if (existing.length > 0) continue;
+      if (existing.length > 0) {
+        if (r > this.lastCommittedRound) {
+          this.lastCommittedRound = r;
+          this.setKV("last_committed_round", r.toString());
+        }
+        continue;
+      }
 
       // Build vertex data for this round and next
       const verticesByRound = new Map<number, VertexNode[]>();
@@ -2764,8 +2858,12 @@ export class PersistiaWorldV4 implements DurableObject {
 
       const result = checkCommit(r, leader, verticesByRound, activeCount);
       if (result.committed && result.anchorHash) {
-        await this.commitAnchor(r, result.anchorHash);
-        commitsThisCycle++;
+        try {
+          await this.commitAnchor(r, result.anchorHash);
+          commitsThisCycle++;
+        } catch (e: any) {
+          console.error(`commitAnchor failed at round ${r}: ${e.message}\n${e.stack}`);
+        }
       }
     }
     return commitsThisCycle > 0;

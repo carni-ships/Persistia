@@ -311,6 +311,65 @@
       color: var(--text-dim);
     }
 
+    /* ─── Finality Levels ─────────────────────────────────── */
+    .finality-levels { padding: 8px 12px; }
+
+    .finality-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 5px 0;
+      font-size: 11px;
+    }
+
+    .finality-row + .finality-row {
+      border-top: 1px solid rgba(42,42,58,0.3);
+    }
+
+    .finality-badge {
+      width: 22px;
+      height: 18px;
+      border-radius: 3px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 9px;
+      font-weight: 700;
+      flex-shrink: 0;
+    }
+
+    .finality-name {
+      flex: 1;
+      min-width: 0;
+      color: var(--text-dim);
+      font-size: 10px;
+    }
+
+    .finality-value {
+      font-weight: 600;
+      font-size: 11px;
+      text-align: right;
+      white-space: nowrap;
+    }
+
+    .finality-bar-track {
+      height: 3px;
+      background: var(--surface-2);
+      border-radius: 2px;
+      margin-top: 6px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .finality-bar-fill {
+      height: 100%;
+      border-radius: 2px;
+      transition: width 0.6s ease;
+      position: absolute;
+      left: 0;
+      top: 0;
+    }
+
     /* ─── Scrollbar ──────────────────────────────────────── */
     ::-webkit-scrollbar { width: 6px; }
     ::-webkit-scrollbar-track { background: transparent; }
@@ -410,6 +469,45 @@
       </div>
       <div class="panel-body">
         <div class="node-list" id="node-list"></div>
+        <!-- Finality Levels -->
+        <div style="border-top:1px solid var(--border)">
+          <div class="panel-header">
+            <span class="panel-title">Finality Levels</span>
+          </div>
+          <div class="finality-levels" id="finality-levels">
+            <div class="finality-row">
+              <div class="finality-badge" style="background:rgba(72,191,227,0.2);color:#48bfe3">L0</div>
+              <div class="finality-name">Optimistic</div>
+              <div class="finality-value" style="color:#48bfe3" id="fin-l0">--</div>
+            </div>
+            <div class="finality-row">
+              <div class="finality-badge" style="background:rgba(108,92,231,0.2);color:#6c5ce7">L1</div>
+              <div class="finality-name">DAG Inclusion</div>
+              <div class="finality-value" style="color:#6c5ce7" id="fin-l1">--</div>
+            </div>
+            <div class="finality-row">
+              <div class="finality-badge" style="background:rgba(0,210,160,0.2);color:#00d2a0">L2</div>
+              <div class="finality-name">BFT Commit</div>
+              <div class="finality-value" style="color:#00d2a0" id="fin-l2">--</div>
+            </div>
+            <div class="finality-row">
+              <div class="finality-badge" style="background:rgba(255,107,107,0.2);color:#ff6b6b">L3</div>
+              <div class="finality-name">ZK Proven</div>
+              <div class="finality-value" style="color:#ff6b6b" id="fin-l3">--</div>
+            </div>
+            <div class="finality-row">
+              <div class="finality-badge" style="background:rgba(255,209,102,0.2);color:#ffd166">L4</div>
+              <div class="finality-name">DA Anchored</div>
+              <div class="finality-value" style="color:#ffd166" id="fin-l4">--</div>
+            </div>
+            <div class="finality-bar-track">
+              <div class="finality-bar-fill" id="fin-bar-l4" style="width:0%;background:#ffd166;opacity:0.4;z-index:1"></div>
+              <div class="finality-bar-fill" id="fin-bar-l3" style="width:0%;background:#ff6b6b;opacity:0.5;z-index:2"></div>
+              <div class="finality-bar-fill" id="fin-bar-l2" style="width:0%;background:#00d2a0;opacity:0.6;z-index:3"></div>
+              <div class="finality-bar-fill" id="fin-bar-l1" style="width:0%;background:#6c5ce7;opacity:0.7;z-index:4"></div>
+            </div>
+          </div>
+        </div>
         <!-- ZK Progress -->
         <div style="border-top:1px solid var(--border)">
           <div class="panel-header">
@@ -484,10 +582,11 @@ let lastSyncSeq = 0;
 async function poll() {
   try {
     // Fetch all data in parallel
-    const [status, sync, zkStatus] = await Promise.all([
+    const [status, sync, zkStatus, anchorStatus] = await Promise.all([
       api('/dag/status'),
       api(`/dag/sync?after_round=${lastSyncRound}&after_seq=${lastSyncSeq}&limit=200`),
       api('/proof/zk/status').catch(() => null),
+      api('/anchor/latest').catch(() => null),
     ]);
 
     if (!connected) {
@@ -573,6 +672,9 @@ async function poll() {
       document.getElementById('zk-gap').textContent = gap > 0 ? `gap: ${gap}` : 'caught up';
     }
 
+    // Finality levels — anchor response includes bundle with last_committed_round
+    updateFinality(status, zkStatus, anchorStatus && !anchorStatus.error ? anchorStatus : null);
+
     // Update nodes panel
     try {
       const peers = await api('/admin/peers');
@@ -639,6 +741,48 @@ function renderNodes(nodes) {
       </div>
     `;
   }).join('');
+}
+
+// ─── Finality Levels ──────────────────────────────────────────────────────────
+let finalityState = { l0: 0, l1: 0, l2: 0, l3: 0, l4: 0 };
+
+function updateFinality(status, zkStatus, anchorStatus) {
+  // L0: events accepted but awaiting vertex inclusion
+  const pending = status.pending_events || 0;
+  // L1: current round (DAG inclusion — events are in signed vertices)
+  const l1 = status.current_round || 0;
+  // L2: last committed round (BFT commit)
+  const l2 = status.last_committed_round >= 0 ? status.last_committed_round : 0;
+  // L3: latest ZK proven block
+  const l3 = zkStatus ? (zkStatus.latest_proven_block || 0) : finalityState.l3;
+  // L4: latest anchored block (from anchor bundle, even if not confirmed on-chain)
+  const l4 = anchorStatus ? (anchorStatus.bundle?.last_committed_round || 0) : finalityState.l4;
+
+  finalityState = { l0: pending, l1, l2, l3, l4 };
+
+  document.getElementById('fin-l0').textContent = pending > 0 ? `${pending} queued` : 'clear';
+  document.getElementById('fin-l1').textContent = l1 > 0 ? `R${l1}` : '--';
+  document.getElementById('fin-l2').textContent = l2 > 0 ? `R${l2}` : '--';
+  document.getElementById('fin-l3').textContent = l3 > 0 ? `R${l3}` : '--';
+  const l4Status = anchorStatus?.status;
+  if (l4 > 0 && l4Status === 'confirmed') {
+    document.getElementById('fin-l4').textContent = `R${l4}`;
+  } else if (l4 > 0) {
+    document.getElementById('fin-l4').textContent = `R${l4}`;
+    document.getElementById('fin-l4').style.opacity = '0.5';
+  } else {
+    document.getElementById('fin-l4').textContent = '--';
+    document.getElementById('fin-l4').style.opacity = '0.5';
+  }
+
+  // Stacked bar: each level as % of L1 (the frontier)
+  if (l1 > 0) {
+    const pct = (v) => Math.min(100, (v / l1) * 100).toFixed(1) + '%';
+    document.getElementById('fin-bar-l1').style.width = '100%';
+    document.getElementById('fin-bar-l2').style.width = pct(l2);
+    document.getElementById('fin-bar-l3').style.width = pct(l3);
+    document.getElementById('fin-bar-l4').style.width = pct(l4);
+  }
 }
 
 // ─── DAG Canvas (Animated) ───────────────────────────────────────────────────
@@ -1122,6 +1266,7 @@ function connectWS() {
           ? msg.last_committed_round : '--';
         document.getElementById('s-events').textContent = msg.finalized_seq;
         document.getElementById('s-nodes').textContent = msg.active_nodes;
+        updateFinality(msg, null, null);
         return;
       }
 

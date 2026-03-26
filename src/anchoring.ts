@@ -436,7 +436,7 @@ export class AnchorManager {
 
   getLatestAnchor(): AnchorRecord | null {
     const rows = [...this.sql.exec(
-      "SELECT id, bundle_json, celestia_height, celestia_commitment, status, created_at, confirmed_at FROM anchors WHERE status IN ('submitted', 'confirmed') ORDER BY created_at DESC LIMIT 1",
+      "SELECT id, bundle_json, celestia_height, celestia_commitment, status, created_at, confirmed_at FROM anchors ORDER BY created_at DESC LIMIT 1",
     )] as any[];
 
     if (rows.length === 0) return null;

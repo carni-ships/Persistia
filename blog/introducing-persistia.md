@@ -184,6 +184,132 @@ We built a compatibility shim (`cosmwasm-compat`) that maps CosmWasm's message-p
 
 This opens the door to porting existing CosmWasm applications — DEXs, lending protocols, NFT marketplaces — onto Persistia without rewriting business logic.
 
+## Autonomous Execution: Contracts That Wake Themselves Up
+
+On nearly every blockchain, smart contracts are inert. They sit in storage until an externally owned account (EOA) submits a transaction that invokes them. A lending protocol can't liquidate an undercollateralized position on its own — it needs a keeper bot watching off-chain and submitting a transaction at the right moment. A subscription service can't charge monthly fees without someone calling the `charge()` function. A game can't advance its world state without a crank-turner.
+
+This is such a fundamental constraint that entire businesses exist to work around it: Chainlink Automation (formerly Keepers), Gelato Network, OpenZeppelin Defender. These are centralized or semi-centralized services that monitor conditions off-chain and submit transactions on behalf of contracts. They add latency, cost, and a trust dependency on a third party.
+
+Persistia doesn't have this limitation. Contracts can register **triggers** — scheduled method calls that the infrastructure executes autonomously, without any external transaction.
+
+### How Triggers Work
+
+A contract calls the `trigger_manage` host function to register a trigger:
+
+```
+{
+  "action": "create",
+  "method": "update_prices",      // method to call
+  "interval_ms": 60000,           // every 60 seconds
+  "max_fires": 0                  // 0 = unlimited
+}
+```
+
+The trigger is stored in the `triggers` table. On every alarm cycle (~12 seconds), the Durable Object checks for due triggers:
+
+1. `getDueTriggers()` — find all triggers where `next_fire <= now`
+2. `contractExecutor.call()` — execute the contract method, with the trigger ID as the caller identity
+3. `markFired()` — advance `next_fire` by the interval, increment the fire count, disable if `max_fires` reached
+4. Process any emitted side effects — the triggered call can itself create new triggers or request oracle data
+
+The DO alarm scheduler adapts: `scheduleAlarm()` picks `min(next_round_time, next_trigger_fire)`, so triggers aren't bottlenecked by the consensus round interval. A trigger with a 10-second interval will fire at approximately 10-second intervals, not 12.
+
+### What This Enables
+
+- **Self-liquidating lending**: The contract checks collateral ratios on its own schedule and liquidates when conditions are met — no keeper bot
+- **Subscription billing**: A SaaS contract charges users every month by calling its own `charge()` method
+- **Game loops**: A world contract advances NPC behavior, weather, resource regeneration every N seconds
+- **Recurring oracle refreshes**: A trigger calls `refresh_price()` which emits an oracle request, and the oracle callback updates the price feed — fully autonomous data pipeline
+- **Self-destruct timers**: A contract schedules its own cleanup after an expiration period
+
+### Composability: Triggers + Oracles
+
+Triggered calls can emit oracle requests, and oracle callbacks can create new triggers. This creates autonomous feedback loops:
+
+```
+Trigger fires every 60s → contract calls refresh_price()
+  → emits oracle_request("https://api.coingecko.com/...")
+  → oracle system fetches with multi-node consensus
+  → callback delivers price to contract
+  → contract updates state, checks thresholds
+  → if price crossed threshold → emits new trigger for emergency action
+```
+
+No human in the loop. No keeper bot. No Gelato subscription. The contract drives its own execution lifecycle.
+
+### Constraints
+
+- Minimum interval: 10 seconds (prevents alarm spam)
+- Maximum interval: 24 hours
+- Per-contract limit: 10 active triggers
+- Fuel metering applies: triggered calls consume fuel like any contract call
+- Only the creator can remove a trigger
+
+The key insight is architectural: because Persistia validators are Durable Objects with a built-in alarm scheduler, autonomous execution is free. It's not a service bolted on — it's a consequence of running consensus on infrastructure that already has a cron primitive.
+
+## Reading Web2 Data: Native Oracles
+
+On Ethereum, if your contract needs an off-chain data point — a price, a weather reading, an API response — you have three options: deploy a Chainlink oracle network ($$$), run your own relay bot (centralized), or use a commit-reveal scheme (complex, slow). The problem is fundamental: EVM execution is deterministic and isolated. Contracts can't call `fetch()`.
+
+Persistia contracts can. The oracle system is a native host function, not an external service.
+
+### How It Works
+
+A contract calls the `oracle_request` host function with a URL, a callback method, an aggregation strategy, and an optional JSON path:
+
+```
+oracle_request(
+  url: "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd",
+  callback: "on_price_received",
+  aggregation: "median",
+  json_path: "ethereum.usd"
+)
+```
+
+The request is emitted as a side effect during contract execution and stored in the `oracle_requests` table. On the next alarm cycle, `processPendingOracles()` picks it up:
+
+**Single-node mode:** The node fetches the URL, extracts the value at the JSON path, and delivers it directly to the contract's callback method.
+
+**Multi-node mode:** Each validator independently fetches the URL and stores its result. When enough responses arrive (quorum = 2f+1), the results are aggregated and the consensus value is delivered to the contract callback. This prevents any single node from injecting false data.
+
+### Aggregation Strategies
+
+| Strategy | Behavior | Use Case |
+|----------|----------|----------|
+| `identical` | All nodes must return the exact same value | Deterministic APIs (block heights, hashes) |
+| `median` | Numeric median of all responses | Price feeds, temperature readings |
+| `majority` | Most common value if it meets quorum | Enum data, status checks |
+
+### The Callback Pattern
+
+The oracle delivers data by calling the contract's specified callback method with the result as input. The contract processes it like any other call — it can update storage, emit events, create triggers, or make further oracle requests:
+
+```rust
+#[no_mangle]
+pub extern "C" fn on_price_received() {
+    let data = input();  // oracle delivers: { value: "3521.42", sources: 3 }
+    let price: f64 = parse_price(&data);
+    storage_write(b"eth_price", &price.to_le_bytes());
+
+    // React to the data autonomously
+    if price < threshold() {
+        // emit another oracle request, create a trigger, etc.
+    }
+}
+```
+
+### Why This Is Different
+
+On Ethereum, Chainlink nodes are a separate network with their own token economics, their own consensus, and their own trust assumptions. The data path is: Chainlink nodes fetch → aggregate off-chain → submit on-chain transaction → your contract reads the result. It's an entire parallel infrastructure.
+
+On Persistia, the validators *are* the oracle nodes. They already run 24/7, they already have BFT consensus, and they already execute contract callbacks. The oracle is just another host function — `fetch()` with consensus. No additional network, no additional token, no additional trust assumption beyond what you already trust for consensus itself.
+
+This makes data-driven contracts economically viable at any scale. A contract that needs a price feed every minute doesn't need to pay Chainlink's fee per update — it registers a trigger and an oracle request, and the infrastructure handles the rest at zero marginal cost.
+
+### JSON Path Extraction
+
+The `json_path` parameter supports dot-notation traversal (`data.price`, `items.0.name`), extracting nested values from complex API responses without burdening the contract with JSON parsing. The extraction happens node-side before aggregation.
+
 ## State Anchoring: Berachain
 
 Persistia anchors finalized state to **Berachain**, an EVM-compatible L1 secured by Proof of Liquidity consensus.

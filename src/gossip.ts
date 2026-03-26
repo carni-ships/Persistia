@@ -349,9 +349,15 @@ export class GossipManager {
         }
 
         // Update sync cursor
+        const now = Date.now();
         this.sql.exec(
           "UPDATE gossip_peers SET last_sync_round = ?, last_seen = ?, failures = 0 WHERE pubkey = ?",
-          data.latest_round || currentRound, Date.now(), peer.pubkey,
+          data.latest_round || currentRound, now, peer.pubkey,
+        );
+        // Also refresh active_nodes so dashboard shows peer as recently seen
+        this.sql.exec(
+          "UPDATE active_nodes SET last_seen = ? WHERE pubkey = ?",
+          now, peer.pubkey,
         );
 
         return { synced: peerSynced, contacted: true };
