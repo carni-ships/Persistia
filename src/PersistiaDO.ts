@@ -1888,6 +1888,24 @@ export class PersistiaWorldV4 implements DurableObject {
           }
         }
 
+        // Gossip proof to external peers via HTTP (reaches nodes on other Workers)
+        if (!body._relayed && this.nodeIdentity) {
+          const proofPayload = {
+            block_number: body.block_number,
+            proof: body.proof,
+            state_root: body.state_root,
+            proven_blocks: body.proven_blocks || 1,
+            proof_type: body.proof_type || "compressed",
+            public_values: body.public_values || null,
+            genesis_root: body.genesis_root || null,
+            // Omit proof_bytes_b64 from gossip to save bandwidth — peers can
+            // fetch full proof via /proof/zk/download if needed for verification
+          };
+          this.gossipManager.createEnvelope("zk_proof", proofPayload)
+            .then(env => this.gossipManager.flood(env))
+            .catch(() => {});
+        }
+
         return this.json({ ok: true, block_number: body.block_number });
       }
 
@@ -2384,6 +2402,47 @@ export class PersistiaWorldV4 implements DurableObject {
             const result = await this.receiveClientEvent(event);
             return this.json(result);
           }
+          case "zk_proof": {
+            const proof = envelope.payload;
+            if (!proof.block_number || !proof.proof || !proof.state_root) {
+              return this.json({ error: "Invalid proof payload" }, 400);
+            }
+            // Check if we already have this proof
+            const existing = [...this.state.storage.sql.exec(
+              "SELECT block_number FROM zk_proofs WHERE block_number = ?", proof.block_number,
+            )];
+            if (existing.length > 0) {
+              return this.json({ ok: true, already_have: true });
+            }
+            // Store the proof
+            let proofBytes: ArrayBuffer | null = null;
+            if (proof.proof_bytes_b64) {
+              const raw = atob(proof.proof_bytes_b64);
+              const arr = new Uint8Array(raw.length);
+              for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+              proofBytes = arr.buffer;
+            }
+            this.state.storage.sql.exec(
+              `INSERT OR IGNORE INTO zk_proofs (block_number, proof_hex, state_root, proven_blocks, proof_type, submitted_at, verified, proof_bytes, public_values, genesis_root)
+               VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
+              proof.block_number, proof.proof, proof.state_root,
+              proof.proven_blocks || 1, proof.proof_type || "compressed",
+              Date.now(), proofBytes,
+              proof.public_values ? JSON.stringify(proof.public_values) : null,
+              proof.genesis_root || null,
+            );
+            this.broadcast({
+              type: "zk.proof_submitted",
+              block_number: proof.block_number,
+              state_root: proof.state_root,
+              proven_blocks: proof.proven_blocks || 1,
+              genesis_root: proof.genesis_root || null,
+            });
+            // Re-gossip to peers (excluding sender)
+            const exclude = new Set([envelope.sender_pubkey]);
+            this.gossipManager.flood(envelope, exclude).catch(() => {});
+            return this.json({ ok: true });
+          }
           default:
             return this.json({ error: "Unknown gossip type" }, 400);
         }
@@ -2417,9 +2476,18 @@ export class PersistiaWorldV4 implements DurableObject {
           afterRound,
         )];
 
+        // Include ZK proof metadata (no proof bytes — peers fetch those separately)
+        const proofs = [...this.state.storage.sql.exec(
+          "SELECT block_number, proof_hex, state_root, proven_blocks, proof_type, genesis_root FROM zk_proofs ORDER BY block_number ASC LIMIT 200",
+        )].map((r: any) => ({
+          block_number: r.block_number, proof: r.proof_hex, state_root: r.state_root,
+          proven_blocks: r.proven_blocks, proof_type: r.proof_type, genesis_root: r.genesis_root,
+        }));
+
         return this.json({
           vertices,
           commits,
+          proofs,
           latest_round: this.currentRound,
         } as SyncResponsePayload);
       }
@@ -2555,6 +2623,21 @@ export class PersistiaWorldV4 implements DurableObject {
           signature: v.signature,
         };
         await this.receiveVertex(vertex, true); // skip consensus during bulk sync
+      },
+      // Sync ZK proofs from peers
+      async (proof: any) => {
+        if (!proof.block_number || !proof.proof || !proof.state_root) return;
+        const existing = [...this.state.storage.sql.exec(
+          "SELECT block_number FROM zk_proofs WHERE block_number = ?", proof.block_number,
+        )];
+        if (existing.length > 0) return;
+        this.state.storage.sql.exec(
+          `INSERT OR IGNORE INTO zk_proofs (block_number, proof_hex, state_root, proven_blocks, proof_type, submitted_at, verified, genesis_root)
+           VALUES (?, ?, ?, ?, ?, ?, 0, ?)`,
+          proof.block_number, proof.proof, proof.state_root,
+          proof.proven_blocks || 1, proof.proof_type || "compressed",
+          Date.now(), proof.genesis_root || null,
+        );
       },
     );
 

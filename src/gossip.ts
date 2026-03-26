@@ -24,7 +24,7 @@ export interface GossipPeer {
 }
 
 export interface GossipEnvelope {
-  type: "vertex" | "event" | "peer_exchange" | "sync_request" | "sync_response";
+  type: "vertex" | "event" | "peer_exchange" | "sync_request" | "sync_response" | "zk_proof";
   sender_pubkey: string;
   sender_url: string;
   signature: string;         // signs the payload JSON
@@ -45,6 +45,7 @@ export interface SyncRequestPayload {
 export interface SyncResponsePayload {
   vertices: any[];
   commits: any[];
+  proofs?: any[];
   latest_round: number;
 }
 
@@ -316,6 +317,7 @@ export class GossipManager {
     currentRound: number,
     activeWindow: number,
     onVertex: (vertex: any) => Promise<void>,
+    onProof?: (proof: any) => Promise<void>,
   ): Promise<{ synced: number; peersContacted: number }> {
     const peers = this.getHealthyPeers();
     let synced = 0;
@@ -345,6 +347,13 @@ export class GossipManager {
             peerSynced++;
           } catch {
             // skip invalid vertices
+          }
+        }
+
+        // Process proofs from sync response
+        if (onProof && data.proofs) {
+          for (const p of data.proofs) {
+            try { await onProof(p); } catch {}
           }
         }
 
