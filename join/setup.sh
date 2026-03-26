@@ -77,9 +77,39 @@ else
     echo "  ✓ R2 bucket '$BUCKET_NAME' already exists"
     R2_ENABLED=true
   else
-    echo "  ⚠ R2 not enabled on your account (optional — node works without it)"
-    echo "    To enable: Cloudflare Dashboard → R2 Object Storage → Get Started"
-    echo "    R2 enables snapshot-based fast sync and offloads WASM/proof storage"
+    echo ""
+    echo "  ┌─────────────────────────────────────────────────────────┐"
+    echo "  │  R2 Object Storage is not enabled on your account.     │"
+    echo "  │                                                         │"
+    echo "  │  R2 is free (10GB storage, 10M reads/month) and        │"
+    echo "  │  enables snapshot-based fast sync — your node will      │"
+    echo "  │  download ~10MB instead of replaying thousands of       │"
+    echo "  │  events from genesis.                                   │"
+    echo "  │                                                         │"
+    echo "  │  To enable:                                             │"
+    echo "  │  1. Open https://dash.cloudflare.com                    │"
+    echo "  │  2. Go to R2 Object Storage (left sidebar)              │"
+    echo "  │  3. Click 'Get Started' or 'Enable R2'                  │"
+    echo "  └─────────────────────────────────────────────────────────┘"
+    echo ""
+    read -r -p "  Enable R2 now and press Enter to retry (or type 'skip' to continue without it): " R2_RESPONSE
+    if [ "$R2_RESPONSE" != "skip" ]; then
+      # Retry after user enables R2
+      if npx wrangler r2 bucket create "$BUCKET_NAME" 2>/dev/null; then
+        echo "  ✓ R2 bucket '$BUCKET_NAME' created"
+        R2_ENABLED=true
+      else
+        if npx wrangler r2 bucket list 2>/dev/null | grep -q "$BUCKET_NAME"; then
+          echo "  ✓ R2 bucket '$BUCKET_NAME' already exists"
+          R2_ENABLED=true
+        else
+          echo "  ⚠ R2 still not available — continuing without it"
+          echo "    You can enable it later and redeploy with: ./setup.sh"
+        fi
+      fi
+    else
+      echo "  Skipping R2 — node will use full event replay for sync"
+    fi
   fi
 fi
 

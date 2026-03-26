@@ -29,8 +29,18 @@ if npx wrangler r2 bucket create "$BUCKET_NAME" 2>/dev/null; then
 elif npx wrangler r2 bucket list 2>/dev/null | grep -q "$BUCKET_NAME"; then
   echo "  ✓ R2 bucket '$BUCKET_NAME' already exists"
 else
-  echo "  ⚠ R2 not enabled. Enable at: Cloudflare Dashboard → R2 → Get Started"
-  echo "  Deploying without R2 (snapshots + blob offloading disabled)"
+  echo ""
+  echo "  R2 Object Storage is not enabled on your account."
+  echo "  Enable it (free): https://dash.cloudflare.com → R2 Object Storage → Get Started"
+  echo ""
+  read -r -p "  Press Enter after enabling R2, or type 'skip': " R2_RESPONSE
+  if [ "$R2_RESPONSE" != "skip" ]; then
+    if npx wrangler r2 bucket create "$BUCKET_NAME" 2>/dev/null; then
+      echo "  ✓ Created R2 bucket '$BUCKET_NAME'"
+    else
+      echo "  ⚠ R2 still not available — deploying without snapshots"
+    fi
+  fi
 fi
 
 # 3. Create Queue
