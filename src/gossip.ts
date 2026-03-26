@@ -326,7 +326,7 @@ export class GossipManager {
       try {
         const afterRound = Math.max(0, peer.last_sync_round || (currentRound - activeWindow));
         const res = await fetchWithTimeout(
-          buildPeerUrl(peer.url, "/gossip/sync", { after_round: String(afterRound), limit: "500" }),
+          buildPeerUrl(peer.url, "/gossip/sync", { after_round: String(afterRound), limit: "2000" }),
           { method: "GET" },
           GOSSIP_TIMEOUT_MS,
         );

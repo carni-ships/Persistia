@@ -2565,31 +2565,22 @@ export class PersistiaWorldV4 implements DurableObject {
     const peerMaxRound = (maxSyncedRound[0]?.mr ?? this.currentRound) as number;
 
     if (peerMaxRound > this.currentRound) {
-      // Fast-forward: if we can't advance through quorum round-by-round,
-      // jump to where peers are so we can participate in current rounds.
-      // This handles post-deploy restarts where nodes are at different rounds
-      // and intermediate rounds lack quorum.
+      // Try normal round advancement first
       const advanced = this.tryAdvanceRound();
+
+      // If we're far behind, fast-forward the round counter so we can participate
       if (!advanced && peerMaxRound > this.currentRound + 2) {
         const jumpTo = peerMaxRound - 1;
         console.log(`Fast-forward: round ${this.currentRound} → ${jumpTo} (peers at ${peerMaxRound})`);
         this.currentRound = jumpTo;
         this.setKV("current_round", this.currentRound.toString());
         this.invalidateActiveCache();
-        // Also skip commits past the gap to prevent commit stall
-        if (this.lastCommittedRound < jumpTo - 2) {
-          // Find the latest dag_commit in the DB to recover from partial commits
-          const latestCommit = [...this.state.storage.sql.exec(
-            "SELECT MAX(round) as mr FROM dag_commits"
-          )];
-          const latestCommitRound = (latestCommit[0]?.mr ?? this.lastCommittedRound) as number;
-          if (latestCommitRound > this.lastCommittedRound) {
-            this.lastCommittedRound = latestCommitRound;
-            this.setKV("last_committed_round", latestCommitRound.toString());
-          }
-        }
       }
-      const committed = await this.tryCommitRounds();
+
+      // Replay committed rounds — use higher batch limit during sync catch-up
+      // so new nodes can replay all historical events to build correct state.
+      const catchUpMode = (peerMaxRound - this.lastCommittedRound) > 20;
+      const committed = await this.tryCommitRounds(catchUpMode ? 100 : 10);
       if (advanced || committed) this.scheduleReactiveAlarm();
       this.broadcastToChannel("status", { type: "status.update", ...this.getConsensusStatus() });
     }
@@ -3162,13 +3153,18 @@ export class PersistiaWorldV4 implements DurableObject {
 
   // ─── Commit Rule ────────────────────────────────────────────────────────
 
-  private async tryCommitRounds(): Promise<boolean> {
+  private async tryCommitRounds(maxCommits: number = 10): Promise<boolean> {
+    const minConsensus = this.getNetworkParam("min_nodes_for_consensus", MIN_NODES_FOR_CONSENSUS);
     const activeCount = this.getActiveNodeCount();
-    if (activeCount < this.getNetworkParam("min_nodes_for_consensus", MIN_NODES_FOR_CONSENSUS)) return false;
+    const isCatchUp = (this.currentRound - this.lastCommittedRound) > ACTIVE_WINDOW;
 
-    // Check uncommitted even rounds — cap at 10 commits per cycle to avoid CPU exhaustion
+    // In normal mode, need minimum active nodes. In catch-up mode, we derive
+    // the active set from vertex authors in each round being committed.
+    if (!isCatchUp && activeCount < minConsensus) return false;
+
+    // Check uncommitted even rounds — cap commits per cycle to avoid CPU exhaustion
     let commitsThisCycle = 0;
-    for (let r = this.lastCommittedRound + 2; r <= this.currentRound - 1 && commitsThisCycle < 10; r += 2) {
+    for (let r = this.lastCommittedRound + 2; r <= this.currentRound - 1 && commitsThisCycle < maxCommits; r += 2) {
       // Already committed? If so, advance lastCommittedRound past it
       // (handles the case where commitAnchor partially succeeded — wrote dag_commits but crashed before updating KV)
       const existing = [...this.state.storage.sql.exec(
@@ -3198,15 +3194,33 @@ export class PersistiaWorldV4 implements DurableObject {
         })));
       }
 
-      // Get active pubkeys for leader selection
-      const activePubkeys = this.getActivePubkeys();
-      const leader = await selectLeader(r, activePubkeys);
+      // During catch-up, derive the active set from vertex authors in a window
+      // around the round being committed (the current active cache is stale for
+      // old rounds since it's based on currentRound).
+      let effectivePubkeys: string[];
+      let effectiveCount: number;
+      if (isCatchUp) {
+        const nearbyAuthors = [...this.state.storage.sql.exec(
+          "SELECT DISTINCT author FROM dag_vertices WHERE round >= ? AND round <= ?",
+          Math.max(0, r - ACTIVE_WINDOW), r + 1,
+        )].map((row: any) => row.author as string);
+        effectivePubkeys = nearbyAuthors;
+        effectiveCount = nearbyAuthors.length;
+        if (effectiveCount < minConsensus) continue; // not enough vertices synced for this round
+      } else {
+        effectivePubkeys = this.getActivePubkeys();
+        effectiveCount = activeCount;
+      }
 
-      const result = checkCommit(r, leader, verticesByRound, activeCount);
+      const leader = await selectLeader(r, effectivePubkeys);
+      const result = checkCommit(r, leader, verticesByRound, effectiveCount);
       if (result.committed && result.anchorHash) {
         try {
           await this.commitAnchor(r, result.anchorHash);
           commitsThisCycle++;
+          if (isCatchUp && commitsThisCycle % 50 === 0) {
+            console.log(`Catch-up replay: committed ${commitsThisCycle} rounds (at round ${r})`);
+          }
         } catch (e: any) {
           console.error(`commitAnchor failed at round ${r}: ${e.message}\n${e.stack}`);
         }
