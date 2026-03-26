@@ -92,7 +92,7 @@ pub struct BlockEvidence {
 pub const MAX_MUTATIONS_PER_BLOCK: usize = 1024;
 
 /// Maximum blocks in a single batch proof.
-pub const MAX_BATCH_SIZE: usize = 32;
+pub const MAX_BATCH_SIZE: usize = 64;
 
 /// BFT quorum: need 2f+1 signatures where f = floor((n-1)/3).
 pub fn required_quorum(active_nodes: u32) -> u32 {

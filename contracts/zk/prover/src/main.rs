@@ -798,6 +798,7 @@ async fn main() -> anyhow::Result<()> {
 
                         let first_block = blocks_to_prove.first().unwrap().block_number;
                         let last_block = blocks_to_prove.last().unwrap().block_number;
+                        let blocks_to_prove_count = blocks_to_prove.len();
                         let recursive = last_proof.is_some();
                         println!(
                             "\nBatch: blocks {}..{} ({} blocks){}",
@@ -838,8 +839,17 @@ async fn main() -> anyhow::Result<()> {
 
                         let stdin = prepare_stdin_with_proof(&input, last_proof.as_ref(), &vk);
 
+                        let prove_start = std::time::Instant::now();
+                        println!("  Proving started at {}", chrono::Local::now().format("%H:%M:%S"));
                         match client.prove(&pk, &stdin).compressed().run() {
                             Ok(proof) => {
+                                let prove_elapsed = prove_start.elapsed();
+                                println!(
+                                    "  Proving completed in {:.1}m ({:.0}s)",
+                                    prove_elapsed.as_secs_f64() / 60.0,
+                                    prove_elapsed.as_secs_f64(),
+                                );
+
                                 if last_proven_block % 10 == 0 {
                                     if let Err(e) = client.verify(&proof, &vk) {
                                         eprintln!("  Verification failed for batch: {}", e);
@@ -856,11 +866,13 @@ async fn main() -> anyhow::Result<()> {
                                 let result: StateTransitionOutput =
                                     bincode::deserialize(proof.public_values.as_slice())?;
 
+                                let blocks_per_hour = blocks_to_prove_count as f64 / (prove_elapsed.as_secs_f64() / 3600.0);
                                 println!(
-                                    "  Batch {}..{} proven — root: {} | chain: {} blocks | {} bytes",
+                                    "  Batch {}..{} proven — root: {} | chain: {} blocks | {:.0} blocks/hr | {} bytes",
                                     first_block, last_block,
                                     hex::encode(result.state_root),
                                     result.proven_blocks,
+                                    blocks_per_hour,
                                     std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
                                 );
 
@@ -913,8 +925,17 @@ async fn main() -> anyhow::Result<()> {
                                 input.batch_blocks = vec![]; // ensure single-block mode
                                 let stdin = prepare_stdin_with_proof(&input, last_proof.as_ref(), &vk);
 
+                                let prove_start = std::time::Instant::now();
+                                println!("  Proving started at {}", chrono::Local::now().format("%H:%M:%S"));
                                 match client.prove(&pk, &stdin).compressed().run() {
                                     Ok(proof) => {
+                                        let prove_elapsed = prove_start.elapsed();
+                                        println!(
+                                            "  Proving completed in {:.1}m ({:.0}s)",
+                                            prove_elapsed.as_secs_f64() / 60.0,
+                                            prove_elapsed.as_secs_f64(),
+                                        );
+
                                         if last_proven_block % 10 == 0 {
                                             if let Err(e) = client.verify(&proof, &vk) {
                                                 eprintln!("  Verification failed for block {}: {}", target, e);
@@ -931,11 +952,13 @@ async fn main() -> anyhow::Result<()> {
                                         let result: StateTransitionOutput =
                                             bincode::deserialize(proof.public_values.as_slice())?;
 
+                                        let blocks_per_hour = 1.0 / (prove_elapsed.as_secs_f64() / 3600.0);
                                         println!(
-                                            "  Block {} proven — root: {} | chain: {} blocks | {} bytes",
+                                            "  Block {} proven — root: {} | chain: {} blocks | {:.0} blocks/hr | {} bytes",
                                             target,
                                             hex::encode(result.state_root),
                                             result.proven_blocks,
+                                            blocks_per_hour,
                                             std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
                                         );
 

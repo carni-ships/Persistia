@@ -452,6 +452,7 @@
           <span id="zk-proven">0 / 0 blocks</span>
           <span id="zk-gap"></span>
         </div>
+        <div id="zk-lineages" style="margin-top:4px;font-size:9px;color:var(--text-dim)"></div>
       </div>
     </div>
   </div>
@@ -545,6 +546,7 @@ let dagData = { vertices: [], commits: new Set() };
 let events = [];
 let nodeColors = {};
 let highlightedRound = null;
+let highlightedAuthor = null;
 const COLORS = [
   '#6c5ce7','#00d2a0','#48bfe3','#ffd166','#ff6b6b',
   '#a29bfe','#55efc4','#74b9ff','#fdcb6e','#fab1a0',
@@ -662,14 +664,37 @@ async function poll() {
 
     // ZK status
     if (zkStatus) {
-      document.getElementById('s-zk').textContent = zkStatus.max_chain_length || zkStatus.total_proofs || 0;
-      const latestProven = zkStatus.latest_proven_block || 0;
+      const active = zkStatus.active_lineage;
+      const lineages = zkStatus.lineages || [];
+      // Show active lineage chain length, fall back to overall
+      const chainLen = active ? active.chain_length : (zkStatus.max_chain_length || zkStatus.total_proofs || 0);
+      document.getElementById('s-zk').textContent = chainLen;
+
+      const latestProven = active ? active.last_block : (zkStatus.latest_proven_block || 0);
       const lastCommitted = zkStatus.last_committed_round || 0;
-      const gap = zkStatus.proof_gap || 0;
+      const gap = active ? active.gap : (zkStatus.proof_gap || 0);
       const pct = lastCommitted > 0 ? Math.min(100, (latestProven / lastCommitted) * 100) : 0;
       document.getElementById('zk-fill').style.width = pct + '%';
-      document.getElementById('zk-proven').textContent = `${latestProven} / ${lastCommitted} blocks`;
+      document.getElementById('zk-proven').textContent = `R${latestProven} / R${lastCommitted}`;
       document.getElementById('zk-gap').textContent = gap > 0 ? `gap: ${gap}` : 'caught up';
+
+      // Render lineages
+      const lineageEl = document.getElementById('zk-lineages');
+      if (lineages.length > 0) {
+        lineageEl.innerHTML = lineages.map((l, i) => {
+          const rootShort = (l.genesis_root || '').slice(0, 8);
+          const isActive = i === 0;
+          const color = isActive ? 'var(--green)' : 'var(--text-dim)';
+          const label = isActive ? 'active' : 'old';
+          const age = l.last_proof_at ? timeAgo(l.last_proof_at) : '';
+          return `<div style="display:flex;justify-content:space-between;margin-top:2px">
+            <span style="color:${color}">${label} · ${rootShort}…</span>
+            <span>R${l.first_block}→R${l.last_block} · ${l.chain_length} proofs${age ? ' · ' + age : ''}</span>
+          </div>`;
+        }).join('');
+      } else {
+        lineageEl.innerHTML = '';
+      }
     }
 
     // Finality levels — anchor response includes bundle with last_committed_round
@@ -748,7 +773,7 @@ function renderNodes(nodes) {
   list.innerHTML = nodes.map(n => {
     const c = nodeColor(n.pubkey);
     return `
-      <div class="node-item">
+      <div class="node-item" data-pubkey="${n.pubkey}" style="cursor:crosshair">
         <div class="node-avatar" style="background:${c}20;color:${c}">${shortKey(n.pubkey).slice(0,2)}</div>
         <div class="node-info">
           <div class="node-pk">${shortKey(n.pubkey)}${n.is_self ? ' (self)' : ''}</div>
@@ -758,6 +783,17 @@ function renderNodes(nodes) {
       </div>
     `;
   }).join('');
+  // Hover handlers for DAG row highlighting
+  list.querySelectorAll('.node-item[data-pubkey]').forEach(el => {
+    el.addEventListener('mouseenter', () => {
+      highlightedAuthor = el.dataset.pubkey;
+      el.style.background = 'rgba(108,92,231,0.1)';
+    });
+    el.addEventListener('mouseleave', () => {
+      highlightedAuthor = null;
+      el.style.background = '';
+    });
+  });
 }
 
 // ─── Finality Levels ──────────────────────────────────────────────────────────
@@ -962,6 +998,25 @@ function drawDAGFrame() {
     }
   }
 
+  // ─── Hover highlight row (validator) ────────────────────────────────
+  if (highlightedAuthor !== null) {
+    const hi = authors.indexOf(highlightedAuthor);
+    if (hi >= 0) {
+      const hy = PAD_T + hi * ROW_H + ROW_H/2;
+      const rowW = visibleRounds.length * COL_W + 20;
+      ctx.fillStyle = 'rgba(108,92,231,0.12)';
+      ctx.fillRect(PAD_L - 10, hy - ROW_H/2, rowW, ROW_H);
+      ctx.strokeStyle = 'rgba(108,92,231,0.4)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(PAD_L - 10, hy - ROW_H/2);
+      ctx.lineTo(PAD_L - 10 + rowW, hy - ROW_H/2);
+      ctx.moveTo(PAD_L - 10, hy + ROW_H/2);
+      ctx.lineTo(PAD_L - 10 + rowW, hy + ROW_H/2);
+      ctx.stroke();
+    }
+  }
+
   // ─── Round labels ─────────────────────────────────────────────────────
   ctx.font = '10px JetBrains Mono';
   ctx.textAlign = 'center';
@@ -979,11 +1034,14 @@ function drawDAGFrame() {
   ctx.textAlign = 'right';
   for (let i = 0; i < authors.length; i++) {
     const y = PAD_T + i * ROW_H + ROW_H/2;
-    ctx.fillStyle = nodeColor(authors[i]);
-    ctx.globalAlpha = 0.7;
+    const isAuthorHighlighted = authors[i] === highlightedAuthor;
+    ctx.fillStyle = isAuthorHighlighted ? '#e0e0e8' : nodeColor(authors[i]);
+    ctx.globalAlpha = isAuthorHighlighted ? 1 : 0.7;
+    ctx.font = isAuthorHighlighted ? 'bold 10px JetBrains Mono' : '10px JetBrains Mono';
     ctx.fillText(shortKey(authors[i]), PAD_L - 8, y + 4);
     ctx.globalAlpha = 1;
   }
+  ctx.font = '10px JetBrains Mono';
 
   // ─── Grid lines (subtle, animated dash) ───────────────────────────────
   ctx.lineWidth = 1;

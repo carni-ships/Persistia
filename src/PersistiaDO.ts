@@ -29,7 +29,9 @@ import { MPPHandler, type MPPConfig } from "./mpp";
 // ─── Configuration ────────────────────────────────────────────────────────────
 
 const CONSENSUS_ENABLED = true;
-const ROUND_INTERVAL_MS = 12_000;  // 12s rounds — tuned so single prover keeps up with batch-32
+const ROUND_INTERVAL_MS = 60_000;  // 60s rounds — slower to let single prover keep up
+const MAX_EVENTS_PER_VERTEX = 50;  // cap events per vertex to keep blocks lightweight for ZK prover
+const PENDING_EVENT_TTL_MS = 5 * 60_000;  // expire pending events older than 5 minutes
 const MIN_NODES_FOR_CONSENSUS = 3;
 
 // ─── Durable Object ──────────────────────────────────────────────────────────
@@ -190,6 +192,29 @@ export class PersistiaWorldV4 implements DurableObject {
       CREATE INDEX idx_covenants_entity ON covenants(entity_type, entity_id);
       CREATE TABLE private_state (contract_address TEXT NOT NULL, key_hash TEXT NOT NULL, commitment TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (contract_address, key_hash));
     `);
+
+    // Batch 7: network config + governance
+    sql.exec(`
+      CREATE TABLE network_config (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL, updated_by TEXT NOT NULL DEFAULT 'system');
+      CREATE TABLE governance_proposals (id TEXT PRIMARY KEY, param_key TEXT NOT NULL, proposed_value TEXT NOT NULL, activate_at_round INTEGER NOT NULL, proposer TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL, activated_at INTEGER, quorum_reached_at INTEGER);
+      CREATE INDEX idx_governance_proposals_status ON governance_proposals(status);
+      CREATE TABLE governance_proposal_votes (proposal_id TEXT NOT NULL, voter TEXT NOT NULL, vote TEXT NOT NULL, reputation INTEGER NOT NULL DEFAULT 100, voted_at INTEGER NOT NULL, PRIMARY KEY (proposal_id, voter));
+      CREATE TABLE network_config_history (id INTEGER PRIMARY KEY AUTOINCREMENT, param_key TEXT NOT NULL, old_value TEXT, new_value TEXT NOT NULL, changed_by TEXT NOT NULL, proposal_id TEXT, round INTEGER NOT NULL, changed_at INTEGER NOT NULL);
+    `);
+
+    // Seed default network config values
+    const defaults: [string, string][] = [
+      ["round_interval_ms", "60000"],
+      ["max_events_per_vertex", "50"],
+      ["pending_event_ttl_ms", "300000"],
+      ["min_nodes_for_consensus", "3"],
+    ];
+    for (const [k, v] of defaults) {
+      sql.exec(
+        "INSERT OR IGNORE INTO network_config (key, value, updated_at, updated_by) VALUES (?, ?, ?, 'genesis')",
+        k, v, Date.now(),
+      );
+    }
   }
 
   private migrateDB() {
@@ -221,6 +246,10 @@ export class PersistiaWorldV4 implements DurableObject {
       ["private_state", `CREATE TABLE private_state (contract_address TEXT NOT NULL, key_hash TEXT NOT NULL, commitment TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (contract_address, key_hash))`],
       ["mpp_challenges", `CREATE TABLE mpp_challenges (challenge_id TEXT PRIMARY KEY, resource TEXT NOT NULL, amount TEXT NOT NULL, denom TEXT NOT NULL, recipient TEXT NOT NULL, expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL, consumed INTEGER NOT NULL DEFAULT 0)`],
       ["mpp_receipts", `CREATE TABLE mpp_receipts (receipt_id TEXT PRIMARY KEY, challenge_id TEXT NOT NULL, tx_hash TEXT NOT NULL, payer TEXT NOT NULL, amount TEXT NOT NULL, denom TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'paid', created_at INTEGER NOT NULL); CREATE INDEX idx_mpp_receipts_challenge ON mpp_receipts(challenge_id); CREATE INDEX idx_mpp_receipts_payer ON mpp_receipts(payer)`],
+      ["network_config", `CREATE TABLE network_config (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL, updated_by TEXT NOT NULL DEFAULT 'system')`],
+      ["governance_proposals", `CREATE TABLE governance_proposals (id TEXT PRIMARY KEY, param_key TEXT NOT NULL, proposed_value TEXT NOT NULL, activate_at_round INTEGER NOT NULL, proposer TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL, activated_at INTEGER, quorum_reached_at INTEGER); CREATE INDEX idx_governance_proposals_status ON governance_proposals(status)`],
+      ["governance_proposal_votes", `CREATE TABLE governance_proposal_votes (proposal_id TEXT NOT NULL, voter TEXT NOT NULL, vote TEXT NOT NULL, reputation INTEGER NOT NULL DEFAULT 100, voted_at INTEGER NOT NULL, PRIMARY KEY (proposal_id, voter))`],
+      ["network_config_history", `CREATE TABLE network_config_history (id INTEGER PRIMARY KEY AUTOINCREMENT, param_key TEXT NOT NULL, old_value TEXT, new_value TEXT NOT NULL, changed_by TEXT NOT NULL, proposal_id TEXT, round INTEGER NOT NULL, changed_at INTEGER NOT NULL)`],
     ] as const;
     for (const [name, ddl] of newTables) {
       try {
@@ -228,6 +257,25 @@ export class PersistiaWorldV4 implements DurableObject {
         if (exists.length === 0) sql.exec(ddl);
       } catch {}
     }
+
+    // Migration: seed default network config values if table was just created
+    try {
+      const configCount = [...sql.exec("SELECT COUNT(*) as cnt FROM network_config")] as any[];
+      if ((configCount[0]?.cnt ?? 0) === 0) {
+        const defaults: [string, string][] = [
+          ["round_interval_ms", "60000"],
+          ["max_events_per_vertex", "50"],
+          ["pending_event_ttl_ms", "300000"],
+          ["min_nodes_for_consensus", "3"],
+        ];
+        for (const [k, v] of defaults) {
+          sql.exec(
+            "INSERT OR IGNORE INTO network_config (key, value, updated_at, updated_by) VALUES (?, ?, ?, 'genesis')",
+            k, v, Date.now(),
+          );
+        }
+      }
+    } catch {}
 
     // Migration: add proof_bytes and public_values columns to zk_proofs
     try {
@@ -360,6 +408,84 @@ export class PersistiaWorldV4 implements DurableObject {
     );
   }
 
+  // ─── Network Config ─────────────────────────────────────────────────────
+
+  private static GOVERNABLE_PARAMS: Record<string, { min: number; max: number }> = {
+    round_interval_ms: { min: 5_000, max: 600_000 },
+    max_events_per_vertex: { min: 5, max: 500 },
+    pending_event_ttl_ms: { min: 30_000, max: 3_600_000 },
+    min_nodes_for_consensus: { min: 1, max: 100 },
+  };
+
+  private getNetworkParam(key: string, fallback: number): number {
+    try {
+      const rows = [...this.state.storage.sql.exec("SELECT value FROM network_config WHERE key = ?", key)];
+      if (rows.length > 0) return parseInt(rows[0].value as string) || fallback;
+    } catch {}
+    return fallback;
+  }
+
+  private setNetworkParam(key: string, value: string, changedBy: string, proposalId?: string) {
+    const sql = this.state.storage.sql;
+    const oldRows = [...sql.exec("SELECT value FROM network_config WHERE key = ?", key)];
+    const oldValue = oldRows.length > 0 ? (oldRows[0].value as string) : null;
+    sql.exec(
+      "INSERT INTO network_config (key, value, updated_at, updated_by) VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = ?, updated_by = ?",
+      key, value, Date.now(), changedBy, value, Date.now(), changedBy,
+    );
+    sql.exec(
+      "INSERT INTO network_config_history (param_key, old_value, new_value, changed_by, proposal_id, round, changed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      key, oldValue, value, changedBy, proposalId || null, this.lastCommittedRound, Date.now(),
+    );
+  }
+
+  // ─── Shard-aware peer discovery ──────────────────────────────────────────
+
+  private updateShardAwareUrl(requestUrl: URL) {
+    const sql = this.state.storage.sql;
+    // Build shard-qualified URL: https://host/?shard=node-1
+    const shardUrl = `${requestUrl.origin}/?shard=${this.shardName}`;
+
+    // Update node identity URL
+    this.nodeIdentity!.url = shardUrl;
+    this.nodeUrl = shardUrl;
+    sql.exec("UPDATE node_identity SET node_url = ?", shardUrl);
+
+    // Update self in active_nodes
+    sql.exec(
+      "UPDATE active_nodes SET url = ? WHERE pubkey = ? AND is_self = 1",
+      shardUrl, this.nodeIdentity!.pubkey,
+    );
+    this.invalidateActiveCache();
+
+    // Auto-seed sibling shards — discover peers we lost after deploy
+    const siblingShards = (this.env.SHARD_NAMES || "node-1,node-2,node-3")
+      .split(",").map((s: string) => s.trim()).filter((s: string) => s && s !== this.shardName);
+    const siblingUrls = siblingShards.map((s: string) => `${requestUrl.origin}/?shard=${s}`);
+
+    // Bootstrap from siblings in the background
+    if (siblingUrls.length > 0) {
+      this.gossipManager.bootstrapFromSeeds(siblingUrls)
+        .then(n => {
+          if (n > 0) {
+            console.log(`Shard ${this.shardName}: discovered ${n} sibling peers`);
+            for (const peer of this.gossipManager.getPeers()) {
+              if (peer.pubkey && peer.url) {
+                sql.exec(
+                  `INSERT INTO active_nodes (pubkey, url, last_vertex_round, last_seen, is_self)
+                   VALUES (?, ?, 0, ?, 0)
+                   ON CONFLICT(pubkey) DO UPDATE SET url = ?, last_seen = ?`,
+                  peer.pubkey, peer.url, Date.now(), peer.url, Date.now(),
+                );
+              }
+            }
+            this.invalidateActiveCache();
+          }
+        })
+        .catch(e => console.warn(`Sibling bootstrap failed: ${e.message}`));
+    }
+  }
+
   // ─── HTTP Router ─────────────────────────────────────────────────────────
 
   async fetch(req: Request): Promise<Response> {
@@ -377,7 +503,14 @@ export class PersistiaWorldV4 implements DurableObject {
 
     // Pick up shard name from Worker relay header
     const shardHeader = req.headers.get("X-Shard-Name");
-    if (shardHeader) this.shardName = shardHeader;
+    if (shardHeader && shardHeader !== this.shardName) {
+      const firstDiscovery = this.shardName === "global-world";
+      this.shardName = shardHeader;
+      if (firstDiscovery && this.nodeIdentity) {
+        // Now we know our shard — fix the node URL to include shard routing
+        this.updateShardAwareUrl(url);
+      }
+    }
 
     // WebSocket upgrade
     if (req.headers.get("Upgrade") === "websocket") {
@@ -414,6 +547,9 @@ export class PersistiaWorldV4 implements DurableObject {
       }
       if (url.pathname.startsWith("/mpp/")) {
         return this.handleMPPRoute(req, url);
+      }
+      if (url.pathname.startsWith("/governance/")) {
+        return this.handleGovernanceRoute(req, url);
       }
       if (url.pathname === "/app-serve") {
         return this.handleAppServe(req, url);
@@ -924,7 +1060,7 @@ export class PersistiaWorldV4 implements DurableObject {
       const xshardExpireRound = Math.max(0, this.currentRound - 100);
       sql.exec(
         "UPDATE xshard_outbox SET status = 'expired' WHERE status = 'pending' AND created_at < ?",
-        Date.now() - 100 * ROUND_INTERVAL_MS,
+        Date.now() - 100 * this.getNetworkParam("round_interval_ms", ROUND_INTERVAL_MS),
       );
       sql.exec("DELETE FROM xshard_outbox WHERE status IN ('delivered', 'expired') AND created_at < ? LIMIT 100", oneHourAgo);
       sql.exec("DELETE FROM xshard_inbox WHERE status IN ('processed', 'failed') AND processed_at < ? LIMIT 100", oneHourAgo);
@@ -996,7 +1132,7 @@ export class PersistiaWorldV4 implements DurableObject {
     const now = Date.now();
     // Use the sooner of: round interval or next trigger fire time
     const nextTrigger = this.triggerManager.getNextFireTime();
-    const roundTime = now + ROUND_INTERVAL_MS;
+    const roundTime = now + this.getNetworkParam("round_interval_ms", ROUND_INTERVAL_MS);
     const alarmTime = nextTrigger ? Math.min(roundTime, Math.max(nextTrigger, now + 1000)) : roundTime;
     this._nextAlarmTime = alarmTime;
     this.state.storage.setAlarm(alarmTime);
@@ -1312,7 +1448,8 @@ export class PersistiaWorldV4 implements DurableObject {
           "oracle_requests", "oracle_responses", "triggers", "gossip_peers", "active_nodes",
           "xshard_outbox", "xshard_inbox", "equivocation_evidence", "governance_votes",
           "proof_claims", "mpp_challenges", "mpp_receipts", "covenants", "private_state",
-          "rate_limit_log",
+          "rate_limit_log", "network_config", "governance_proposals", "governance_proposal_votes",
+          "network_config_history",
         ];
         const sizes: Record<string, number> = {};
         let totalRows = 0;
@@ -1341,8 +1478,104 @@ export class PersistiaWorldV4 implements DurableObject {
         });
       }
 
+      case "/admin/config": {
+        // GET: return all network config params
+        const sql = this.state.storage.sql;
+        const params = [...sql.exec("SELECT key, value, updated_at, updated_by FROM network_config ORDER BY key")] as any[];
+        return this.json({ params: params.reduce((acc: any, r: any) => { acc[r.key] = { value: r.value, updated_at: r.updated_at, updated_by: r.updated_by }; return acc; }, {}) });
+      }
+
+      case "/admin/config/set": {
+        // POST: admin-set a network param directly (bypasses governance)
+        if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+        const { key, value } = await req.json() as any;
+        if (!key || value === undefined) return this.json({ error: "Missing key or value" }, 400);
+        const bounds = PersistiaWorldV4.GOVERNABLE_PARAMS[key];
+        if (!bounds) return this.json({ error: `Unknown param: ${key}. Allowed: ${Object.keys(PersistiaWorldV4.GOVERNABLE_PARAMS).join(", ")}` }, 400);
+        const numValue = parseInt(value);
+        if (isNaN(numValue) || numValue < bounds.min || numValue > bounds.max) {
+          return this.json({ error: `Value must be between ${bounds.min} and ${bounds.max}` }, 400);
+        }
+        this.setNetworkParam(key, numValue.toString(), "admin");
+        return this.json({ ok: true, key, value: numValue });
+      }
+
+      case "/admin/config/history": {
+        const sql = this.state.storage.sql;
+        const history = [...sql.exec(
+          "SELECT param_key, old_value, new_value, changed_by, proposal_id, round, changed_at FROM network_config_history ORDER BY changed_at DESC LIMIT 50"
+        )] as any[];
+        return this.json({ history });
+      }
+
+      case "/admin/governance/proposals": {
+        const sql = this.state.storage.sql;
+        const status = url.searchParams.get("status") || "pending";
+        const proposals = [...sql.exec(
+          "SELECT * FROM governance_proposals WHERE status = ? ORDER BY created_at DESC LIMIT 50", status
+        )] as any[];
+        // Attach vote counts
+        for (const p of proposals) {
+          const votes = [...sql.exec(
+            "SELECT vote, COUNT(*) as cnt FROM governance_proposal_votes WHERE proposal_id = ? GROUP BY vote", p.id
+          )] as any[];
+          p.votes = votes.reduce((acc: any, v: any) => { acc[v.vote] = v.cnt; return acc; }, {});
+        }
+        return this.json({ proposals });
+      }
+
       default:
         return this.json({ error: "Unknown admin endpoint" }, 404);
+    }
+  }
+
+  // ─── Governance Routes ──────────────────────────────────────────────────
+
+  private async handleGovernanceRoute(req: Request, url: URL): Promise<Response> {
+    const sql = this.state.storage.sql;
+    switch (url.pathname) {
+      case "/governance/config": {
+        const params = [...sql.exec("SELECT key, value, updated_at, updated_by FROM network_config ORDER BY key")] as any[];
+        return this.json({ params: params.reduce((acc: any, r: any) => { acc[r.key] = r.value; return acc; }, {}) });
+      }
+      case "/governance/proposals": {
+        const status = url.searchParams.get("status"); // null = all
+        const query = status
+          ? "SELECT * FROM governance_proposals WHERE status = ? ORDER BY created_at DESC LIMIT 50"
+          : "SELECT * FROM governance_proposals ORDER BY created_at DESC LIMIT 50";
+        const proposals = [...(status ? sql.exec(query, status) : sql.exec(query))] as any[];
+        for (const p of proposals) {
+          const votes = [...sql.exec(
+            "SELECT vote, COUNT(*) as cnt FROM governance_proposal_votes WHERE proposal_id = ? GROUP BY vote", p.id
+          )] as any[];
+          p.votes = votes.reduce((acc: any, v: any) => { acc[v.vote] = v.cnt; return acc; }, {});
+          const voters = [...sql.exec(
+            "SELECT voter, vote, voted_at FROM governance_proposal_votes WHERE proposal_id = ? ORDER BY voted_at", p.id
+          )] as any[];
+          p.voter_list = voters;
+        }
+        return this.json({ proposals, current_round: this.currentRound, last_committed_round: this.lastCommittedRound });
+      }
+      case "/governance/propose": {
+        if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+        const body = await req.json() as SignedEvent;
+        body.type = "governance.propose";
+        return this.json(await this.receiveClientEvent(body));
+      }
+      case "/governance/vote": {
+        if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+        const body = await req.json() as SignedEvent;
+        body.type = "governance.vote";
+        return this.json(await this.receiveClientEvent(body));
+      }
+      case "/governance/history": {
+        const history = [...sql.exec(
+          "SELECT param_key, old_value, new_value, changed_by, proposal_id, round, changed_at FROM network_config_history ORDER BY changed_at DESC LIMIT 50"
+        )] as any[];
+        return this.json({ history });
+      }
+      default:
+        return this.json({ error: "Unknown governance endpoint" }, 404);
     }
   }
 
@@ -1670,17 +1903,47 @@ export class PersistiaWorldV4 implements DurableObject {
       }
 
       case "/proof/zk/status": {
-        // Summary of ZK proof coverage
+        // Summary of ZK proof coverage with lineage tracking
         const latest = [...sql.exec(
           "SELECT MAX(block_number) as latest_block, MAX(proven_blocks) as max_chain_length FROM zk_proofs"
         )] as any[];
         const count = [...sql.exec("SELECT COUNT(*) as total FROM zk_proofs")] as any[];
+
+        // Detect proof lineages: a new lineage starts when proven_blocks resets to a low value
+        // or genesis_root changes. Group by genesis_root to find distinct chains.
+        const lineages = [...sql.exec(
+          `SELECT genesis_root, MIN(block_number) as first_block, MAX(block_number) as last_block,
+                  MAX(proven_blocks) as chain_length, COUNT(*) as proof_count,
+                  MIN(submitted_at) as started_at, MAX(submitted_at) as last_proof_at
+           FROM zk_proofs GROUP BY genesis_root ORDER BY MAX(block_number) DESC`
+        )] as any[];
+
+        // Active lineage is the one with the highest last_block
+        const active = lineages.length > 0 ? lineages[0] : null;
+
         return this.json({
           total_proofs: count[0]?.total || 0,
           latest_proven_block: latest[0]?.latest_block || null,
           max_chain_length: latest[0]?.max_chain_length || 0,
           last_committed_round: this.lastCommittedRound,
           proof_gap: (this.lastCommittedRound || 0) - (latest[0]?.latest_block || 0),
+          lineages: lineages.map((l: any) => ({
+            genesis_root: l.genesis_root || "unknown",
+            first_block: l.first_block,
+            last_block: l.last_block,
+            chain_length: l.chain_length,
+            proof_count: l.proof_count,
+            started_at: l.started_at,
+            last_proof_at: l.last_proof_at,
+            active: l === active,
+          })),
+          active_lineage: active ? {
+            genesis_root: active.genesis_root || "unknown",
+            first_block: active.first_block,
+            last_block: active.last_block,
+            chain_length: active.chain_length,
+            gap: (this.lastCommittedRound || 0) - (active.last_block || 0),
+          } : null,
         });
       }
 
@@ -2570,7 +2833,7 @@ export class PersistiaWorldV4 implements DurableObject {
     )];
     if (pending.length > 0) return { ok: true, pending: true };
 
-    if (CONSENSUS_ENABLED && this.getActiveNodeCount() >= MIN_NODES_FOR_CONSENSUS) {
+    if (CONSENSUS_ENABLED && this.getActiveNodeCount() >= this.getNetworkParam("min_nodes_for_consensus", MIN_NODES_FOR_CONSENSUS)) {
       // Consensus mode: validate rules optimistically, add to pending pool
       const ruleCheck = this.validateRules(event);
       if (!ruleCheck.ok) return ruleCheck;
@@ -2659,9 +2922,23 @@ export class PersistiaWorldV4 implements DurableObject {
     if (!this.nodeIdentity) return;
     const sql = this.state.storage.sql;
 
-    // Gather pending events
+    // Expire stale pending events
+    const pendingTtl = this.getNetworkParam("pending_event_ttl_ms", PENDING_EVENT_TTL_MS);
+    const expiryCutoff = Date.now() - pendingTtl;
+    const expired = [...sql.exec(
+      "SELECT COUNT(*) as cnt FROM pending_events WHERE timestamp < ?", expiryCutoff,
+    )];
+    const expiredCount = (expired[0]?.cnt ?? 0) as number;
+    if (expiredCount > 0) {
+      sql.exec("DELETE FROM pending_events WHERE timestamp < ?", expiryCutoff);
+      console.log(`Expired ${expiredCount} stale pending events (older than ${pendingTtl / 1000}s)`);
+    }
+
+    // Gather pending events (capped to keep vertices lightweight)
+    const maxEvents = this.getNetworkParam("max_events_per_vertex", MAX_EVENTS_PER_VERTEX);
     const pendingRows = [...sql.exec(
-      "SELECT hash, type, payload, pubkey, signature, timestamp FROM pending_events ORDER BY timestamp ASC LIMIT 500",
+      "SELECT hash, type, payload, pubkey, signature, timestamp FROM pending_events ORDER BY timestamp ASC LIMIT ?",
+      maxEvents,
     )];
 
     const events: SignedEvent[] = pendingRows.map((r: any) => ({
@@ -2848,7 +3125,7 @@ export class PersistiaWorldV4 implements DurableObject {
 
   private tryAdvanceRound(): boolean {
     const activeCount = this.getActiveNodeCount();
-    if (activeCount < MIN_NODES_FOR_CONSENSUS) return false;
+    if (activeCount < this.getNetworkParam("min_nodes_for_consensus", MIN_NODES_FOR_CONSENSUS)) return false;
 
     const quorum = getQuorumSize(activeCount);
 
@@ -2879,7 +3156,7 @@ export class PersistiaWorldV4 implements DurableObject {
 
   private async tryCommitRounds(): Promise<boolean> {
     const activeCount = this.getActiveNodeCount();
-    if (activeCount < MIN_NODES_FOR_CONSENSUS) return false;
+    if (activeCount < this.getNetworkParam("min_nodes_for_consensus", MIN_NODES_FOR_CONSENSUS)) return false;
 
     // Check uncommitted even rounds — cap at 10 commits per cycle to avoid CPU exhaustion
     let commitsThisCycle = 0;
@@ -3090,6 +3367,9 @@ export class PersistiaWorldV4 implements DurableObject {
     this.setKV("last_committed_round", round.toString());
     this.setKV("finalized_seq", this.finalizedSeq.toString());
     this.setKV("finalized_root", this.finalizedRoot);
+
+    // Activate governance proposals that reached quorum and their target round
+    this.activateGovernanceProposals(round);
 
     // Anchor root periodically
     if (this.finalizedSeq > 0 && this.finalizedSeq % 100 === 0) {
@@ -3401,6 +3681,39 @@ export class PersistiaWorldV4 implements DurableObject {
       case "oracle.response":
         // System-generated — always valid if it reaches here
         return { ok: true };
+      case "governance.propose": {
+        if (!payload.param_key || payload.proposed_value === undefined || !payload.activate_at_round) {
+          return { ok: false, error: "Missing param_key, proposed_value, or activate_at_round" };
+        }
+        const bounds = PersistiaWorldV4.GOVERNABLE_PARAMS[payload.param_key];
+        if (!bounds) return { ok: false, error: `Unknown param: ${payload.param_key}` };
+        const numVal = parseInt(payload.proposed_value);
+        if (isNaN(numVal) || numVal < bounds.min || numVal > bounds.max) {
+          return { ok: false, error: `Value must be between ${bounds.min} and ${bounds.max}` };
+        }
+        if (payload.activate_at_round <= this.lastCommittedRound + 10) {
+          return { ok: false, error: "activate_at_round must be at least 10 rounds in the future" };
+        }
+        // Must be a registered validator
+        const vRows = [...this.state.storage.sql.exec("SELECT 1 FROM validators WHERE pubkey = ? AND status = 'active'", pubkey)];
+        if (vRows.length === 0) return { ok: false, error: "Only active validators can propose" };
+        return { ok: true };
+      }
+      case "governance.vote": {
+        if (!payload.proposal_id || !payload.vote) return { ok: false, error: "Missing proposal_id or vote" };
+        if (!["yes", "no"].includes(payload.vote)) return { ok: false, error: "Vote must be 'yes' or 'no'" };
+        // Proposal must exist and be pending
+        const pRows = [...this.state.storage.sql.exec("SELECT status FROM governance_proposals WHERE id = ?", payload.proposal_id)];
+        if (pRows.length === 0) return { ok: false, error: "Proposal not found" };
+        if (pRows[0].status !== "pending") return { ok: false, error: "Proposal is not pending" };
+        // Must be a registered validator
+        const valRows = [...this.state.storage.sql.exec("SELECT 1 FROM validators WHERE pubkey = ? AND status = 'active'", pubkey)];
+        if (valRows.length === 0) return { ok: false, error: "Only active validators can vote" };
+        // Cannot vote twice
+        const existing = [...this.state.storage.sql.exec("SELECT 1 FROM governance_proposal_votes WHERE proposal_id = ? AND voter = ?", payload.proposal_id, pubkey)];
+        if (existing.length > 0) return { ok: false, error: "Already voted on this proposal" };
+        return { ok: true };
+      }
       default:
         return { ok: false, error: `Unknown event type: ${event.type}` };
     }
@@ -3549,7 +3862,113 @@ export class PersistiaWorldV4 implements DurableObject {
         this.broadcast({ type: "trigger.removed", trigger_id: payload.trigger_id });
         break;
       }
+      case "governance.propose": {
+        const proposalId = await sha256(`gov:${pubkey}:${payload.param_key}:${payload.proposed_value}:${Date.now()}`);
+        sql.exec(
+          `INSERT INTO governance_proposals (id, param_key, proposed_value, activate_at_round, proposer, status, created_at)
+           VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
+          proposalId, payload.param_key, payload.proposed_value.toString(),
+          payload.activate_at_round, pubkey, Date.now(),
+        );
+        this.broadcast({
+          type: "governance.proposed",
+          proposal_id: proposalId,
+          param_key: payload.param_key,
+          proposed_value: payload.proposed_value,
+          activate_at_round: payload.activate_at_round,
+          proposer: pubkey,
+        });
+        break;
+      }
+      case "governance.vote": {
+        const repRows = [...sql.exec("SELECT reputation FROM validators WHERE pubkey = ?", pubkey)];
+        const reputation = repRows.length > 0 ? (repRows[0].reputation as number) : 100;
+        sql.exec(
+          `INSERT INTO governance_proposal_votes (proposal_id, voter, vote, reputation, voted_at)
+           VALUES (?, ?, ?, ?, ?)`,
+          payload.proposal_id, pubkey, payload.vote, reputation, Date.now(),
+        );
+        // Check if quorum is reached
+        this.checkProposalQuorum(payload.proposal_id);
+        this.broadcast({
+          type: "governance.voted",
+          proposal_id: payload.proposal_id,
+          voter: pubkey,
+          vote: payload.vote,
+        });
+        break;
+      }
     }
+  }
+
+  // ─── Governance ─────────────────────────────────────────────────────────
+
+  private checkProposalQuorum(proposalId: string) {
+    const sql = this.state.storage.sql;
+    const yesVotes = [...sql.exec(
+      "SELECT COUNT(*) as cnt FROM governance_proposal_votes WHERE proposal_id = ? AND vote = 'yes'", proposalId
+    )] as any[];
+    const yesCount = (yesVotes[0]?.cnt ?? 0) as number;
+
+    // Quorum: >2/3 of active validators
+    const activeValidators = [...sql.exec("SELECT COUNT(*) as cnt FROM validators WHERE status = 'active'")] as any[];
+    const totalValidators = (activeValidators[0]?.cnt ?? 0) as number;
+    if (totalValidators === 0) return;
+
+    const quorum = Math.ceil((totalValidators * 2) / 3);
+    if (yesCount >= quorum) {
+      sql.exec(
+        "UPDATE governance_proposals SET quorum_reached_at = ? WHERE id = ? AND status = 'pending'",
+        Date.now(), proposalId,
+      );
+      console.log(`Governance proposal ${proposalId.slice(0, 12)}... reached quorum (${yesCount}/${totalValidators})`);
+    }
+  }
+
+  /**
+   * Called during commitAnchor to activate any governance proposals whose
+   * activate_at_round has been reached and quorum was achieved.
+   */
+  private activateGovernanceProposals(round: number) {
+    const sql = this.state.storage.sql;
+    const ready = [...sql.exec(
+      `SELECT id, param_key, proposed_value, proposer FROM governance_proposals
+       WHERE status = 'pending' AND quorum_reached_at IS NOT NULL AND activate_at_round <= ?`,
+      round,
+    )] as any[];
+
+    for (const proposal of ready) {
+      const bounds = PersistiaWorldV4.GOVERNABLE_PARAMS[proposal.param_key];
+      if (!bounds) continue; // param no longer governable
+
+      const numVal = parseInt(proposal.proposed_value);
+      if (isNaN(numVal) || numVal < bounds.min || numVal > bounds.max) {
+        sql.exec("UPDATE governance_proposals SET status = 'rejected' WHERE id = ?", proposal.id);
+        console.log(`Governance proposal ${proposal.id.slice(0, 12)}... rejected: value out of bounds`);
+        continue;
+      }
+
+      this.setNetworkParam(proposal.param_key, proposal.proposed_value, "governance", proposal.id);
+      sql.exec(
+        "UPDATE governance_proposals SET status = 'activated', activated_at = ? WHERE id = ?",
+        Date.now(), proposal.id,
+      );
+      console.log(`Governance activated: ${proposal.param_key} = ${proposal.proposed_value} (proposal ${proposal.id.slice(0, 12)}...)`);
+      this.broadcast({
+        type: "governance.activated",
+        proposal_id: proposal.id,
+        param_key: proposal.param_key,
+        new_value: proposal.proposed_value,
+        round,
+      });
+    }
+
+    // Expire old proposals that passed their activation round without quorum
+    sql.exec(
+      `UPDATE governance_proposals SET status = 'expired'
+       WHERE status = 'pending' AND quorum_reached_at IS NULL AND activate_at_round <= ?`,
+      round,
+    );
   }
 
   // ─── Oracle Processing ──────────────────────────────────────────────────
@@ -3631,7 +4050,7 @@ export class PersistiaWorldV4 implements DurableObject {
         const rawResponse = await fetchWithTimeout(req.url);
         const extracted = extractJsonPath(rawResponse, req.json_path);
 
-        if (this.getActiveNodeCount() < MIN_NODES_FOR_CONSENSUS) {
+        if (this.getActiveNodeCount() < this.getNetworkParam("min_nodes_for_consensus", MIN_NODES_FOR_CONSENSUS)) {
           // Single-node mode: deliver directly
           this.state.storage.sql.exec(
             "UPDATE oracle_requests SET status = 'delivered', result_value = ?, result_sources = 1, delivered_at = ? WHERE id = ?",

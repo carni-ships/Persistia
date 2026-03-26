@@ -433,19 +433,21 @@ export class GossipManager {
   async bootstrapFromSeeds(seedUrls: string[]): Promise<number> {
     let added = 0;
 
-    for (const url of seedUrls) {
+    for (const seedUrl of seedUrls) {
       try {
-        // Fetch node info to get pubkey
-        const res = await fetchWithTimeout(url, { method: "GET" }, GOSSIP_TIMEOUT_MS);
+        // Fetch node info to get pubkey (use /dag/status which returns JSON with node_pubkey)
+        const statusUrl = buildPeerUrl(seedUrl, "/dag/status");
+        const res = await fetchWithTimeout(statusUrl, { method: "GET" }, GOSSIP_TIMEOUT_MS);
         if (!res.ok) continue;
 
         const info = await res.json() as any;
         if (info.node_pubkey) {
-          if (this.addPeer(info.node_pubkey, url)) added++;
+          if (this.addPeer(info.node_pubkey, seedUrl)) added++;
         }
 
         // Also try to get their peer list
-        const peersRes = await fetchWithTimeout(`${url}/gossip/peers`, { method: "GET" }, GOSSIP_TIMEOUT_MS);
+        const peersUrl = buildPeerUrl(seedUrl, "/gossip/peers");
+        const peersRes = await fetchWithTimeout(peersUrl, { method: "GET" }, GOSSIP_TIMEOUT_MS);
         if (peersRes.ok) {
           const data = await peersRes.json() as any;
           for (const p of data.peers || []) {
