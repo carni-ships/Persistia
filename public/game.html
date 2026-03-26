@@ -182,7 +182,9 @@ canvas { display: block; }
 // PERSISTIA GAME CLIENT
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const NODE = location.origin;
+const params = new URLSearchParams(location.search);
+const NODE = params.get('node') || location.origin;
+const SHARD = params.get('shard') || 'node-1';
 
 const BLOCKS = {
   1: { name: 'dirt',  color: '#8B6914', dark: '#6B4F0E', light: '#A67D1A' },
@@ -250,7 +252,7 @@ async function sign(data) {
 // ─── Networking ──────────────────────────────────────────────────────────────
 
 function connect() {
-  const wsUrl = NODE.replace(/^http/, 'ws');
+  const wsUrl = NODE.replace(/^http/, 'ws') + '/?shard=' + SHARD;
   ws = new WebSocket(wsUrl);
 
   ws.onopen = () => {
@@ -365,7 +367,7 @@ async function submitAction(type, payload) {
 
 async function refreshInventory() {
   try {
-    const res = await fetch(`${NODE}/inventory?pubkey=${encodeURIComponent(pubkeyB64)}`);
+    const res = await fetch(`${NODE}/inventory?pubkey=${encodeURIComponent(pubkeyB64)}&shard=${SHARD}`);
     const data = await res.json();
     inventory = data.inventory || {};
     updateInv();
@@ -687,7 +689,7 @@ worldEl.addEventListener('wheel', (e) => {
 
 async function pollStatus() {
   try {
-    const res = await fetch(`${NODE}/dag/status`);
+    const res = await fetch(`${NODE}/dag/status?shard=${SHARD}`);
     const s = await res.json();
     consensusRound = s.current_round || 0;
     activeNodes = s.active_nodes || 0;
@@ -704,7 +706,7 @@ async function boot() {
   buildPalette();
   await initKeys();
   // Seed inventory via HTTP in case this is a new player
-  try { await fetch(`${NODE}/seed`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ pubkey: pubkeyB64 }) }); } catch {}
+  try { await fetch(`${NODE}/seed?shard=${SHARD}`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ pubkey: pubkeyB64 }) }); } catch {}
   connect();
   render();
   pollStatus();
