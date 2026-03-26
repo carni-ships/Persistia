@@ -112,6 +112,14 @@ async function placeBlock(agent: Agent, x: number, z: number, block: number): Pr
   return false;
 }
 
+async function breakBlock(agent: Agent, x: number, z: number): Promise<boolean> {
+  const timestamp = Date.now();
+  const payload = { x, z };
+  const signature = await sign(agent.privateKey, { type: "break", payload, timestamp });
+  const result = await post("/event", { type: "break", payload, pubkey: agent.pubkey, signature, timestamp });
+  return !!result.ok;
+}
+
 // ─── Structure Generators ────────────────────────────────────────────────────
 // Each returns an array of {x, z, block} for the agent to build sequentially.
 
@@ -509,9 +517,9 @@ function startOrganicPhase(agents: Agent[]) {
       await seedInventory(agent, 500);
     }
 
-    // Small random actions: extend roads, add trees, place decorative blocks
+    // Small random actions: extend roads, add trees, place decorative blocks, break blocks
     const roll = Math.random();
-    if (roll < 0.4) {
+    if (roll < 0.3) {
       // Add a tree somewhere
       const tx = Math.round((Math.random() - 0.5) * 120);
       const tz = Math.round((Math.random() - 0.5) * 120);
@@ -521,7 +529,7 @@ function startOrganicPhase(agents: Agent[]) {
         await sleep(500);
       }
       console.log(`  [${agent.name}] Planted tree at (${tx}, ${tz})`);
-    } else if (roll < 0.7) {
+    } else if (roll < 0.5) {
       // Add a small stone/dirt patch
       const px = Math.round((Math.random() - 0.5) * 100);
       const pz = Math.round((Math.random() - 0.5) * 100);
@@ -536,7 +544,7 @@ function startOrganicPhase(agents: Agent[]) {
         }
       }
       console.log(`  [${agent.name}] Created ${BLOCK_NAMES[block]} patch at (${px}, ${pz})`);
-    } else {
+    } else if (roll < 0.7) {
       // Extend a road from a random spot
       const rx = Math.round((Math.random() - 0.5) * 80);
       const rz = Math.round((Math.random() - 0.5) * 80);
@@ -549,6 +557,19 @@ function startOrganicPhase(agents: Agent[]) {
         await sleep(500);
       }
       console.log(`  [${agent.name}] Extended road at (${rx}, ${rz})`);
+    } else {
+      // Break some blocks in a random area (clearing, demolition)
+      const bx = Math.round((Math.random() - 0.5) * 100);
+      const bz = Math.round((Math.random() - 0.5) * 100);
+      const count = 1 + Math.floor(Math.random() * 4);
+      let broken = 0;
+      for (let i = 0; i < count; i++) {
+        const dx = Math.round((Math.random() - 0.5) * 4);
+        const dz = Math.round((Math.random() - 0.5) * 4);
+        if (await breakBlock(agent, bx + dx, bz + dz)) broken++;
+        await sleep(500);
+      }
+      console.log(`  [${agent.name}] Cleared ${broken} blocks near (${bx}, ${bz})`);
     }
 
     if (tick % 20 === 0) {
