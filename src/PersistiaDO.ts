@@ -4202,7 +4202,8 @@ export class PersistiaWorldV4 implements DurableObject {
           payload.x, payload.z, payload.block, pubkey);
         this.addToInventory(pubkey, this.blockTypeToItem(payload.block), -1);
         this.stateTree.markDirty(`block:${payload.x},${payload.z}`, `${payload.block}:${pubkey}`);
-        this.stateTree.markDirty(`inv:${pubkey}:${this.blockTypeToItem(payload.block)}`, null); // simplified; full value set on next commit
+        this.stateTree.markDirty(`inv:${pubkey}:${this.blockTypeToItem(payload.block)}`, null);
+        await this.rewardGameAction(pubkey);
         break;
       case "break": {
         const rows = [...sql.exec("SELECT block_type FROM blocks WHERE x = ? AND z = ?", payload.x, payload.z)];
@@ -4211,6 +4212,7 @@ export class PersistiaWorldV4 implements DurableObject {
           this.addToInventory(pubkey, this.blockTypeToItem(rows[0].block_type as number), 1);
           this.stateTree.markDirty(`block:${payload.x},${payload.z}`, null);
         }
+        await this.rewardGameAction(pubkey);
         break;
       }
       case "transfer":
@@ -4218,6 +4220,7 @@ export class PersistiaWorldV4 implements DurableObject {
         break;
       case "craft":
         this.applyCraft(pubkey, payload.recipe);
+        await this.rewardGameAction(pubkey);
         break;
       case "token.transfer": {
         const senderRows = [...sql.exec("SELECT address FROM accounts WHERE pubkey = ?", pubkey)];
@@ -4676,6 +4679,18 @@ export class PersistiaWorldV4 implements DurableObject {
       "INSERT INTO inventory (pubkey, item, count) VALUES (?, ?, ?) ON CONFLICT(pubkey, item) DO UPDATE SET count = ?",
       pubkey, item, current + delta, current + delta,
     );
+  }
+
+  // ─── Game Action Rewards ────────────────────────────────────────────────
+
+  private async rewardGameAction(pubkey: string) {
+    try {
+      const acct = await this.accountManager.getOrCreate(pubkey);
+      this.accountManager.mint(acct.address, "PERSIST", 1n);
+      this.stateTree.markDirty(`bal:${acct.address}:PERSIST`, null);
+    } catch (e) {
+      console.warn(`Failed to reward game action for ${pubkey}: ${e}`);
+    }
   }
 
   // ─── Crafting ───────────────────────────────────────────────────────────
