@@ -1069,7 +1069,7 @@ function updateAdaptivePanel(status) {
   const maxEv = status.max_events_per_vertex || 50;
   const pending = status.pending_events || 0;
   const utilPct = Math.min(100, (pending / maxEv) * 100);
-  document.getElementById('ap-util').textContent = utilPct.toFixed(0) + '%';
+  document.getElementById('ap-util').textContent = utilPct.toFixed(0) + '% (' + pending + ' pending)';
 
   const utilBar = document.getElementById('ap-util-bar');
   utilBar.style.width = utilPct.toFixed(1) + '%';
