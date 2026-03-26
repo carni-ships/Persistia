@@ -32,7 +32,7 @@ import { SnapshotManager, type SnapshotMeta } from "./snapshot";
 
 const CONSENSUS_ENABLED = true;
 const ROUND_INTERVAL_MS = 60_000;  // 60s rounds — slower to let single prover keep up
-const MAX_EVENTS_PER_VERTEX = 50;  // cap events per vertex to keep blocks lightweight for ZK prover
+const MAX_EVENTS_PER_VERTEX = 500;  // cap events per vertex
 const PENDING_EVENT_TTL_MS = 5 * 60_000;  // expire pending events older than 5 minutes
 const MIN_NODES_FOR_CONSENSUS = 3;
 
@@ -214,7 +214,7 @@ export class PersistiaWorldV4 implements DurableObject {
     // Seed default network config values
     const defaults: [string, string][] = [
       ["round_interval_ms", "60000"],
-      ["max_events_per_vertex", "50"],
+      ["max_events_per_vertex", "500"],
       ["pending_event_ttl_ms", "300000"],
       ["min_nodes_for_consensus", "3"],
     ];
@@ -273,7 +273,7 @@ export class PersistiaWorldV4 implements DurableObject {
       if ((configCount[0]?.cnt ?? 0) === 0) {
         const defaults: [string, string][] = [
           ["round_interval_ms", "60000"],
-          ["max_events_per_vertex", "50"],
+          ["max_events_per_vertex", "500"],
           ["pending_event_ttl_ms", "300000"],
           ["min_nodes_for_consensus", "3"],
         ];
