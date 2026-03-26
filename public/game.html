@@ -252,7 +252,7 @@ async function sign(data) {
 // ─── Networking ──────────────────────────────────────────────────────────────
 
 function connect() {
-  const wsUrl = NODE.replace(/^http/, 'ws') + '/?shard=' + SHARD;
+  const wsUrl = NODE.replace(/^http/, 'ws') + '/ws?shard=' + SHARD;
   ws = new WebSocket(wsUrl);
 
   ws.onopen = () => {

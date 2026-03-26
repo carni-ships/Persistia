@@ -690,7 +690,7 @@ async function runVerification() {
 
 // ─── WebSocket for live proof updates ─────────────────────────────────────
 function connectWS() {
-  const wsUrl = NODE.replace(/^http/, 'ws') + '/?shard=' + SHARD;
+  const wsUrl = NODE.replace(/^http/, 'ws') + '/ws?shard=' + SHARD;
   let ws;
   try { ws = new WebSocket(wsUrl); } catch { return; }
 

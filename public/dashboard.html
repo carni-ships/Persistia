@@ -1581,7 +1581,7 @@ function drawDAGFrame() {
 // ─── WebSocket (live updates) ────────────────────────────────────────────────
 let dashWs = null;
 function connectWS() {
-  const wsUrl = NODE.replace(/^http/, 'ws') + '/?shard=' + SHARD;
+  const wsUrl = NODE.replace(/^http/, 'ws') + '/ws?shard=' + SHARD;
   let ws;
   try {
     ws = new WebSocket(wsUrl);
