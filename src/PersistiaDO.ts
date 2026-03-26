@@ -25,7 +25,7 @@ import { AnchorManager, type AnchorConfig, type AnchorRecord } from "./anchoring
 import { ValidatorRegistry, verifyPoW } from "./validator-registry";
 import { AccountManager, pubkeyB64ToAddress, validateAddress } from "./wallet";
 import { MPPHandler, type MPPConfig } from "./mpp";
-import { computeAdaptiveInterval, type AdaptiveSignals } from "./adaptive-params";
+import { computeAdaptiveInterval, SMOOTHING_WINDOW, type AdaptiveSignals } from "./adaptive-params";
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -65,6 +65,7 @@ export class PersistiaWorldV4 implements DurableObject {
   // ─── Adaptive parameters (EIP-1559 style) ───────────────────────────
   private _consecutiveEmptyRounds: number = 0;
   private _adaptiveEnabled: boolean = true;
+  private _utilizationHistory: number[] = []; // last N rounds for smoothing
 
   // ─── Incremental state commitment ──────────────────────────────────
   stateTree: IncrementalStateTree = new IncrementalStateTree();
@@ -447,13 +448,11 @@ export class PersistiaWorldV4 implements DurableObject {
   // ─── Adaptive Parameter Adjustment (EIP-1559 style) ─────────────────────
 
   /**
-   * Called after each round commit. Adjusts round_interval_ms based on:
-   *  - Vertex utilization (events included vs capacity)
-   *  - Pending event queue pressure
-   *  - ZK prover lag (proven block vs committed round)
-   *  - Consecutive empty rounds (idle network)
+   * Called after each round commit. Adjusts round_interval_ms and
+   * max_events_per_vertex based on smoothed network signals.
    *
-   * Like EIP-1559: interval moves ±12.5% per round toward equilibrium.
+   * Uses exponential moving average over the last SMOOTHING_WINDOW rounds
+   * to prevent oscillation under bursty load patterns.
    */
   private adjustAdaptiveParams(round: number, eventsInRound: number) {
     if (!this._adaptiveEnabled) return;
@@ -486,15 +485,28 @@ export class PersistiaWorldV4 implements DurableObject {
       latestProvenBlock,
       lastCommittedRound: this.lastCommittedRound,
       consecutiveEmptyRounds: this._consecutiveEmptyRounds,
+      utilizationHistory: this._utilizationHistory,
     };
 
-    const bounds = PersistiaWorldV4.GOVERNABLE_PARAMS["round_interval_ms"];
-    const result = computeAdaptiveInterval(currentInterval, signals, bounds);
+    const intervalBounds = PersistiaWorldV4.GOVERNABLE_PARAMS["round_interval_ms"];
+    const eventsBounds = PersistiaWorldV4.GOVERNABLE_PARAMS["max_events_per_vertex"];
+    const result = computeAdaptiveInterval(currentInterval, maxEvents, signals, intervalBounds, eventsBounds);
+
+    // Update utilization history (sliding window)
+    this._utilizationHistory.push(result.rawUtilization);
+    if (this._utilizationHistory.length > SMOOTHING_WINDOW) {
+      this._utilizationHistory.shift();
+    }
 
     // Only write if actually changed (avoid spamming config history)
     if (result.newIntervalMs !== currentInterval) {
       this.setNetworkParam("round_interval_ms", result.newIntervalMs.toString(), "adaptive");
       console.log(`Adaptive: round_interval_ms ${currentInterval}→${result.newIntervalMs}ms (${result.reason})`);
+    }
+
+    if (result.newMaxEvents !== null && result.newMaxEvents !== maxEvents) {
+      this.setNetworkParam("max_events_per_vertex", result.newMaxEvents.toString(), "adaptive");
+      console.log(`Adaptive: max_events_per_vertex ${maxEvents}→${result.newMaxEvents}`);
     }
   }
 
@@ -1024,6 +1036,7 @@ export class PersistiaWorldV4 implements DurableObject {
             pow_difficulty: this.validatorRegistry.getDifficulty(),
             contracts: contractCount[0]?.c || 0,
             round_interval_ms: this.getNetworkParam("round_interval_ms", ROUND_INTERVAL_MS),
+            max_events_per_vertex: this.getNetworkParam("max_events_per_vertex", MAX_EVENTS_PER_VERTEX),
             adaptive: {
               enabled: this._adaptiveEnabled,
               prover_lag: latestProvenStatus > 0 ? this.lastCommittedRound - latestProvenStatus : null,
@@ -1594,12 +1607,16 @@ export class PersistiaWorldV4 implements DurableObject {
         return this.json({
           adaptive_enabled: this._adaptiveEnabled,
           current_interval_ms: this.getNetworkParam("round_interval_ms", ROUND_INTERVAL_MS),
+          current_max_events: this.getNetworkParam("max_events_per_vertex", MAX_EVENTS_PER_VERTEX),
           consecutive_empty_rounds: this._consecutiveEmptyRounds,
           pending_events: this.getPendingEventCount(),
           prover_lag: latestProven > 0 ? this.lastCommittedRound - latestProven : null,
           latest_proven_block: latestProven || null,
           last_committed_round: this.lastCommittedRound,
-          bounds: PersistiaWorldV4.GOVERNABLE_PARAMS["round_interval_ms"],
+          utilization_history: this._utilizationHistory,
+          smoothing_window: SMOOTHING_WINDOW,
+          interval_bounds: PersistiaWorldV4.GOVERNABLE_PARAMS["round_interval_ms"],
+          events_bounds: PersistiaWorldV4.GOVERNABLE_PARAMS["max_events_per_vertex"],
         });
       }
 
@@ -2599,6 +2616,10 @@ export class PersistiaWorldV4 implements DurableObject {
           commits,
           proofs,
           latest_round: this.currentRound,
+          adaptive_state: {
+            round_interval_ms: this.getNetworkParam("round_interval_ms", ROUND_INTERVAL_MS),
+            max_events_per_vertex: this.getNetworkParam("max_events_per_vertex", MAX_EVENTS_PER_VERTEX),
+          },
         } as SyncResponsePayload);
       }
 
@@ -2748,6 +2769,22 @@ export class PersistiaWorldV4 implements DurableObject {
           proof.proven_blocks || 1, proof.proof_type || "compressed",
           Date.now(), proof.genesis_root || null,
         );
+      },
+      // Bootstrap adaptive params from peers (cold-start convergence)
+      (peerAdaptive: { round_interval_ms: number; max_events_per_vertex: number }) => {
+        // Only adopt peer's adaptive state if we're catching up (far behind)
+        if (this._adaptiveEnabled && this._utilizationHistory.length === 0) {
+          const currentInterval = this.getNetworkParam("round_interval_ms", ROUND_INTERVAL_MS);
+          if (peerAdaptive.round_interval_ms !== currentInterval) {
+            this.setNetworkParam("round_interval_ms", peerAdaptive.round_interval_ms.toString(), "adaptive-bootstrap");
+            console.log(`Adaptive bootstrap: round_interval_ms → ${peerAdaptive.round_interval_ms}ms from peer`);
+          }
+          const currentMax = this.getNetworkParam("max_events_per_vertex", MAX_EVENTS_PER_VERTEX);
+          if (peerAdaptive.max_events_per_vertex !== currentMax) {
+            this.setNetworkParam("max_events_per_vertex", peerAdaptive.max_events_per_vertex.toString(), "adaptive-bootstrap");
+            console.log(`Adaptive bootstrap: max_events_per_vertex → ${peerAdaptive.max_events_per_vertex} from peer`);
+          }
+        }
       },
     );
 
@@ -3741,10 +3778,15 @@ export class PersistiaWorldV4 implements DurableObject {
     return this._activeCache!.nodes;
   }
 
-  private getConsensusStatus(): ConsensusStatus {
+  private getConsensusStatus(): ConsensusStatus & Record<string, any> {
     // In single-node / direct-apply mode, report latestSeq as finalized
     const effectiveSeq = this.finalizedSeq > 0 ? this.finalizedSeq : this.latestSeq;
     const effectiveRoot = this.finalizedRoot || this.currentRoot;
+    let latestProvenCS = 0;
+    try {
+      const rows = [...this.state.storage.sql.exec("SELECT MAX(block_number) as b FROM zk_proofs")];
+      latestProvenCS = (rows[0]?.b ?? 0) as number;
+    } catch {}
     return {
       node_pubkey: this.nodeIdentity?.pubkey || "",
       current_round: this.currentRound,
@@ -3753,6 +3795,13 @@ export class PersistiaWorldV4 implements DurableObject {
       last_committed_round: this.lastCommittedRound,
       active_nodes: this.getActiveNodeCount(),
       pending_events: this.getPendingEventCount(),
+      round_interval_ms: this.getNetworkParam("round_interval_ms", ROUND_INTERVAL_MS),
+      max_events_per_vertex: this.getNetworkParam("max_events_per_vertex", MAX_EVENTS_PER_VERTEX),
+      adaptive: {
+        enabled: this._adaptiveEnabled,
+        prover_lag: latestProvenCS > 0 ? this.lastCommittedRound - latestProvenCS : null,
+        consecutive_empty_rounds: this._consecutiveEmptyRounds,
+      },
     };
   }
 

@@ -155,7 +155,7 @@
     .main .bottom-row {
       grid-column: 1; grid-row: 2;
       display: grid;
-      grid-template-columns: 1fr 1fr;
+      grid-template-columns: 1fr 1fr 1fr;
       gap: 1px;
       background: var(--border);
       max-height: 240px;
@@ -384,6 +384,50 @@
       top: 0;
     }
 
+    /* ─── Adaptive Panel ─────────────────────────────────── */
+    .adaptive-grid {
+      padding: 8px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      font-size: 11px;
+    }
+    .adaptive-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .adaptive-label {
+      color: var(--text-dim);
+      font-size: 10px;
+      white-space: nowrap;
+    }
+    .adaptive-value {
+      font-weight: 600;
+      text-align: right;
+      white-space: nowrap;
+    }
+    .adaptive-bar {
+      height: 6px;
+      background: var(--surface-2);
+      border-radius: 3px;
+      overflow: hidden;
+      position: relative;
+    }
+    .adaptive-bar-fill {
+      height: 100%;
+      border-radius: 3px;
+      transition: width 0.6s ease, background 0.3s ease;
+    }
+    .adaptive-indicator {
+      display: inline-block;
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      margin-right: 4px;
+    }
+
     /* ─── Scrollbar ──────────────────────────────────────── */
     ::-webkit-scrollbar { width: 6px; }
     ::-webkit-scrollbar-track { background: transparent; }
@@ -533,6 +577,48 @@
           </div>
         </div>
       </div>
+
+      <!-- Adaptive Parameters Panel -->
+      <div class="panel">
+        <div class="panel-header">
+          <span class="panel-title">Adaptive Params</span>
+          <span class="panel-title" id="adaptive-status" style="color:var(--green)">active</span>
+        </div>
+        <div class="panel-body">
+          <div class="adaptive-grid" id="adaptive-grid">
+            <div class="adaptive-row">
+              <span class="adaptive-label">Round Interval</span>
+              <span class="adaptive-value" id="ap-interval" style="color:var(--accent)">--</span>
+            </div>
+            <div class="adaptive-bar">
+              <div class="adaptive-bar-fill" id="ap-interval-bar" style="width:33%;background:var(--accent)"></div>
+            </div>
+            <div class="adaptive-row">
+              <span class="adaptive-label">Max Events/Vertex</span>
+              <span class="adaptive-value" id="ap-max-events" style="color:var(--blue)">--</span>
+            </div>
+            <div class="adaptive-row">
+              <span class="adaptive-label">Utilization</span>
+              <span class="adaptive-value" id="ap-util">--</span>
+            </div>
+            <div class="adaptive-bar">
+              <div class="adaptive-bar-fill" id="ap-util-bar" style="width:0%;background:var(--green)"></div>
+            </div>
+            <div class="adaptive-row">
+              <span class="adaptive-label">Prover Lag</span>
+              <span class="adaptive-value" id="ap-prover-lag">--</span>
+            </div>
+            <div class="adaptive-row">
+              <span class="adaptive-label">Empty Rounds</span>
+              <span class="adaptive-value" id="ap-empty" style="color:var(--text-dim)">0</span>
+            </div>
+            <div class="adaptive-row">
+              <span class="adaptive-label">Trend</span>
+              <span class="adaptive-value" id="ap-trend" style="color:var(--text-dim)">--</span>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -613,6 +699,8 @@ async function poll() {
     document.getElementById('s-events').textContent = status.finalized_seq;
     document.getElementById('s-nodes').textContent = status.active_nodes;
 
+    // Update adaptive params panel
+    updateAdaptivePanel(status);
 
     // Process DAG sync data
     if (sync.vertices && sync.vertices.length > 0) {
@@ -838,6 +926,108 @@ function updateFinality(status, zkStatus, anchorStatus) {
     document.getElementById('fin-bar-l3').style.width = pct(l3);
     document.getElementById('fin-bar-l4').style.width = pct(l4);
   }
+}
+
+// ─── Adaptive Panel ──────────────────────────────────────────────────────────
+let prevIntervalMs = null;
+
+function updateAdaptivePanel(status) {
+  const adaptive = status.adaptive;
+  if (!adaptive) return;
+
+  const intervalMs = status.round_interval_ms || 60000;
+  const enabled = adaptive.enabled;
+  const proverLag = adaptive.prover_lag;
+  const emptyRounds = adaptive.consecutive_empty_rounds || 0;
+
+  // Status indicator
+  const statusEl = document.getElementById('adaptive-status');
+  if (enabled) {
+    statusEl.textContent = 'active';
+    statusEl.style.color = 'var(--green)';
+  } else {
+    statusEl.textContent = 'disabled';
+    statusEl.style.color = 'var(--text-dim)';
+  }
+
+  // Round interval with unit
+  const intervalEl = document.getElementById('ap-interval');
+  if (intervalMs >= 1000) {
+    intervalEl.textContent = (intervalMs / 1000).toFixed(1) + 's';
+  } else {
+    intervalEl.textContent = intervalMs + 'ms';
+  }
+
+  // Interval bar: position within 1s–180s bounds
+  const minMs = 1000, maxMs = 180000;
+  const intervalPct = Math.max(0, Math.min(100, ((intervalMs - minMs) / (maxMs - minMs)) * 100));
+  const intervalBar = document.getElementById('ap-interval-bar');
+  intervalBar.style.width = intervalPct.toFixed(1) + '%';
+  // Color: green when fast, yellow mid, red when slow
+  if (intervalPct < 33) {
+    intervalBar.style.background = 'var(--green)';
+  } else if (intervalPct < 66) {
+    intervalBar.style.background = 'var(--yellow)';
+  } else {
+    intervalBar.style.background = 'var(--red)';
+  }
+
+  // Max events
+  document.getElementById('ap-max-events').textContent = status.max_events_per_vertex || '--';
+
+  // Pending events as utilization proxy
+  const maxEv = status.max_events_per_vertex || 50;
+  const pending = status.pending_events || 0;
+  const utilPct = Math.min(100, (pending / maxEv) * 100);
+  document.getElementById('ap-util').textContent = utilPct.toFixed(0) + '% (' + pending + ' pending)';
+
+  const utilBar = document.getElementById('ap-util-bar');
+  utilBar.style.width = utilPct.toFixed(1) + '%';
+  if (utilPct < 50) {
+    utilBar.style.background = 'var(--green)';
+  } else if (utilPct < 80) {
+    utilBar.style.background = 'var(--yellow)';
+  } else {
+    utilBar.style.background = 'var(--red)';
+  }
+
+  // Prover lag
+  const lagEl = document.getElementById('ap-prover-lag');
+  if (proverLag === null || proverLag === undefined) {
+    lagEl.textContent = 'no proofs';
+    lagEl.style.color = 'var(--text-dim)';
+  } else if (proverLag <= 30) {
+    lagEl.textContent = proverLag + ' rounds';
+    lagEl.style.color = 'var(--green)';
+  } else if (proverLag <= 100) {
+    lagEl.textContent = proverLag + ' rounds (braking)';
+    lagEl.style.color = 'var(--yellow)';
+  } else {
+    lagEl.textContent = proverLag + ' rounds (max brake)';
+    lagEl.style.color = 'var(--red)';
+  }
+
+  // Empty rounds
+  const emptyEl = document.getElementById('ap-empty');
+  emptyEl.textContent = emptyRounds;
+  emptyEl.style.color = emptyRounds > 3 ? 'var(--yellow)' : 'var(--text-dim)';
+
+  // Trend arrow
+  const trendEl = document.getElementById('ap-trend');
+  if (prevIntervalMs !== null) {
+    const delta = intervalMs - prevIntervalMs;
+    if (Math.abs(delta) < 100) {
+      trendEl.textContent = '→ stable';
+      trendEl.style.color = 'var(--text-dim)';
+    } else if (delta < 0) {
+      trendEl.textContent = '↑ speeding up';
+      trendEl.style.color = 'var(--green)';
+    } else {
+      trendEl.textContent = '↓ slowing down';
+      trendEl.style.color = 'var(--yellow)';
+    }
+  }
+  prevIntervalMs = intervalMs;
 }
 
 // ─── DAG Canvas (Animated) ───────────────────────────────────────────────────
@@ -1380,6 +1570,7 @@ function connectWS() {
         document.getElementById('s-events').textContent = msg.finalized_seq;
         document.getElementById('s-nodes').textContent = msg.active_nodes;
         updateFinality(msg, null, null);
+        updateAdaptivePanel(msg);
         return;
       }
 

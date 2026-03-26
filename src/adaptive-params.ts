@@ -1,6 +1,7 @@
 // ─── Adaptive Network Parameters (EIP-1559-style) ─────────────────────────────
 //
-// Dynamically adjusts round_interval_ms based on network load and prover health.
+// Dynamically adjusts round_interval_ms and max_events_per_vertex based on
+// network load and prover health.
 //
 // Signals:
 //   1. Event pressure   — pending events / max_events_per_vertex (vertex utilization)
@@ -8,15 +9,16 @@
 //   3. Vertex emptiness  — consecutive empty vertices (no demand)
 //
 // Mechanics (inspired by EIP-1559 base fee):
-//   - Each committed round, compute a load factor from the signals
+//   - Each committed round, compute a smoothed load factor from recent history
 //   - Adjust round_interval_ms by at most ±12.5% per round
+//   - Adjust max_events_per_vertex by at most ±6.25% per round
 //   - Prover lag acts as a hard brake — if too far behind, always slow down
 //   - Consecutive empty rounds trigger progressive slowdown
-//   - All changes are bounded by GOVERNABLE_PARAMS limits (5s–600s)
+//   - All changes are bounded by GOVERNABLE_PARAMS limits
 //   - Changes are recorded in network_config_history with changedBy="adaptive"
 //
-// The system finds equilibrium: high load + healthy prover → fast rounds,
-// low load or struggling prover → slow rounds to conserve resources.
+// Smoothing: uses an exponential moving average over the last SMOOTHING_WINDOW
+// rounds to prevent oscillation under bursty load.
 
 export interface AdaptiveSignals {
   pendingEvents: number;        // current pending event queue size
@@ -26,14 +28,17 @@ export interface AdaptiveSignals {
   latestProvenBlock: number;    // highest block proven by ZK prover (0 if none)
   lastCommittedRound: number;   // latest committed round
   consecutiveEmptyRounds: number; // how many recent rounds had 0 events
+  utilizationHistory: number[]; // recent utilization values for smoothing
 }
 
 export interface AdaptiveResult {
   newIntervalMs: number;
+  newMaxEvents: number | null;   // null = no change
   reason: string;
-  loadFactor: number;          // -1 to +1: negative = speed up, positive = slow down
+  loadFactor: number;            // -1 to +1: negative = speed up, positive = slow down
   proverLag: number;
-  utilization: number;
+  utilization: number;           // smoothed utilization
+  rawUtilization: number;        // instant (unsmoothed) utilization
 }
 
 // ─── Constants ─────────────────────────────────────────────────────────────────
@@ -41,8 +46,14 @@ export interface AdaptiveResult {
 /** Max adjustment per round: 12.5% (same as EIP-1559 base fee change denominator of 8) */
 const MAX_CHANGE_RATE = 0.125;
 
+/** Max adjustment for max_events_per_vertex: 6.25% (more conservative) */
+const MAX_EVENTS_CHANGE_RATE = 0.0625;
+
 /** Target vertex utilization: 50% of capacity */
 const TARGET_UTILIZATION = 0.5;
+
+/** Smoothing window: average over this many recent rounds */
+export const SMOOTHING_WINDOW = 5;
 
 /** Prover lag thresholds (in rounds) */
 const PROVER_LAG_SOFT = 30;   // start slowing down
@@ -51,105 +62,133 @@ const PROVER_LAG_HARD = 100;  // force maximum slowdown
 /** After this many consecutive empty rounds, start slowing down */
 const EMPTY_ROUND_THRESHOLD = 3;
 
-/** Minimum interval to prevent thrashing (don't go below this even if GOVERNABLE_PARAMS allows) */
+/** Minimum interval to prevent thrashing */
 const ADAPTIVE_FLOOR_MS = 1_000;    // 1s — match GOVERNABLE_PARAMS floor
 
+/** Events capacity adjustment thresholds */
+const EVENTS_UPSCALE_UTILIZATION = 0.8;   // scale up capacity when consistently >80% full
+const EVENTS_DOWNSCALE_UTILIZATION = 0.2; // scale down when consistently <20% full
+
 /**
- * Compute the next round_interval_ms based on current network signals.
- *
- * Returns the new interval (clamped to bounds) and a human-readable reason.
+ * Compute smoothed utilization from history using exponential weighting.
+ * More recent values are weighted more heavily.
+ */
+function smoothedUtilization(history: number[], currentValue: number): number {
+  const values = [...history, currentValue];
+  if (values.length <= 1) return currentValue;
+
+  // Exponential weights: most recent = 1.0, previous = 0.7, etc.
+  const DECAY = 0.7;
+  let weightedSum = 0;
+  let weightTotal = 0;
+  for (let i = values.length - 1; i >= 0; i--) {
+    const age = values.length - 1 - i;
+    const weight = Math.pow(DECAY, age);
+    weightedSum += values[i] * weight;
+    weightTotal += weight;
+  }
+  return weightTotal > 0 ? weightedSum / weightTotal : currentValue;
+}
+
+/**
+ * Compute the next round_interval_ms and optionally max_events_per_vertex
+ * based on current network signals.
  */
 export function computeAdaptiveInterval(
   currentIntervalMs: number,
+  currentMaxEvents: number,
   signals: AdaptiveSignals,
-  bounds: { min: number; max: number },
+  intervalBounds: { min: number; max: number },
+  eventsBounds: { min: number; max: number },
 ): AdaptiveResult {
   const {
     pendingEvents,
     maxEventsPerVertex,
     eventsInLastVertex,
-    currentRound,
     latestProvenBlock,
     lastCommittedRound,
     consecutiveEmptyRounds,
+    utilizationHistory,
   } = signals;
 
-  // ── 1. Compute utilization ──────────────────────────────────────────────
-  // Blend of: events in last vertex (recent) + pending queue pressure (forward-looking)
+  // ── 1. Compute instant utilization ────────────────────────────────────
   const vertexUtilization = maxEventsPerVertex > 0
     ? eventsInLastVertex / maxEventsPerVertex
     : 0;
   const queuePressure = maxEventsPerVertex > 0
-    ? Math.min(pendingEvents / maxEventsPerVertex, 2.0)  // cap at 2x (queue is 2 vertices deep)
+    ? Math.min(pendingEvents / maxEventsPerVertex, 2.0)
     : 0;
 
   // Weighted blend: 60% recent vertex, 40% queue pressure
-  const utilization = vertexUtilization * 0.6 + queuePressure * 0.4;
+  const rawUtilization = vertexUtilization * 0.6 + queuePressure * 0.4;
 
-  // ── 2. Compute prover lag ───────────────────────────────────────────────
-  // Only relevant if proofs exist (latestProvenBlock > 0)
+  // ── 2. Smooth utilization over recent history ─────────────────────────
+  const utilization = smoothedUtilization(utilizationHistory, rawUtilization);
+
+  // ── 3. Compute prover lag brake ───────────────────────────────────────
   let proverLag = 0;
   let proverBrakeFactor = 0;
   if (latestProvenBlock > 0) {
     proverLag = lastCommittedRound - latestProvenBlock;
     if (proverLag > PROVER_LAG_HARD) {
-      proverBrakeFactor = 1.0; // maximum slowdown
+      proverBrakeFactor = 1.0;
     } else if (proverLag > PROVER_LAG_SOFT) {
-      // Linear ramp from 0 to 1 between soft and hard thresholds
       proverBrakeFactor = (proverLag - PROVER_LAG_SOFT) / (PROVER_LAG_HARD - PROVER_LAG_SOFT);
     }
   }
 
-  // ── 3. Compute empty-round drag ─────────────────────────────────────────
-  // Progressive slowdown when network is idle
+  // ── 4. Compute empty-round drag ───────────────────────────────────────
   let emptyDrag = 0;
   if (consecutiveEmptyRounds > EMPTY_ROUND_THRESHOLD) {
-    // Each additional empty round beyond threshold adds 25% of max change
     emptyDrag = Math.min(
       (consecutiveEmptyRounds - EMPTY_ROUND_THRESHOLD) * 0.25,
       1.0,
     );
   }
 
-  // ── 4. Combine into load factor ─────────────────────────────────────────
-  // Negative = network is loaded → speed up (decrease interval)
-  // Positive = network is idle or prover is behind → slow down (increase interval)
-
-  // Base: deviation from target utilization (EIP-1559 style)
-  // utilization > target → negative (speed up)
-  // utilization < target → positive (slow down)
+  // ── 5. Combine into load factor ───────────────────────────────────────
   let baseFactor = (TARGET_UTILIZATION - utilization) / TARGET_UTILIZATION;
-
-  // Clamp base factor to [-1, 1]
   baseFactor = Math.max(-1, Math.min(1, baseFactor));
 
-  // Apply prover brake — overrides speedup if prover is lagging
-  // If prover brake is active, load factor can't go below the brake level
   let loadFactor = baseFactor;
   if (proverBrakeFactor > 0) {
     loadFactor = Math.max(loadFactor, proverBrakeFactor);
   }
-
-  // Apply empty-round drag — adds to slowdown
   if (emptyDrag > 0 && loadFactor < emptyDrag) {
     loadFactor = emptyDrag;
   }
-
-  // Final clamp
   loadFactor = Math.max(-1, Math.min(1, loadFactor));
 
-  // ── 5. Apply adjustment ─────────────────────────────────────────────────
+  // ── 6. Adjust round_interval_ms ───────────────────────────────────────
   const change = loadFactor * MAX_CHANGE_RATE;
   let newInterval = currentIntervalMs * (1 + change);
 
-  // Clamp to bounds
-  const effectiveMin = Math.max(bounds.min, ADAPTIVE_FLOOR_MS);
-  newInterval = Math.max(effectiveMin, Math.min(bounds.max, newInterval));
-
-  // Round to nearest 100ms to avoid noisy oscillation
+  const effectiveMin = Math.max(intervalBounds.min, ADAPTIVE_FLOOR_MS);
+  newInterval = Math.max(effectiveMin, Math.min(intervalBounds.max, newInterval));
   newInterval = Math.round(newInterval / 100) * 100;
+  // Ensure we don't round below floor
+  if (newInterval < effectiveMin) newInterval = effectiveMin;
 
-  // ── 6. Build reason string ──────────────────────────────────────────────
+  // ── 7. Adjust max_events_per_vertex ───────────────────────────────────
+  // More conservative: only adjust when sustained high/low utilization
+  let newMaxEvents: number | null = null;
+  if (utilization > EVENTS_UPSCALE_UTILIZATION && proverBrakeFactor === 0) {
+    // High sustained utilization + prover healthy → increase capacity
+    const eventsChange = Math.ceil(currentMaxEvents * MAX_EVENTS_CHANGE_RATE);
+    const proposed = currentMaxEvents + eventsChange;
+    if (proposed <= eventsBounds.max && proposed !== currentMaxEvents) {
+      newMaxEvents = proposed;
+    }
+  } else if (utilization < EVENTS_DOWNSCALE_UTILIZATION && consecutiveEmptyRounds === 0) {
+    // Low sustained utilization (but not idle) → decrease capacity to lighten vertices
+    const eventsChange = Math.ceil(currentMaxEvents * MAX_EVENTS_CHANGE_RATE);
+    const proposed = currentMaxEvents - eventsChange;
+    if (proposed >= eventsBounds.min && proposed !== currentMaxEvents) {
+      newMaxEvents = proposed;
+    }
+  }
+
+  // ── 8. Build reason string ────────────────────────────────────────────
   const parts: string[] = [];
   if (Math.abs(change) < 0.001) {
     parts.push("stable");
@@ -160,13 +199,16 @@ export function computeAdaptiveInterval(
   }
   if (proverBrakeFactor > 0) parts.push(`prover lag=${proverLag} rounds`);
   if (emptyDrag > 0) parts.push(`${consecutiveEmptyRounds} empty rounds`);
-  parts.push(`util=${(utilization * 100).toFixed(0)}%`);
+  parts.push(`util=${(utilization * 100).toFixed(0)}% (raw=${(rawUtilization * 100).toFixed(0)}%)`);
+  if (newMaxEvents !== null) parts.push(`max_events→${newMaxEvents}`);
 
   return {
     newIntervalMs: newInterval,
+    newMaxEvents,
     reason: parts.join(", "),
     loadFactor,
     proverLag,
     utilization,
+    rawUtilization,
   };
 }

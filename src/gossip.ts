@@ -47,6 +47,10 @@ export interface SyncResponsePayload {
   commits: any[];
   proofs?: any[];
   latest_round: number;
+  adaptive_state?: {
+    round_interval_ms: number;
+    max_events_per_vertex: number;
+  };
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -318,6 +322,7 @@ export class GossipManager {
     activeWindow: number,
     onVertex: (vertex: any) => Promise<void>,
     onProof?: (proof: any) => Promise<void>,
+    onAdaptiveState?: (state: { round_interval_ms: number; max_events_per_vertex: number }) => void,
   ): Promise<{ synced: number; peersContacted: number }> {
     const peers = this.getHealthyPeers();
     let synced = 0;
@@ -355,6 +360,11 @@ export class GossipManager {
           for (const p of data.proofs) {
             try { await onProof(p); } catch {}
           }
+        }
+
+        // Bootstrap adaptive params from peer (cold-start convergence)
+        if (onAdaptiveState && data.adaptive_state) {
+          onAdaptiveState(data.adaptive_state);
         }
 
         // Update sync cursor
