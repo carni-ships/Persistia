@@ -2,6 +2,8 @@
 
 A decentralized BFT consensus ledger running on Cloudflare Workers with zero-knowledge state proofs, WASM smart contracts, Berachain state anchoring, and fully on-chain application hosting.
 
+> **Note:** Persistia is a testnet. PERSISTIA tokens are for testing purposes only and have no monetary value.
+
 ## Architecture
 
 - **Consensus**: Bullshark DAG-based BFT with 12s rounds, quorum-gated advancement, leader-based commit rule
@@ -49,9 +51,13 @@ Visit `https://your-worker.workers.dev/dashboard?shard=node-1` for real-time DAG
 
 Visit `https://your-worker.workers.dev/verifier?shard=node-1` to verify the ZK proof chain — validates IVC continuity, state root linking, and proof coverage.
 
+### Game
+
+Visit `https://your-worker.workers.dev/game?shard=node-1` to play the Minecraft-lite voxel game — place and break blocks, craft structures (houses, walls, bridges), and explore a shared persistent world.
+
 ### Wallet
 
-Visit `https://your-worker.workers.dev/wallet` to manage Ed25519 keys, view balances, and send token transfers. Use the faucet endpoint to get test tokens.
+Visit `https://your-worker.workers.dev/wallet` to manage Ed25519 keys, view balances, and send token transfers. Use the faucet endpoint to get testnet tokens (no monetary value).
 
 ### Join an Existing Network
 
@@ -67,32 +73,38 @@ src/
   node-identity.ts        # Ed25519 key management and signing
   wallet.ts               # Bech32 addresses, account model, token transfers
   contract-executor.ts    # WASM smart contract runtime
+  wasm-metering.ts        # Deterministic fuel injection for WASM binaries
   state-proofs.ts         # Incremental Merkle tree and state commitments
+  snapshot.ts             # Deterministic state snapshots for fast node bootstrap
   anchoring.ts            # Berachain state anchoring
   cross-shard.ts          # Cross-shard message relay (notes + nullifiers)
   mpp.ts                  # Machine Payment Protocol (HTTP 402)
   oracle.ts               # Decentralized oracle with multi-node aggregation
   triggers.ts             # Scheduled contract execution (cron)
+  adaptive-params.ts      # EIP-1559-style dynamic network parameter adjustment
   validator-registry.ts   # PoW-based Sybil resistance and reputation tracking
   app-sdk.ts              # Persistia App SDK for on-chain frontends
   types.ts                # Shared type definitions
   index.ts                # Worker entry point and HTTP routing
 
-client/
+public/
   dashboard.html          # Real-time DAG explorer with consensus legend
   verifier.html           # ZK proof chain verifier
   wallet.html             # Key management, balances, and transfers
-  game.html               # Minecraft-lite game client
-  script.js               # Game client library
+  game.html               # Minecraft-lite voxel game with crafting system
 
 scripts/
   generate-events.ts      # Procedural world builder (villages, roads, trees)
   run-validators.ts       # Multi-node local dev runner
+  deploy.sh               # Seed node deployment (Cloudflare auth + R2 setup)
+  test-anchor.ts          # Berachain anchoring test (HBTP gateway + raw tx)
 
 contracts/
   persistia-sdk/          # Rust SDK for writing smart contracts
   cosmwasm-compat/        # CosmWasm compatibility layer
   example-counter/        # Example counter contract
+  example-oracle/         # Example oracle contract (BTC price feed)
+  token-standard/         # PTS-20/PTS-721 unified token standard (fungible + NFT)
   zk/
     program/              # SP1 guest program (what the proof verifies)
     prover/               # SP1 prover binary (generates proofs)
@@ -250,7 +262,8 @@ The generator creates Ed25519 agents, builds structures, then transitions to org
 
 ## Key Design Decisions
 
-- **No native token**: Validators participate based on reputation, not stake
+- **Testnet tokens**: PERSISTIA tokens are for testing only and have no monetary value
+- **No native token for consensus**: Validators participate based on reputation, not stake
 - **Bech32 addresses**: Compatible with Cosmos ecosystem address format (`persistia1...`)
 - **Deterministic execution**: No floats, no WASI, fuel-metered WASM
 - **Berachain anchoring**: State roots anchored to Berachain (EVM L1) for external verifiability

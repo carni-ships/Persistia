@@ -1,7 +1,9 @@
 **Persistia Ledger Specification**  
-**Version:** 0.7.0  
-**Date:** March 24, 2026  
+**Version:** 0.7.0
+**Date:** March 26, 2026
 **Purpose:** A decentralized, Mina-style succinct ledger for persistent shared state (voxel worlds, asset ownership, transfers, and simple programmable rules). Runs across independent Cloudflare accounts with no single point of failure.
+
+> **Note:** This is a testnet. PERSISTIA tokens are for testing purposes only and have no monetary value.
 
 ### 1. High-Level Overview
 - **Goal**: Provide a ledger that is:
@@ -34,41 +36,132 @@ Cloudflare Node (any account) ── gossip (HTTP + p2pcf WebRTC) ── Cloudfl
 - **Gossip network**: Any-to-any; nodes discover each other via a public list or manual `addNode()` call.
 
 ### 3. Data Model (inside each Durable Object)
-Stored in DO’s built-in SQLite + in-memory cache:
+Stored in DO’s built-in SQLite + in-memory cache. The database contains 40 tables spanning consensus, contracts, privacy, governance, and networking:
 
-| Table / Map          | Key                  | Value                                      | Notes |
-|----------------------|----------------------|--------------------------------------------|-------|
-| `state`              | chunkKey (`x,z`)     | blockType (int) or full chunk blob         | Voxel or any key-value state |
-| `ownership`          | assetId (string)     | `{ownerPubkey, metadata, timestamp}`       | NFTs / items / land |
-| `inventory`          | playerPubkey         | `{itemId: count, ...}`                     | Player balances |
-| `events`             | sequenceId           | `{type, payload, signature, timestamp}`    | Append-only log (for replay) |
-| `proofs`             | proofId              | `{root, proofData}`                        | Succinct roots |
+**Core State**
+| Table | Purpose |
+|-------|---------|
+| `blocks` | Voxel world state (key-value chunks) |
+| `ownership` | Asset ownership (NFTs, items, land) |
+| `inventory` | Player item balances |
+| `events` | Append-only signed event log |
+| `accounts` | Wallet accounts with nonces |
+| `token_balances` | Token balances per address per denomination |
+
+**Consensus & DAG**
+| Table | Purpose |
+|-------|---------|
+| `dag_vertices` | DAG vertex data per round |
+| `dag_commits` | Committed round metadata |
+| `consensus_events` | Finalized events with sequence numbers |
+| `pending_events` | Unfinalized event queue |
+| `active_nodes` | Currently active validator nodes |
+| `consensus_state` | Round, sequence, and DAG counters |
+
+**Smart Contracts & Execution**
+| Table | Purpose |
+|-------|---------|
+| `contracts` | Deployed WASM contract binaries and metadata |
+| `contract_state` | Per-contract key-value storage |
+| `oracle_requests` / `oracle_responses` | Decentralized oracle data feeds |
+| `triggers` | Scheduled contract execution (cron) |
+
+**ZK Proofs & Verification**
+| Table | Purpose |
+|-------|---------|
+| `roots` | State commitment roots |
+| `zk_proofs` | SP1 STARK proof chain |
+| `proof_claims` | Proof claims for verification |
+| `block_headers` | Block headers with BFT commit certificates |
+
+**Networking & Governance**
+| Table | Purpose |
+|-------|---------|
+| `gossip_peers` | Known gossip peer URLs |
+| `validators` | Registered validators with reputation |
+| `equivocation_evidence` | Byzantine behavior evidence |
+| `anchors` | Berachain state anchor records |
+| `network_config` / `network_config_history` | Governance-controlled parameters |
+| `governance_proposals` / `governance_proposal_votes` / `governance_votes` | On-chain governance |
+| `rate_limit_log` | Per-pubkey rate limiting |
+
+**Cross-Shard & Privacy**
+| Table | Purpose |
+|-------|---------|
+| `xshard_outbox` / `xshard_inbox` | Cross-shard message relay |
+| `notes` / `nullifiers` | Privacy-preserving note system |
+| `covenants` | Covenant state machines |
+| `private_state` | Encrypted private state |
+
+**Payments**
+| Table | Purpose |
+|-------|---------|
+| `mpp_challenges` / `mpp_receipts` | Machine Payment Protocol (HTTP 402) |
+| `node_identity` | Node Ed25519 keys |
 
 - All mutations are atomic inside the DO.
 - Every write appends a signed event to `events`.
 
 ### 4. APIs (exposed by every node)
-**WebSocket (real-time)**  
-- `join` → returns latest succinct root + current snapshot  
-- `submit` → signed action (place/break/transfer/craft/call)  
+**WebSocket (real-time, via `/ws` path)**
+- `join` → returns latest state snapshot (all blocks, players)
+- `submit` → signed action (place/break/transfer/craft/call)
 - Broadcasts deltas to all connected clients + gossips to other nodes
 
-**HTTP endpoints**  
-- `POST /transfer` `{assetId, fromPubkey, toPubkey, signature}`  
-- `POST /craft` `{playerPubkey, recipeId, signature}`  
-- `POST /call` `{contractId, calldata, signature}` (future programmable)  
-- `GET /root` → returns latest Merkle/SP1 root + timestamp  
-- `POST /gossip` → internal node-to-node (signed events)
+**HTTP endpoints** (see README.md for full API reference)
 
-**Admin (per-node)**  
-- `POST /addNode` `{url}` → add gossip peer
+*Consensus & DAG*
+- `GET /dag/status` — chain status (round, active nodes, finalized seq)
+- `GET /dag/vertices?round=N` — vertices at a specific round
+- `POST /event` — submit a signed event
+- `GET /sync?after=N` — fetch finalized events after sequence N
+- `GET /state` — full state snapshot
+- `POST /addNode` — register a gossip peer
+- `GET /gossip/sync` — pull vertices from peer
+- `GET /network` — node identity and capabilities
+- `POST /join` — register an external node with seed shards
+
+*Wallet & Tokens*
+- `GET /wallet/info?pubkey=X` — account info and balances
+- `GET /wallet/balance?address=X` — token balances
+- `POST /wallet/faucet` — mint testnet tokens (no monetary value)
+
+*Smart Contracts*
+- `POST /contract/deploy` — deploy WASM contract
+- `POST /contract/call` — call contract method
+- `GET /contract/query` — read-only contract query
+- `POST /contract/app/upload` — upload frontend files to a contract
+- `GET /apps` — list deployed on-chain apps
+- `GET /app/{address}/` — serve on-chain app frontend
+
+*ZK Proofs & State Verification*
+- `GET /proof/zk/status` — ZK proof chain status
+- `POST /proof/zk/submit` — submit a ZK proof
+- `GET /proof/zk/chain` — full IVC proof chain with public values
+- `GET /proof/generate?key=X` — Merkle inclusion/non-inclusion proof
+- `GET /proof/commitment` — current state root and entry count
+
+*Light Client*
+- `GET /headers/latest` — latest block header with BFT commit certificate
+- `GET /headers?after=N` — block headers after block N
+
+*Validators, Anchoring, Cross-Shard, MPP, SQL*
+- `POST /validator/register` — register as validator (with PoW)
+- `GET /anchor/latest` — latest state anchor
+- `POST /notes/create` / `POST /notes/consume` — cross-shard notes + nullifiers
+- `GET /mpp/info` — Machine Payment Protocol info
+- `GET /query?q=SELECT...` — read-only SQL against node's SQLite
+- `GET /schema` — list all tables and indexes
 
 ### 5. Consensus & Gossip
-- **Simple threshold model** (PoC): Any node can propose a batch; 2/3 of known peers must echo-sign within 10 s.  
-- **Gossip protocol**:  
-  - Immediate flood on new signed event (HTTP POST).  
-  - Periodic sync every 30 s (pull missing events by sequenceId).  
-- **Conflict resolution**: Highest sequence + valid signature wins; invalid events are dropped before storage.  
+- **Bullshark DAG-BFT**: Validators produce vertices in rounds (12s default, adaptive via EIP-1559-style parameter adjustment). Leader-based commit rule with quorum-gated advancement.
+- **Quorum**: 2f+1 of active validators must include a vertex in a round for it to advance. Leader commit requires seeing quorum of vertices referencing the leader's vertex.
+- **Catch-up mode**: Nodes more than 20 rounds behind process 100 commits per cycle to accelerate sync.
+- **Gossip protocol**:
+  - Rate-limited vertex synchronization via `/gossip/sync` endpoint.
+  - Returns batched vertices, commits, and ZK proof metadata with adaptive network parameters.
+  - Periodic sync pulls missing vertices by round.
+- **Conflict resolution**: DAG structure ensures total ordering via topological sort of committed vertices. Invalid events rejected before storage/gossip.
 - **No fork risk for anchored state**: The canonical history is the latest Berachain-anchored root.
 
 ### 6. Succinctness Layer (Mina-style)
@@ -85,9 +178,14 @@ Stored in DO’s built-in SQLite + in-memory cache:
 **Phase 3 (future)**: Full recursive composition (SP1 recursion + optional o1js/Mina bridge).
 
 ### 7. Smart Contracts / Programmable Rules
-- **Current (v0.2)**: Hard-coded but verifiable rules inside DO (e.g., crafting requires exact inventory).  
-- **v0.3+**: Arbitrary RISC-V programs via SP1 (upload Rust contract once, call it in any transition).  
-- **v0.4+**: EVM compatibility via SP1-CC (prove real Solidity calls off-chain).
+- **WASM runtime** (implemented): Contracts written in Rust, compiled to `wasm32-unknown-unknown`, deployed as signed events. NEAR-style register-based ABI with deterministic fuel metering (no floats, no WASI).
+- **Rust SDK** (`persistia-sdk`): Provides `storage_read`, `storage_write`, `set_return`, cross-contract calls.
+- **CosmWasm compatibility** (`cosmwasm-compat`): Port CosmWasm contracts by swapping imports and rebuilding.
+- **Token standard** (`token-standard`): PTS-20/PTS-721 unified standard supporting both fungible tokens and NFTs.
+- **Oracle contracts** (`example-oracle`): Request external API data with BFT-aggregated callbacks.
+- **On-chain apps**: Full-stack frontends served directly from contract state at `/app/{address}/`.
+- **Game world**: Minecraft-lite voxel game with craftable block types (house, wall, bridge) running entirely on-chain.
+- **Future**: EVM compatibility via SP1-CC (prove real Solidity calls off-chain).
 
 Contracts are executed inside the proof → fully verifiable, no trust in the node.
 
@@ -129,6 +227,11 @@ The ledger’s canonical state = latest valid Berachain anchor. Any node can boo
 13. ✅ HTTP-native light client (BFT certificates + Merkle proofs)
 14. ✅ Fully on-chain app hosting (frontend served from contract state)
 15. ✅ Real-time DAG dashboard, ZK verifier, wallet UI
+16. ✅ Minecraft-lite voxel game with crafting system (house, wall, bridge blocks)
+17. ✅ PTS-20/PTS-721 unified token standard
+18. ✅ Deterministic WASM fuel metering (replaces timeout-based execution)
+19. ✅ EIP-1559-style adaptive network parameters (round interval, event capacity)
+20. ✅ Deterministic state snapshots for fast node bootstrap
 
 ### 12. Roadmap: Appchain Rollup Framework
 
