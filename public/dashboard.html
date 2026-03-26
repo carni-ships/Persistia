@@ -34,6 +34,7 @@
       font-family: 'JetBrains Mono', monospace;
       font-size: 13px;
       min-height: 100vh;
+      overflow: hidden;
     }
 
     /* ─── Header ─────────────────────────────────────────── */
@@ -41,48 +42,71 @@
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 16px 24px;
+      padding: 10px 20px;
       border-bottom: 1px solid var(--border);
       background: var(--surface);
+      height: 48px;
     }
 
     .logo {
       display: flex;
       align-items: center;
-      gap: 12px;
+      gap: 10px;
     }
 
     .logo-icon {
-      width: 32px;
-      height: 32px;
+      width: 28px;
+      height: 28px;
       background: var(--accent);
-      border-radius: 8px;
+      border-radius: 6px;
       display: flex;
       align-items: center;
       justify-content: center;
       font-weight: 700;
-      font-size: 16px;
+      font-size: 14px;
     }
 
     .logo-text {
-      font-size: 18px;
+      font-size: 16px;
       font-weight: 600;
       letter-spacing: -0.5px;
     }
 
     .logo-tag {
-      font-size: 10px;
+      font-size: 9px;
       color: var(--text-dim);
       background: var(--surface-2);
-      padding: 2px 8px;
-      border-radius: 4px;
-      margin-left: 8px;
+      padding: 2px 6px;
+      border-radius: 3px;
     }
 
-    .header-right {
+    .header-nav {
       display: flex;
       align-items: center;
-      gap: 16px;
+      gap: 6px;
+    }
+
+    .header-nav a {
+      text-decoration: none;
+      font-size: 11px;
+      padding: 4px 10px;
+      border-radius: 5px;
+      transition: all 0.15s;
+    }
+
+    .nav-primary { color: var(--accent); border: 1px solid rgba(108,92,231,0.3); }
+    .nav-primary:hover { background: var(--accent-dim); }
+    .nav-green { color: var(--green); border: 1px solid rgba(0,210,160,0.3); }
+    .nav-green:hover { background: var(--green-dim); }
+    .nav-gold { color: #d29922; border: 1px solid rgba(210,153,34,0.3); }
+    .nav-gold:hover { background: rgba(210,153,34,0.15); }
+    .nav-dim { color: var(--text-dim); }
+    .nav-dim:hover { color: #fff; }
+
+    .header-status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
     }
 
     .status-dot {
@@ -108,7 +132,7 @@
     /* ─── Stats Bar ──────────────────────────────────────── */
     .stats-bar {
       display: grid;
-      grid-template-columns: repeat(5, 1fr);
+      grid-template-columns: repeat(4, 1fr);
       gap: 1px;
       background: var(--border);
       border-bottom: 1px solid var(--border);
@@ -116,10 +140,10 @@
 
     .stat-card {
       background: var(--surface);
-      padding: 16px 20px;
+      padding: 10px 16px;
       display: flex;
-      flex-direction: column;
-      gap: 4px;
+      align-items: baseline;
+      gap: 8px;
     }
 
     .stat-label {
@@ -130,7 +154,7 @@
     }
 
     .stat-value {
-      font-size: 22px;
+      font-size: 20px;
       font-weight: 600;
       letter-spacing: -1px;
     }
@@ -138,29 +162,22 @@
     .stat-sub {
       font-size: 10px;
       color: var(--text-dim);
+      margin-left: auto;
     }
 
     /* ─── Main Layout ────────────────────────────────────── */
     .main {
       display: grid;
-      grid-template-columns: 1fr 320px;
-      grid-template-rows: 1fr 240px;
-      height: calc(100vh - 130px);
+      grid-template-columns: 1fr 300px;
+      grid-template-rows: 1fr auto;
+      height: calc(100vh - 48px - 46px);
       gap: 1px;
       background: var(--border);
     }
 
-    .main .dag-panel { grid-column: 1; grid-row: 1; min-height: 0; }
-    .main .events-panel { grid-column: 2; grid-row: 1 / 3; }
-    .main .bottom-row {
-      grid-column: 1; grid-row: 2;
-      display: grid;
-      grid-template-columns: 1fr 1fr 1fr;
-      gap: 1px;
-      background: var(--border);
-      max-height: 240px;
-      overflow: hidden;
-    }
+    .dag-area { grid-column: 1; grid-row: 1; display: flex; flex-direction: column; }
+    .events-panel { grid-column: 2; grid-row: 1 / 3; }
+    .bottom-tabs { grid-column: 1; grid-row: 2; }
 
     .panel {
       background: var(--surface);
@@ -173,13 +190,13 @@
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 12px 16px;
+      padding: 8px 14px;
       border-bottom: 1px solid var(--border);
       flex-shrink: 0;
     }
 
     .panel-title {
-      font-size: 11px;
+      font-size: 10px;
       text-transform: uppercase;
       letter-spacing: 1px;
       color: var(--text-dim);
@@ -199,7 +216,63 @@
       display: block;
     }
 
-    .dag-panel .panel-body { overflow: auto; }
+    .dag-area .panel-body { overflow: auto; }
+
+    /* ─── Tabbed Bottom Panel ────────────────────────────── */
+    .tab-bar {
+      display: flex;
+      gap: 0;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    .tab-btn {
+      padding: 7px 16px;
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      color: var(--text-dim);
+      background: transparent;
+      border: none;
+      border-bottom: 2px solid transparent;
+      cursor: pointer;
+      font-family: inherit;
+      transition: all 0.15s;
+    }
+
+    .tab-btn:hover { color: var(--text); }
+    .tab-btn.active {
+      color: var(--accent);
+      border-bottom-color: var(--accent);
+    }
+
+    .tab-content {
+      display: none;
+      overflow: auto;
+    }
+
+    .tab-content.active { display: block; }
+
+    .bottom-tabs {
+      background: var(--surface);
+      display: flex;
+      flex-direction: column;
+      height: 220px;
+      min-height: 180px;
+    }
+
+    .bottom-tabs .tab-panels {
+      flex: 1;
+      overflow: hidden;
+      position: relative;
+    }
+
+    .bottom-tabs .tab-content {
+      position: absolute;
+      inset: 0;
+      overflow: auto;
+    }
 
     /* ─── Event Log ──────────────────────────────────────── */
     .event-list {
@@ -210,8 +283,8 @@
     .event-item {
       display: flex;
       align-items: flex-start;
-      gap: 10px;
-      padding: 8px 16px;
+      gap: 8px;
+      padding: 6px 14px;
       border-bottom: 1px solid rgba(42,42,58,0.5);
       font-size: 11px;
       transition: background 0.15s;
@@ -224,13 +297,14 @@
     .event-time {
       color: var(--text-dim);
       white-space: nowrap;
-      min-width: 55px;
+      min-width: 50px;
+      font-size: 10px;
     }
 
     .event-badge {
-      padding: 1px 6px;
+      padding: 1px 5px;
       border-radius: 3px;
-      font-size: 10px;
+      font-size: 9px;
       font-weight: 500;
       white-space: nowrap;
     }
@@ -246,6 +320,7 @@
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
+      font-size: 10px;
     }
 
     .event-detail .mono {
@@ -253,25 +328,30 @@
       font-weight: 500;
     }
 
-    /* ─── Node List ──────────────────────────────────────── */
-    .node-list { padding: 8px 0; }
+    /* ─── Validators Tab ─────────────────────────────────── */
+    .node-list {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 1px;
+      background: rgba(42,42,58,0.2);
+    }
 
     .node-item {
       display: flex;
       align-items: center;
       gap: 10px;
-      padding: 10px 16px;
-      border-bottom: 1px solid rgba(42,42,58,0.3);
+      padding: 8px 14px;
+      background: var(--surface);
     }
 
     .node-avatar {
-      width: 28px;
-      height: 28px;
-      border-radius: 6px;
+      width: 26px;
+      height: 26px;
+      border-radius: 5px;
       display: flex;
       align-items: center;
       justify-content: center;
-      font-size: 11px;
+      font-size: 10px;
       font-weight: 600;
       flex-shrink: 0;
     }
@@ -285,9 +365,9 @@
       white-space: nowrap;
     }
     .node-meta {
-      font-size: 10px;
+      font-size: 9px;
       color: var(--text-dim);
-      margin-top: 2px;
+      margin-top: 1px;
     }
 
     .node-round {
@@ -296,43 +376,23 @@
       color: var(--accent);
     }
 
-    /* ─── ZK Status ──────────────────────────────────────── */
-    .zk-bar {
+    /* ─── Finality Tab ───────────────────────────────────── */
+    .finality-tab-content {
+      display: flex;
+      gap: 20px;
       padding: 12px 16px;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
     }
 
-    .zk-progress {
-      height: 4px;
-      background: var(--surface-2);
-      border-radius: 2px;
-      overflow: hidden;
+    .finality-levels-col {
+      flex: 1;
+      min-width: 200px;
     }
-
-    .zk-progress-fill {
-      height: 100%;
-      background: var(--accent);
-      border-radius: 2px;
-      transition: width 0.5s ease;
-    }
-
-    .zk-stats {
-      display: flex;
-      justify-content: space-between;
-      font-size: 10px;
-      color: var(--text-dim);
-    }
-
-    /* ─── Finality Levels ─────────────────────────────────── */
-    .finality-levels { padding: 8px 12px; }
 
     .finality-row {
       display: flex;
       align-items: center;
       gap: 8px;
-      padding: 5px 0;
+      padding: 4px 0;
       font-size: 11px;
     }
 
@@ -370,7 +430,7 @@
       height: 3px;
       background: var(--surface-2);
       border-radius: 2px;
-      margin-top: 6px;
+      margin-top: 8px;
       position: relative;
       overflow: hidden;
     }
@@ -384,62 +444,106 @@
       top: 0;
     }
 
-    /* ─── Adaptive Panel ─────────────────────────────────── */
-    .adaptive-grid {
-      padding: 8px 12px;
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-      font-size: 11px;
+    /* ZK section within finality tab */
+    .zk-section {
+      flex: 1;
+      min-width: 200px;
+      border-left: 1px solid var(--border);
+      padding-left: 20px;
     }
-    .adaptive-row {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-    }
-    .adaptive-label {
-      color: var(--text-dim);
+
+    .zk-section-title {
       font-size: 10px;
-      white-space: nowrap;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      color: var(--text-dim);
+      margin-bottom: 8px;
     }
-    .adaptive-value {
-      font-weight: 600;
-      text-align: right;
-      white-space: nowrap;
-    }
-    .adaptive-bar {
-      height: 6px;
+
+    .zk-progress {
+      height: 4px;
       background: var(--surface-2);
-      border-radius: 3px;
+      border-radius: 2px;
       overflow: hidden;
-      position: relative;
+      margin: 8px 0;
     }
-    .adaptive-bar-fill {
+
+    .zk-progress-fill {
       height: 100%;
-      border-radius: 3px;
-      transition: width 0.6s ease, background 0.3s ease;
+      background: var(--accent);
+      border-radius: 2px;
+      transition: width 0.5s ease;
     }
-    .adaptive-indicator {
-      display: inline-block;
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-      margin-right: 4px;
+
+    .zk-stats {
+      display: flex;
+      justify-content: space-between;
+      font-size: 10px;
+      color: var(--text-dim);
+    }
+
+    .zk-chain-value {
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--accent);
+    }
+
+    /* ─── Network Tab ────────────────────────────────────── */
+    .network-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+      gap: 1px;
+      background: rgba(42,42,58,0.2);
+      padding: 0;
+    }
+
+    .network-stat {
+      background: var(--surface);
+      padding: 10px 14px;
+    }
+
+    .network-stat-label {
+      font-size: 9px;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      color: var(--text-dim);
+      margin-bottom: 4px;
+    }
+
+    .network-stat-value {
+      font-size: 14px;
+      font-weight: 600;
+    }
+
+    .network-stat-bar {
+      height: 4px;
+      background: var(--surface-2);
+      border-radius: 2px;
+      overflow: hidden;
+      margin-top: 6px;
+    }
+
+    .network-stat-bar-fill {
+      height: 100%;
+      border-radius: 2px;
+      transition: width 0.6s ease, background 0.3s ease;
     }
 
     /* ─── Scrollbar ──────────────────────────────────────── */
-    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar { width: 5px; }
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
     ::-webkit-scrollbar-thumb:hover { background: #3a3a4a; }
 
     /* ─── Responsive ─────────────────────────────────────── */
     @media (max-width: 900px) {
-      .stats-bar { grid-template-columns: repeat(3, 1fr); }
+      .stats-bar { grid-template-columns: repeat(2, 1fr); }
       .main { grid-template-columns: 1fr; grid-template-rows: 300px auto auto; }
-      .dag-panel { grid-row: auto; }
-      .verify-grid { grid-template-columns: 1fr; }
+      .events-panel { grid-column: 1; grid-row: 3; max-height: 300px; }
+      .bottom-tabs { height: auto; min-height: 200px; }
+      .node-list { grid-template-columns: 1fr; }
+      .finality-tab-content { flex-direction: column; gap: 12px; }
+      .zk-section { border-left: none; border-top: 1px solid var(--border); padding-left: 0; padding-top: 12px; }
     }
   </style>
 </head>
@@ -450,62 +554,48 @@
       <span class="logo-text">Persistia</span>
       <span class="logo-tag">v0.5.0</span>
     </div>
-    <div class="header-right" style="display:flex;align-items:center;gap:16px">
-      <a href="/game" style="color:var(--accent);text-decoration:none;font-size:12px;padding:4px 12px;border:1px solid var(--accent);border-radius:6px;transition:all 0.15s" onmouseover="this.style.background='var(--accent-dim)'" onmouseout="this.style.background='transparent'">Game World</a>
-      <a href="/verifier" style="color:var(--green);text-decoration:none;font-size:12px;padding:4px 12px;border:1px solid var(--green);border-radius:6px;transition:all 0.15s" onmouseover="this.style.background='rgba(0,210,160,0.15)'" onmouseout="this.style.background='transparent'">Verifier</a>
-      <a href="/wallet" style="color:#d29922;text-decoration:none;font-size:12px;padding:4px 12px;border:1px solid rgba(210,153,34,0.4);border-radius:6px;transition:all 0.15s" onmouseover="this.style.background='rgba(210,153,34,0.15)'" onmouseout="this.style.background='transparent'">Wallet</a>
-      <a href="https://github.com/carni-ships/Persistia" target="_blank" rel="noopener" style="color:var(--text-dim);text-decoration:none;font-size:14px;transition:color 0.15s" onmouseover="this.style.color='#fff'" onmouseout="this.style.color='var(--text-dim)'" title="GitHub">
-        <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+    <div class="header-nav">
+      <a href="/game" class="nav-primary">Game</a>
+      <a href="/verifier" class="nav-green">Verifier</a>
+      <a href="/wallet" class="nav-gold">Wallet</a>
+      <a href="https://github.com/carni-ships/Persistia" target="_blank" rel="noopener" class="nav-dim" title="GitHub">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" style="vertical-align:-2px"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
       </a>
-      <a href="/blog/introducing-persistia" target="_blank" style="color:var(--text-dim);text-decoration:none;font-size:12px;transition:color 0.15s" onmouseover="this.style.color='#fff'" onmouseout="this.style.color='var(--text-dim)'" title="Blog">Blog</a>
-      <div style="display:flex;align-items:center;gap:8px">
-        <div class="status-dot" id="status-dot"></div>
-        <span class="node-url" id="node-url">connecting...</span>
-      </div>
+      <a href="/blog/introducing-persistia" target="_blank" class="nav-dim">Blog</a>
+    </div>
+    <div class="header-status">
+      <div class="status-dot" id="status-dot"></div>
+      <span class="node-url" id="node-url">connecting...</span>
     </div>
   </header>
 
+  <!-- Stats: 4 compact cards in a row -->
   <div class="stats-bar">
     <div class="stat-card">
-      <div class="stat-label">Round</div>
-      <div class="stat-value" id="s-round">--</div>
-      <div class="stat-sub">current consensus round</div>
+      <span class="stat-label">Round</span>
+      <span class="stat-value" id="s-round">--</span>
+      <span class="stat-sub">consensus</span>
     </div>
     <div class="stat-card">
-      <div class="stat-label">Finalized</div>
-      <div class="stat-value" id="s-finalized">--</div>
-      <div class="stat-sub">committed round</div>
+      <span class="stat-label">Finalized</span>
+      <span class="stat-value" id="s-finalized">--</span>
+      <span class="stat-sub">committed</span>
     </div>
     <div class="stat-card">
-      <div class="stat-label">Events</div>
-      <div class="stat-value" id="s-events">--</div>
-      <div class="stat-sub">total finalized</div>
+      <span class="stat-label">Events</span>
+      <span class="stat-value" id="s-events">--</span>
+      <span class="stat-sub">total</span>
     </div>
     <div class="stat-card">
-      <div class="stat-label">Nodes</div>
-      <div class="stat-value" id="s-nodes">--</div>
-      <div class="stat-sub">active validators</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-label">ZK Proofs</div>
-      <div class="stat-value" id="s-zk">--</div>
-      <div class="stat-sub" id="s-zk-sub">chain length</div>
-      <div class="zk-bar" style="margin-top:6px">
-        <div class="zk-progress" style="height:4px">
-          <div class="zk-progress-fill" id="zk-fill" style="width:0%"></div>
-        </div>
-        <div class="zk-stats" style="font-size:9px;margin-top:2px">
-          <span id="zk-proven">0 / 0 blocks</span>
-          <span id="zk-gap"></span>
-        </div>
-        <div id="zk-lineages" style="margin-top:4px;font-size:9px;color:var(--text-dim)"></div>
-      </div>
+      <span class="stat-label">Nodes</span>
+      <span class="stat-value" id="s-nodes">--</span>
+      <span class="stat-sub">active</span>
     </div>
   </div>
 
   <div class="main">
     <!-- DAG Visualization -->
-    <div class="panel dag-panel">
+    <div class="panel dag-area">
       <div class="panel-header">
         <span class="panel-title">DAG Consensus</span>
         <span style="font-size:10px;color:var(--text-dim)" id="dag-info">rounds shown: 0</span>
@@ -515,7 +605,7 @@
       </div>
     </div>
 
-    <!-- Live Events (stretches full height) -->
+    <!-- Live Events (right sidebar, full height) -->
     <div class="panel events-panel">
       <div class="panel-header">
         <span class="panel-title">Live Events</span>
@@ -526,95 +616,109 @@
       </div>
     </div>
 
-    <!-- Bottom row: Validators + Finality side by side -->
-    <div class="bottom-row">
-      <div class="panel">
-        <div class="panel-header">
-          <span class="panel-title">Validators</span>
-        </div>
-        <div class="panel-body">
+    <!-- Bottom: Tabbed Panel -->
+    <div class="bottom-tabs">
+      <div class="tab-bar">
+        <button class="tab-btn active" data-tab="validators">Validators</button>
+        <button class="tab-btn" data-tab="finality">Finality &amp; ZK</button>
+        <button class="tab-btn" data-tab="network">Network</button>
+      </div>
+      <div class="tab-panels">
+        <!-- Validators Tab -->
+        <div class="tab-content active" id="tab-validators">
           <div class="node-list" id="node-list"></div>
         </div>
-      </div>
 
-      <div class="panel">
-        <div class="panel-header">
-          <span class="panel-title">Finality Levels</span>
-        </div>
-        <div class="panel-body">
-          <div class="finality-levels" id="finality-levels">
-            <div class="finality-row">
-              <div class="finality-badge" style="background:rgba(72,191,227,0.2);color:#48bfe3">L0</div>
-              <div class="finality-name">Optimistic</div>
-              <div class="finality-value" style="color:#48bfe3" id="fin-l0">--</div>
+        <!-- Finality & ZK Tab -->
+        <div class="tab-content" id="tab-finality">
+          <div class="finality-tab-content">
+            <div class="finality-levels-col" id="finality-levels">
+              <div class="finality-row">
+                <div class="finality-badge" style="background:rgba(72,191,227,0.2);color:#48bfe3">L0</div>
+                <div class="finality-name">Optimistic</div>
+                <div class="finality-value" style="color:#48bfe3" id="fin-l0">--</div>
+              </div>
+              <div class="finality-row">
+                <div class="finality-badge" style="background:rgba(108,92,231,0.2);color:#6c5ce7">L1</div>
+                <div class="finality-name">DAG Inclusion</div>
+                <div class="finality-value" style="color:#6c5ce7" id="fin-l1">--</div>
+              </div>
+              <div class="finality-row">
+                <div class="finality-badge" style="background:rgba(0,210,160,0.2);color:#00d2a0">L2</div>
+                <div class="finality-name">BFT Commit</div>
+                <div class="finality-value" style="color:#00d2a0" id="fin-l2">--</div>
+              </div>
+              <div class="finality-row">
+                <div class="finality-badge" style="background:rgba(255,107,107,0.2);color:#ff6b6b">L3</div>
+                <div class="finality-name">ZK Proven</div>
+                <div class="finality-value" style="color:#ff6b6b" id="fin-l3">--</div>
+              </div>
+              <div class="finality-row">
+                <div class="finality-badge" style="background:rgba(255,209,102,0.2);color:#ffd166">L4</div>
+                <div class="finality-name">DA Anchored</div>
+                <div class="finality-value" style="color:#ffd166" id="fin-l4">--</div>
+              </div>
+              <div class="finality-bar-track">
+                <div class="finality-bar-fill" id="fin-bar-l4" style="width:0%;background:#ffd166;opacity:0.4;z-index:1"></div>
+                <div class="finality-bar-fill" id="fin-bar-l3" style="width:0%;background:#ff6b6b;opacity:0.5;z-index:2"></div>
+                <div class="finality-bar-fill" id="fin-bar-l2" style="width:0%;background:#00d2a0;opacity:0.6;z-index:3"></div>
+                <div class="finality-bar-fill" id="fin-bar-l1" style="width:0%;background:#6c5ce7;opacity:0.7;z-index:4"></div>
+              </div>
             </div>
-            <div class="finality-row">
-              <div class="finality-badge" style="background:rgba(108,92,231,0.2);color:#6c5ce7">L1</div>
-              <div class="finality-name">DAG Inclusion</div>
-              <div class="finality-value" style="color:#6c5ce7" id="fin-l1">--</div>
-            </div>
-            <div class="finality-row">
-              <div class="finality-badge" style="background:rgba(0,210,160,0.2);color:#00d2a0">L2</div>
-              <div class="finality-name">BFT Commit</div>
-              <div class="finality-value" style="color:#00d2a0" id="fin-l2">--</div>
-            </div>
-            <div class="finality-row">
-              <div class="finality-badge" style="background:rgba(255,107,107,0.2);color:#ff6b6b">L3</div>
-              <div class="finality-name">ZK Proven</div>
-              <div class="finality-value" style="color:#ff6b6b" id="fin-l3">--</div>
-            </div>
-            <div class="finality-row">
-              <div class="finality-badge" style="background:rgba(255,209,102,0.2);color:#ffd166">L4</div>
-              <div class="finality-name">DA Anchored</div>
-              <div class="finality-value" style="color:#ffd166" id="fin-l4">--</div>
-            </div>
-            <div class="finality-bar-track">
-              <div class="finality-bar-fill" id="fin-bar-l4" style="width:0%;background:#ffd166;opacity:0.4;z-index:1"></div>
-              <div class="finality-bar-fill" id="fin-bar-l3" style="width:0%;background:#ff6b6b;opacity:0.5;z-index:2"></div>
-              <div class="finality-bar-fill" id="fin-bar-l2" style="width:0%;background:#00d2a0;opacity:0.6;z-index:3"></div>
-              <div class="finality-bar-fill" id="fin-bar-l1" style="width:0%;background:#6c5ce7;opacity:0.7;z-index:4"></div>
+
+            <!-- ZK Proof Status -->
+            <div class="zk-section">
+              <div class="zk-section-title">ZK Proof Chain</div>
+              <div class="zk-chain-value" id="s-zk">--</div>
+              <div style="font-size:10px;color:var(--text-dim);margin-top:2px" id="s-zk-sub">chain length</div>
+              <div class="zk-progress">
+                <div class="zk-progress-fill" id="zk-fill" style="width:0%"></div>
+              </div>
+              <div class="zk-stats">
+                <span id="zk-proven">0 / 0 blocks</span>
+                <span id="zk-gap"></span>
+              </div>
+              <div id="zk-lineages" style="margin-top:6px;font-size:9px;color:var(--text-dim)"></div>
             </div>
           </div>
         </div>
-      </div>
 
-      <!-- Adaptive Parameters Panel -->
-      <div class="panel">
-        <div class="panel-header">
-          <span class="panel-title">Adaptive Params</span>
-          <span class="panel-title" id="adaptive-status" style="color:var(--green)">active</span>
-        </div>
-        <div class="panel-body">
-          <div class="adaptive-grid" id="adaptive-grid">
-            <div class="adaptive-row">
-              <span class="adaptive-label">Round Interval</span>
-              <span class="adaptive-value" id="ap-interval" style="color:var(--accent)">--</span>
+        <!-- Network Tab (Adaptive Params) -->
+        <div class="tab-content" id="tab-network">
+          <div class="network-grid" id="adaptive-grid">
+            <div class="network-stat">
+              <div class="network-stat-label">Round Interval</div>
+              <div class="network-stat-value" id="ap-interval" style="color:var(--accent)">--</div>
+              <div class="network-stat-bar">
+                <div class="network-stat-bar-fill" id="ap-interval-bar" style="width:33%;background:var(--accent)"></div>
+              </div>
             </div>
-            <div class="adaptive-bar">
-              <div class="adaptive-bar-fill" id="ap-interval-bar" style="width:33%;background:var(--accent)"></div>
+            <div class="network-stat">
+              <div class="network-stat-label">Max Events/Vertex</div>
+              <div class="network-stat-value" id="ap-max-events" style="color:var(--blue)">--</div>
             </div>
-            <div class="adaptive-row">
-              <span class="adaptive-label">Max Events/Vertex</span>
-              <span class="adaptive-value" id="ap-max-events" style="color:var(--blue)">--</span>
+            <div class="network-stat">
+              <div class="network-stat-label">Utilization</div>
+              <div class="network-stat-value" id="ap-util" style="color:var(--green)">--</div>
+              <div class="network-stat-bar">
+                <div class="network-stat-bar-fill" id="ap-util-bar" style="width:0%;background:var(--green)"></div>
+              </div>
             </div>
-            <div class="adaptive-row">
-              <span class="adaptive-label">Utilization</span>
-              <span class="adaptive-value" id="ap-util">--</span>
+            <div class="network-stat">
+              <div class="network-stat-label">Prover Lag</div>
+              <div class="network-stat-value" id="ap-prover-lag" style="color:var(--text-dim)">--</div>
             </div>
-            <div class="adaptive-bar">
-              <div class="adaptive-bar-fill" id="ap-util-bar" style="width:0%;background:var(--green)"></div>
+            <div class="network-stat">
+              <div class="network-stat-label">Empty Rounds</div>
+              <div class="network-stat-value" id="ap-empty" style="color:var(--text-dim)">0</div>
             </div>
-            <div class="adaptive-row">
-              <span class="adaptive-label">Prover Lag</span>
-              <span class="adaptive-value" id="ap-prover-lag">--</span>
+            <div class="network-stat">
+              <div class="network-stat-label">Trend</div>
+              <div class="network-stat-value" id="ap-trend" style="color:var(--text-dim)">--</div>
             </div>
-            <div class="adaptive-row">
-              <span class="adaptive-label">Empty Rounds</span>
-              <span class="adaptive-value" id="ap-empty" style="color:var(--text-dim)">0</span>
-            </div>
-            <div class="adaptive-row">
-              <span class="adaptive-label">Trend</span>
-              <span class="adaptive-value" id="ap-trend" style="color:var(--text-dim)">--</span>
+            <div class="network-stat">
+              <div class="network-stat-label">Adaptive Status</div>
+              <div class="network-stat-value" id="adaptive-status" style="color:var(--green)">active</div>
             </div>
           </div>
         </div>
@@ -623,6 +727,17 @@
   </div>
 
 <script>
+// ─── Tab Switching ────────────────────────────────────────────────────────────
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const target = btn.dataset.tab;
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById('tab-' + target).classList.add('active');
+  });
+});
+
 // ─── Config ──────────────────────────────────────────────────────────────────
 const params = new URLSearchParams(location.search);
 const NODE = params.get('node') || location.origin;
@@ -678,7 +793,6 @@ let lastSyncSeq = 0;
 
 async function poll() {
   try {
-    // Fetch all data in parallel
     const [status, sync, zkStatus, anchorStatus] = await Promise.all([
       api('/dag/status'),
       api(`/dag/sync?after_round=${lastSyncRound}&after_seq=${lastSyncSeq}&limit=200`),
@@ -699,7 +813,6 @@ async function poll() {
     document.getElementById('s-events').textContent = status.finalized_seq;
     document.getElementById('s-nodes').textContent = status.active_nodes;
 
-    // Update adaptive params panel
     updateAdaptivePanel(status);
 
     // Process DAG sync data
@@ -713,11 +826,8 @@ async function poll() {
           events: v.events_json ? JSON.parse(v.events_json) : [],
           signature: v.signature,
         });
-
-        // Add to event log
         addEvent('vertex', `Round ${v.round}`, shortKey(v.author), nodeColor(v.author), null, v.round);
       }
-
       lastSyncRound = Math.max(lastSyncRound, ...sync.vertices.map(v => v.round));
     }
 
@@ -728,7 +838,6 @@ async function poll() {
       }
     }
 
-    // Mark initial sync complete after first HTTP poll
     if (!dagAnim.initialSyncDone) {
       setTimeout(() => { dagAnim.initialSyncDone = true; }, 500);
     }
@@ -737,7 +846,7 @@ async function poll() {
     if (sync.recent_events && sync.recent_events.length > 0) {
       for (const ev of sync.recent_events) {
         const et = ev.type || 'unknown';
-        const badge = et.startsWith('contract.') ? 'contract' : et === 'craft' ? 'event' : 'event';
+        const badge = et.startsWith('contract.') ? 'contract' : 'event';
         let detail = et;
         try {
           const p = typeof ev.payload === 'string' ? JSON.parse(ev.payload) : ev.payload;
@@ -756,7 +865,6 @@ async function poll() {
     if (zkStatus) {
       const active = zkStatus.active_lineage;
       const lineages = zkStatus.lineages || [];
-      // Show active lineage chain length, fall back to overall
       const chainLen = active ? active.chain_length : (zkStatus.max_chain_length || zkStatus.total_proofs || 0);
       document.getElementById('s-zk').textContent = chainLen;
 
@@ -768,7 +876,6 @@ async function poll() {
       document.getElementById('zk-proven').textContent = `R${latestProven} / R${lastCommitted}`;
       document.getElementById('zk-gap').textContent = gap > 0 ? `gap: ${gap}` : 'caught up';
 
-      // Render lineages
       const lineageEl = document.getElementById('zk-lineages');
       if (lineages.length > 0) {
         lineageEl.innerHTML = lineages.map((l, i) => {
@@ -787,7 +894,6 @@ async function poll() {
       }
     }
 
-    // Finality levels — anchor response includes bundle with last_committed_round
     updateFinality(status, zkStatus, anchorStatus && !anchorStatus.error ? anchorStatus : null);
 
     // Update nodes panel
@@ -795,13 +901,11 @@ async function poll() {
       const peers = await api('/admin/peers');
       const allPeers = peers.peers || [];
       renderNodes(allPeers);
-      // Count nodes with vertices in last 20 rounds (matches DAG chart filter)
       const currentRound = status.current_round || 0;
       const activePeers = allPeers.filter(p => p.last_vertex_round > currentRound - 20);
       document.getElementById('s-nodes').textContent = activePeers.length;
     } catch {}
 
-    // Render DAG
     renderDAG();
 
   } catch (err) {
@@ -838,7 +942,6 @@ function renderEvents() {
     </li>
   `).join('');
 
-  // Hover handlers for DAG highlight
   for (const li of list.querySelectorAll('li[data-round]')) {
     li.addEventListener('mouseenter', () => {
       highlightedRound = parseInt(li.dataset.round);
@@ -873,7 +976,6 @@ function renderNodes(nodes) {
       </div>
     `;
   }).join('');
-  // Hover handlers for DAG row highlighting
   list.querySelectorAll('.node-item[data-pubkey]').forEach(el => {
     el.addEventListener('mouseenter', () => {
       highlightedAuthor = el.dataset.pubkey;
@@ -890,15 +992,10 @@ function renderNodes(nodes) {
 let finalityState = { l0: 0, l1: 0, l2: 0, l3: 0, l4: 0 };
 
 function updateFinality(status, zkStatus, anchorStatus) {
-  // L0: events accepted but awaiting vertex inclusion
   const pending = status.pending_events || 0;
-  // L1: current round (DAG inclusion — events are in signed vertices)
   const l1 = status.current_round || 0;
-  // L2: last committed round (BFT commit)
   const l2 = status.last_committed_round >= 0 ? status.last_committed_round : 0;
-  // L3: latest ZK proven block
   const l3 = zkStatus ? (zkStatus.latest_proven_block || 0) : finalityState.l3;
-  // L4: latest anchored block (from anchor bundle, even if not confirmed on-chain)
   const l4 = anchorStatus ? (anchorStatus.bundle?.last_committed_round || 0) : finalityState.l4;
 
   finalityState = { l0: pending, l1, l2, l3, l4 };
@@ -918,7 +1015,6 @@ function updateFinality(status, zkStatus, anchorStatus) {
     document.getElementById('fin-l4').style.opacity = '0.5';
   }
 
-  // Stacked bar: each level as % of L1 (the frontier)
   if (l1 > 0) {
     const pct = (v) => Math.min(100, (v / l1) * 100).toFixed(1) + '%';
     document.getElementById('fin-bar-l1').style.width = '100%';
@@ -940,7 +1036,6 @@ function updateAdaptivePanel(status) {
   const proverLag = adaptive.prover_lag;
   const emptyRounds = adaptive.consecutive_empty_rounds || 0;
 
-  // Status indicator
   const statusEl = document.getElementById('adaptive-status');
   if (enabled) {
     statusEl.textContent = 'active';
@@ -950,7 +1045,6 @@ function updateAdaptivePanel(status) {
     statusEl.style.color = 'var(--text-dim)';
   }
 
-  // Round interval with unit
   const intervalEl = document.getElementById('ap-interval');
   if (intervalMs >= 1000) {
     intervalEl.textContent = (intervalMs / 1000).toFixed(1) + 's';
@@ -958,12 +1052,10 @@ function updateAdaptivePanel(status) {
     intervalEl.textContent = intervalMs + 'ms';
   }
 
-  // Interval bar: position within 1s–180s bounds
   const minMs = 1000, maxMs = 180000;
   const intervalPct = Math.max(0, Math.min(100, ((intervalMs - minMs) / (maxMs - minMs)) * 100));
   const intervalBar = document.getElementById('ap-interval-bar');
   intervalBar.style.width = intervalPct.toFixed(1) + '%';
-  // Color: green when fast, yellow mid, red when slow
   if (intervalPct < 33) {
     intervalBar.style.background = 'var(--green)';
   } else if (intervalPct < 66) {
@@ -972,14 +1064,12 @@ function updateAdaptivePanel(status) {
     intervalBar.style.background = 'var(--red)';
   }
 
-  // Max events
   document.getElementById('ap-max-events').textContent = status.max_events_per_vertex || '--';
 
-  // Pending events as utilization proxy
   const maxEv = status.max_events_per_vertex || 50;
   const pending = status.pending_events || 0;
   const utilPct = Math.min(100, (pending / maxEv) * 100);
-  document.getElementById('ap-util').textContent = utilPct.toFixed(0) + '% (' + pending + ' pending)';
+  document.getElementById('ap-util').textContent = utilPct.toFixed(0) + '%';
 
   const utilBar = document.getElementById('ap-util-bar');
   utilBar.style.width = utilPct.toFixed(1) + '%';
@@ -991,7 +1081,6 @@ function updateAdaptivePanel(status) {
     utilBar.style.background = 'var(--red)';
   }
 
-  // Prover lag
   const lagEl = document.getElementById('ap-prover-lag');
   if (proverLag === null || proverLag === undefined) {
     lagEl.textContent = 'no proofs';
@@ -1000,19 +1089,17 @@ function updateAdaptivePanel(status) {
     lagEl.textContent = proverLag + ' rounds';
     lagEl.style.color = 'var(--green)';
   } else if (proverLag <= 100) {
-    lagEl.textContent = proverLag + ' rounds (braking)';
+    lagEl.textContent = proverLag + ' rounds';
     lagEl.style.color = 'var(--yellow)';
   } else {
-    lagEl.textContent = proverLag + ' rounds (max brake)';
+    lagEl.textContent = proverLag + ' rounds';
     lagEl.style.color = 'var(--red)';
   }
 
-  // Empty rounds
   const emptyEl = document.getElementById('ap-empty');
   emptyEl.textContent = emptyRounds;
   emptyEl.style.color = emptyRounds > 3 ? 'var(--yellow)' : 'var(--text-dim)';
 
-  // Trend arrow
   const trendEl = document.getElementById('ap-trend');
   if (prevIntervalMs !== null) {
     const delta = intervalMs - prevIntervalMs;
@@ -1020,10 +1107,10 @@ function updateAdaptivePanel(status) {
       trendEl.textContent = '→ stable';
       trendEl.style.color = 'var(--text-dim)';
     } else if (delta < 0) {
-      trendEl.textContent = '↑ speeding up';
+      trendEl.textContent = '↑ faster';
       trendEl.style.color = 'var(--green)';
     } else {
-      trendEl.textContent = '↓ slowing down';
+      trendEl.textContent = '↓ slower';
       trendEl.style.color = 'var(--yellow)';
     }
   }
@@ -1032,14 +1119,14 @@ function updateAdaptivePanel(status) {
 
 // ─── DAG Canvas (Animated) ───────────────────────────────────────────────────
 const dagAnim = {
-  particles: [],       // flying particles along edges
-  pulses: [],          // expanding rings on new vertices
-  commitFlashes: [],   // flash effects on commits
+  particles: [],
+  pulses: [],
+  commitFlashes: [],
   knownHashes: new Set(),
   knownCommits: new Set(),
   time: 0,
   running: false,
-  initialSyncDone: false, // suppress effects during initial bulk sync
+  initialSyncDone: false,
 };
 
 function spawnPulse(x, y, color) {
@@ -1058,7 +1145,6 @@ function spawnEdgeParticle(x1, y1, x2, y2, color) {
 }
 
 function renderDAG() {
-  // just flag a re-render; the animation loop handles drawing
   if (!dagAnim.running) {
     dagAnim.running = true;
     requestAnimationFrame(dagAnimLoop);
@@ -1080,7 +1166,6 @@ function drawDAGFrame() {
 
   const vertices = dagData.vertices;
 
-  // Pre-compute author count to determine needed canvas height
   let neededH;
   const ROW_H = 50;
   const PAD_T = 40;
@@ -1105,7 +1190,6 @@ function drawDAGFrame() {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   const W = cw, H = ch;
 
-  // Subtle dark clear with slight trail
   ctx.fillStyle = 'rgba(13,17,23,0.92)';
   ctx.fillRect(0, 0, W, H);
 
@@ -1119,21 +1203,19 @@ function drawDAGFrame() {
   }
 
   const rounds = [...new Set(vertices.map(v => v.round))].sort((a,b) => a-b);
-  // Only show authors active in the last 20 rounds (hide dead/inactive nodes)
   const recentCutoff = rounds.length > 0 ? rounds[rounds.length - 1] - 20 : 0;
   const recentAuthors = new Set(vertices.filter(v => v.round >= recentCutoff).map(v => v.author));
   const authors = [...recentAuthors];
 
   const COL_W = 60;
   const PAD_L = 70;
-  const maxCols = Math.floor((W - PAD_L - 220) / COL_W); // 220 = legend width + padding
+  const maxCols = Math.floor((W - PAD_L - 180) / COL_W);
   const visibleRounds = rounds.slice(-maxCols);
   const minRound = visibleRounds[0] || 0;
 
   document.getElementById('dag-info').textContent =
     `rounds ${visibleRounds[0] || 0}–${visibleRounds[visibleRounds.length-1] || 0} | ${authors.length} nodes`;
 
-  // Build position map
   const posMap = new Map();
   for (const v of vertices) {
     if (v.round < minRound) continue;
@@ -1144,7 +1226,6 @@ function drawDAGFrame() {
     const y = PAD_T + row * ROW_H + ROW_H/2;
     posMap.set(v.hash, { x, y, v });
 
-    // Spawn effects only for vertices arriving after initial sync
     if (!dagAnim.knownHashes.has(v.hash)) {
       dagAnim.knownHashes.add(v.hash);
       if (dagAnim.initialSyncDone) {
@@ -1158,7 +1239,6 @@ function drawDAGFrame() {
       }
     }
 
-    // Commit flash only after initial sync
     if (dagData.commits.has(v.hash) && !dagAnim.knownCommits.has(v.hash)) {
       dagAnim.knownCommits.add(v.hash);
       if (dagAnim.initialSyncDone) {
@@ -1167,11 +1247,10 @@ function drawDAGFrame() {
     }
   }
 
-  // ─── Draw round column indicators ─────────────────────────────────────
+  // Round column indicators
   const t = dagAnim.time * 0.001;
   for (let i = 0; i < visibleRounds.length; i++) {
     const x = PAD_L + i * COL_W + COL_W/2;
-    // Subtle column glow for even rounds (commit-eligible)
     if (visibleRounds[i] % 2 === 0) {
       const grad = ctx.createLinearGradient(x, PAD_T - 10, x, PAD_T + authors.length * ROW_H);
       grad.addColorStop(0, 'rgba(0,210,160,0.03)');
@@ -1182,7 +1261,7 @@ function drawDAGFrame() {
     }
   }
 
-  // ─── Hover highlight column ──────────────────────────────────────────
+  // Hover highlight column
   if (highlightedRound !== null) {
     const hi = visibleRounds.indexOf(highlightedRound);
     if (hi >= 0) {
@@ -1190,7 +1269,6 @@ function drawDAGFrame() {
       const colH = authors.length * ROW_H + 20;
       ctx.fillStyle = 'rgba(108,92,231,0.15)';
       ctx.fillRect(hx - COL_W/2, PAD_T - 10, COL_W, colH);
-      // Bright border lines
       ctx.strokeStyle = 'rgba(108,92,231,0.5)';
       ctx.lineWidth = 1.5;
       ctx.beginPath();
@@ -1202,7 +1280,7 @@ function drawDAGFrame() {
     }
   }
 
-  // ─── Hover highlight row (validator) ────────────────────────────────
+  // Hover highlight row (validator)
   if (highlightedAuthor !== null) {
     const hi = authors.indexOf(highlightedAuthor);
     if (hi >= 0) {
@@ -1221,7 +1299,7 @@ function drawDAGFrame() {
     }
   }
 
-  // ─── Round labels ─────────────────────────────────────────────────────
+  // Round labels
   ctx.font = '10px JetBrains Mono';
   ctx.textAlign = 'center';
   for (let i = 0; i < visibleRounds.length; i++) {
@@ -1234,7 +1312,7 @@ function drawDAGFrame() {
   }
   ctx.font = '10px JetBrains Mono';
 
-  // ─── Author labels ────────────────────────────────────────────────────
+  // Author labels
   ctx.textAlign = 'right';
   for (let i = 0; i < authors.length; i++) {
     const y = PAD_T + i * ROW_H + ROW_H/2;
@@ -1247,7 +1325,7 @@ function drawDAGFrame() {
   }
   ctx.font = '10px JetBrains Mono';
 
-  // ─── Grid lines (subtle, animated dash) ───────────────────────────────
+  // Grid lines
   ctx.lineWidth = 1;
   for (let i = 0; i < authors.length; i++) {
     const y = PAD_T + i * ROW_H + ROW_H/2;
@@ -1262,7 +1340,7 @@ function drawDAGFrame() {
   ctx.setLineDash([]);
   ctx.lineDashOffset = 0;
 
-  // ─── Edges with gradient ──────────────────────────────────────────────
+  // Edges with gradient
   for (const [hash, pos] of posMap) {
     const v = pos.v;
     if (!v.refs) continue;
@@ -1282,7 +1360,6 @@ function drawDAGFrame() {
       ctx.lineWidth = isCommitEdge ? 1.5 : 1;
       ctx.beginPath();
       ctx.moveTo(refPos.x, refPos.y);
-      // Slight curve for visual interest
       const mx = (refPos.x + pos.x) / 2;
       const my = (refPos.y + pos.y) / 2 - 6;
       ctx.quadraticCurveTo(mx, my, pos.x, pos.y);
@@ -1290,7 +1367,7 @@ function drawDAGFrame() {
     }
   }
 
-  // ─── Edge particles ───────────────────────────────────────────────────
+  // Edge particles
   for (let i = dagAnim.particles.length - 1; i >= 0; i--) {
     const p = dagAnim.particles[i];
     p.t += p.speed;
@@ -1303,7 +1380,6 @@ function drawDAGFrame() {
     ctx.beginPath();
     ctx.arc(px, py, 2.5, 0, Math.PI * 2);
     ctx.fill();
-    // Trail
     ctx.globalAlpha = alpha * 0.3;
     ctx.beginPath();
     ctx.arc(px - (p.x2 - p.x1) * 0.02, py - (p.y2 - p.y1) * 0.02, 1.5, 0, Math.PI * 2);
@@ -1311,35 +1387,30 @@ function drawDAGFrame() {
     ctx.globalAlpha = 1;
   }
 
-  // ─── Vertices ─────────────────────────────────────────────────────────
+  // Vertices
   for (const [hash, pos] of posMap) {
     const v = pos.v;
     const isCommitted = dagData.commits.has(hash);
     const color = nodeColor(v.author);
     const baseR = isCommitted ? 10 : 7;
-    // Subtle breathing on vertices
     const breathe = 1 + Math.sin(dagAnim.time * 0.003 + pos.x * 0.1) * 0.08;
     const r = baseR * breathe;
 
-    // Ambient glow
     const glowR = r * 2.5;
     const glow = ctx.createRadialGradient(pos.x, pos.y, r * 0.5, pos.x, pos.y, glowR);
     if (isCommitted) {
       glow.addColorStop(0, 'rgba(0,210,160,0.25)');
       glow.addColorStop(1, 'rgba(0,210,160,0)');
     } else {
-      const c = color;
-      glow.addColorStop(0, c + '20');
-      glow.addColorStop(1, c + '00');
+      glow.addColorStop(0, color + '20');
+      glow.addColorStop(1, color + '00');
     }
     ctx.fillStyle = glow;
     ctx.fillRect(pos.x - glowR, pos.y - glowR, glowR * 2, glowR * 2);
 
-    // Main vertex shape
     ctx.fillStyle = isCommitted ? '#00d2a0' : color;
     ctx.beginPath();
     if (isCommitted) {
-      // Diamond
       ctx.moveTo(pos.x, pos.y - r);
       ctx.lineTo(pos.x + r, pos.y);
       ctx.lineTo(pos.x, pos.y + r);
@@ -1350,19 +1421,16 @@ function drawDAGFrame() {
     }
     ctx.fill();
 
-    // Inner highlight
     const hl = ctx.createRadialGradient(pos.x - r*0.3, pos.y - r*0.3, 0, pos.x, pos.y, r);
     hl.addColorStop(0, 'rgba(255,255,255,0.2)');
     hl.addColorStop(1, 'rgba(255,255,255,0)');
     ctx.fillStyle = hl;
     ctx.fill();
 
-    // Border
     ctx.strokeStyle = isCommitted ? '#00d2a0' : color;
     ctx.lineWidth = isCommitted ? 2 : 1;
     ctx.stroke();
 
-    // Event count badge
     const evCount = v.events ? v.events.length : 0;
     if (evCount > 0) {
       ctx.fillStyle = '#fff';
@@ -1372,7 +1440,7 @@ function drawDAGFrame() {
     }
   }
 
-  // ─── Pulse rings (new vertex arrival) ─────────────────────────────────
+  // Pulse rings
   for (let i = dagAnim.pulses.length - 1; i >= 0; i--) {
     const p = dagAnim.pulses[i];
     const age = (dagAnim.time - p.birth) / 1000;
@@ -1388,13 +1456,11 @@ function drawDAGFrame() {
     ctx.globalAlpha = 1;
   }
 
-  // ─── Commit flash (expanding green ring + burst) ──────────────────────
+  // Commit flash
   for (let i = dagAnim.commitFlashes.length - 1; i >= 0; i--) {
     const f = dagAnim.commitFlashes[i];
     const age = (dagAnim.time - f.birth) / 1000;
     if (age > 1.5) { dagAnim.commitFlashes.splice(i, 1); continue; }
-
-    // Expanding ring
     const radius = 10 + age * 50;
     const alpha = Math.max(0, 1 - age / 1.5);
     ctx.strokeStyle = '#00d2a0';
@@ -1403,8 +1469,6 @@ function drawDAGFrame() {
     ctx.beginPath();
     ctx.arc(f.x, f.y, radius, 0, Math.PI * 2);
     ctx.stroke();
-
-    // Second ring offset
     if (age > 0.1) {
       const r2 = 10 + (age - 0.1) * 40;
       ctx.globalAlpha = alpha * 0.3;
@@ -1413,20 +1477,18 @@ function drawDAGFrame() {
       ctx.arc(f.x, f.y, r2, 0, Math.PI * 2);
       ctx.stroke();
     }
-
     ctx.globalAlpha = 1;
   }
 
-  // ─── Legend (isolated canvas state to prevent ghosting) ─────────────────
+  // Legend
   ctx.save();
   ctx.globalAlpha = 1;
   ctx.setLineDash([]);
   ctx.lineDashOffset = 0;
 
-  const lw = 200, lh = 148;
+  const lw = 180, lh = 130;
   const legendX = W - lw - 6, legendY = H - lh - 6;
 
-  // Opaque background — clearRect then fill to fully eliminate trail artifacts
   ctx.clearRect(legendX, legendY, lw, lh);
   ctx.fillStyle = '#12121c';
   ctx.fillRect(legendX, legendY, lw, lh);
@@ -1436,100 +1498,81 @@ function drawDAGFrame() {
   ctx.roundRect(legendX, legendY, lw, lh, 6);
   ctx.stroke();
 
-  const lTextX = legendX + 28;
-  ctx.font = 'bold 9px JetBrains Mono';
+  const lTextX = legendX + 26;
+  ctx.font = 'bold 8px JetBrains Mono';
   ctx.fillStyle = '#8a8aaa';
   ctx.textAlign = 'left';
   ctx.textBaseline = 'middle';
-  ctx.fillText('LEGEND', legendX + 10, legendY + 12);
+  ctx.fillText('LEGEND', legendX + 8, legendY + 10);
 
-  let ly = legendY + 28;
-  const lSpacing = 17;
-  const labelStyle = () => { ctx.fillStyle = '#b0b0c8'; ctx.font = '8.5px JetBrains Mono'; ctx.textAlign = 'left'; };
+  let ly = legendY + 24;
+  const lSpacing = 15;
+  const labelStyle = () => { ctx.fillStyle = '#b0b0c8'; ctx.font = '8px JetBrains Mono'; ctx.textAlign = 'left'; };
 
-  // Pending vertex (circle)
   ctx.fillStyle = '#6c5ce7';
   ctx.beginPath();
-  ctx.arc(legendX + 16, ly, 5, 0, Math.PI * 2);
+  ctx.arc(legendX + 14, ly, 4, 0, Math.PI * 2);
   ctx.fill();
   ctx.fillStyle = '#fff';
-  ctx.font = 'bold 7px JetBrains Mono';
+  ctx.font = 'bold 6px JetBrains Mono';
   ctx.textAlign = 'center';
-  ctx.fillText('3', legendX + 16, ly);
+  ctx.fillText('3', legendX + 14, ly);
   labelStyle();
-  ctx.fillText('Pending vertex (events)', lTextX, ly);
+  ctx.fillText('Pending (events)', lTextX, ly);
 
   ly += lSpacing;
-  // Committed vertex (diamond)
   ctx.fillStyle = '#00d2a0';
   ctx.beginPath();
-  ctx.moveTo(legendX + 16, ly - 5);
-  ctx.lineTo(legendX + 21, ly);
-  ctx.lineTo(legendX + 16, ly + 5);
-  ctx.lineTo(legendX + 11, ly);
+  ctx.moveTo(legendX + 14, ly - 4);
+  ctx.lineTo(legendX + 18, ly);
+  ctx.lineTo(legendX + 14, ly + 4);
+  ctx.lineTo(legendX + 10, ly);
   ctx.closePath();
   ctx.fill();
   labelStyle();
-  ctx.fillText('Committed vertex', lTextX, ly);
+  ctx.fillText('Committed', lTextX, ly);
 
   ly += lSpacing;
-  // Edge reference
   ctx.strokeStyle = 'rgba(108,92,231,0.5)';
   ctx.lineWidth = 1.5;
   ctx.beginPath();
-  ctx.moveTo(legendX + 10, ly);
-  ctx.lineTo(legendX + 22, ly);
+  ctx.moveTo(legendX + 8, ly);
+  ctx.lineTo(legendX + 20, ly);
   ctx.stroke();
   labelStyle();
-  ctx.fillText('DAG reference (edge)', lTextX, ly);
+  ctx.fillText('DAG edge', lTextX, ly);
 
   ly += lSpacing;
-  // Commit edge
   ctx.strokeStyle = 'rgba(0,210,160,0.6)';
   ctx.lineWidth = 2;
   ctx.beginPath();
-  ctx.moveTo(legendX + 10, ly);
-  ctx.lineTo(legendX + 22, ly);
+  ctx.moveTo(legendX + 8, ly);
+  ctx.lineTo(legendX + 20, ly);
   ctx.stroke();
   labelStyle();
   ctx.fillText('Commit edge', lTextX, ly);
 
   ly += lSpacing;
-  // Even round column
   ctx.fillStyle = 'rgba(0,210,160,0.15)';
-  ctx.fillRect(legendX + 10, ly - 6, 12, 12);
+  ctx.fillRect(legendX + 8, ly - 5, 12, 10);
   ctx.fillStyle = 'rgba(0,210,160,0.6)';
-  ctx.font = 'bold 7px JetBrains Mono';
+  ctx.font = 'bold 6px JetBrains Mono';
   ctx.textAlign = 'center';
-  ctx.fillText('R2', legendX + 16, ly);
+  ctx.fillText('R2', legendX + 14, ly);
   labelStyle();
-  ctx.fillText('Even round (commit)', lTextX, ly);
+  ctx.fillText('Even round', lTextX, ly);
 
   ly += lSpacing;
-  // Validator color
   ctx.fillStyle = '#ff6b6b';
   ctx.beginPath();
-  ctx.arc(legendX + 13, ly, 3.5, 0, Math.PI * 2);
+  ctx.arc(legendX + 12, ly, 3, 0, Math.PI * 2);
   ctx.fill();
   ctx.fillStyle = '#ffd93d';
   ctx.beginPath();
-  ctx.arc(legendX + 20, ly, 3.5, 0, Math.PI * 2);
+  ctx.arc(legendX + 18, ly, 3, 0, Math.PI * 2);
   ctx.fill();
   labelStyle();
-  ctx.fillText('Color = validator ID', lTextX, ly);
-
-  ly += lSpacing;
-  // Number inside vertex
-  ctx.fillStyle = '#555';
-  ctx.beginPath();
-  ctx.arc(legendX + 16, ly, 5, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.fillStyle = '#fff';
-  ctx.font = 'bold 7px JetBrains Mono';
-  ctx.textAlign = 'center';
-  ctx.fillText('N', legendX + 16, ly);
-  labelStyle();
-  ctx.fillText('N = event count', lTextX, ly);
+  ctx.fillText('Validator color', lTextX, ly);
 
   ctx.restore();
 }
@@ -1546,9 +1589,7 @@ function connectWS() {
 
   ws.onopen = () => {
     ws.send(JSON.stringify({ type: 'join', pubkey: 'dashboard' }));
-    // Subscribe to all push channels — eliminates HTTP polling
     ws.send(JSON.stringify({ type: 'subscribe', channels: ['dag', 'status', 'peers', 'zk'] }));
-    // Initial sync via WS instead of HTTP
     ws.send(JSON.stringify({ type: 'sync', after_round: lastSyncRound, limit: 500 }));
     ws.send(JSON.stringify({ type: 'status' }));
   };
@@ -1557,7 +1598,6 @@ function connectWS() {
     try {
       const msg = JSON.parse(e.data);
 
-      // Server-pushed status update (replaces polling /dag/status)
       if (msg.type === 'status.update' || msg.type === 'status.result') {
         if (!connected) {
           connected = true;
@@ -1574,13 +1614,11 @@ function connectWS() {
         return;
       }
 
-      // Server-pushed peer list (replaces polling /admin/peers)
       if (msg.type === 'peers.update') {
         renderNodes(msg.peers || []);
         return;
       }
 
-      // WS-based sync response (replaces polling /dag/sync)
       if (msg.type === 'sync.result') {
         if (msg.vertices && msg.vertices.length > 0) {
           for (const v of msg.vertices) {
@@ -1605,11 +1643,9 @@ function connectWS() {
           }
         }
         renderDAG();
-        // Seed event log with recent history on first sync (use server timestamps)
         if (!dagAnim.initialSyncDone) {
           const recentVertices = (msg.vertices || []).slice(-20);
           const recentCommits = (msg.commits || []).slice(-10);
-          // Build combined list sorted by time, oldest first
           const seed = [];
           for (const v of recentVertices) {
             seed.push({ type: 'vertex', detail: `Round ${v.round}`, extra: shortKey(v.author), color: nodeColor(v.author), time: v.received_at || v.timestamp || 0, round: v.round });
@@ -1617,7 +1653,7 @@ function connectWS() {
           for (const c of recentCommits) {
             seed.push({ type: 'commit', detail: `Round ${c.round} finalized`, extra: shortKey(c.anchor_hash), color: null, time: c.committed_at || 0, round: c.round });
           }
-          seed.sort((a, b) => b.time - a.time); // newest first
+          seed.sort((a, b) => b.time - a.time);
           events.push(...seed);
           if (events.length > 200) events.length = 200;
           renderEvents();
@@ -1628,7 +1664,6 @@ function connectWS() {
         return;
       }
 
-      // Live push events — use server timestamps so "time ago" reflects when events happened on-chain
       if (msg.type === 'vertex.new') {
         addEvent('vertex', `Round ${msg.round}`, shortKey(msg.author), nodeColor(msg.author), msg.timestamp, msg.round);
       } else if (msg.type === 'commit') {
@@ -1639,10 +1674,6 @@ function connectWS() {
         addEvent(badge, et, shortKey(msg.event?.pubkey), null, msg.event?.timestamp, msg.round);
       } else if (msg.type === 'zk.proof_submitted') {
         addEvent('zk', `Block ${msg.block_number} proved`, '', null, msg.timestamp, msg.block_number);
-        // Auto-refresh verifier if tab is active
-        if (verifierAutoRan && document.getElementById('tab-verifier').classList.contains('active')) {
-          setTimeout(runVerification, 1000);
-        }
       }
     } catch {}
   };
@@ -1657,15 +1688,11 @@ function connectWS() {
 
 // ─── Init ────────────────────────────────────────────────────────────────────
 document.getElementById('status-dot').classList.add('offline');
-
-// Handle resize
 window.addEventListener('resize', () => renderDAG());
-
-// Start WS (primary) and polling as rare fallback for ZK status
 connectWS();
 poll();
-setInterval(poll, 60000); // Fallback only — most data arrives via WS push
-setInterval(renderEvents, 5000); // Keep event timestamps fresh
+setInterval(poll, 60000);
+setInterval(renderEvents, 5000);
 </script>
 </body>
 </html>
