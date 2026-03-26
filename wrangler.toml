@@ -3,9 +3,10 @@ main = "src/index.ts"
 compatibility_date = "2026-03-01"
 compatibility_flags = ["nodejs_compat"]
 
-[[rules]]
-type = "Text"
-globs = ["**/*.html"]
+# ─── Static Assets (HTML served from CDN edge, not bundled in Worker) ──
+[assets]
+directory = "./public"
+binding = "ASSETS"
 
 [[durable_objects.bindings]]
 name = "PERSISTIA_WORLD"
@@ -14,6 +15,21 @@ class_name = "PersistiaWorldV4"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["PersistiaWorldV4"]
+
+# ─── R2 Object Storage (WASM binaries + ZK proof blobs) ───────────────
+[[r2_buckets]]
+binding = "BLOB_STORE"
+bucket_name = "persistia-blobs"
+
+# ─── Queue (async cross-shard relay) ──────────────────────────────────
+[[queues.producers]]
+binding = "RELAY_QUEUE"
+queue = "persistia-relay"
+
+[[queues.consumers]]
+queue = "persistia-relay"
+max_batch_size = 10
+max_batch_timeout = 5
 
 # ─── Environment Variables ─────────────────────────────────────────────
 # NODE_URL       — This node's public URL

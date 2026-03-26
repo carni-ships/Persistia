@@ -3,9 +3,10 @@ main = "../src/index.ts"
 compatibility_date = "2026-03-01"
 compatibility_flags = ["nodejs_compat"]
 
-[[rules]]
-type = "Text"
-globs = ["**/*.html"]
+# ─── Static Assets (HTML served from CDN edge) ────────────────────────
+[assets]
+directory = "../public"
+binding = "ASSETS"
 
 [[durable_objects.bindings]]
 name = "PERSISTIA_WORLD"
@@ -14,6 +15,13 @@ class_name = "PersistiaWorldV4"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["PersistiaWorldV4"]
+
+# ─── R2 Object Storage (optional — falls back to SQLite if not configured) ──
+# External nodes can optionally set up R2 for blob storage.
+# Uncomment and create a bucket if you want to offload WASM/proof blobs.
+# [[r2_buckets]]
+# binding = "BLOB_STORE"
+# bucket_name = "persistia-node-blobs"
 
 # ─── Required: Set these for your node ─────────────────────────────────
 [vars]

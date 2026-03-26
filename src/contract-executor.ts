@@ -270,9 +270,11 @@ export class ContractExecutor {
   // LRU module cache: Map iteration order = insertion order; most-recent at end
   private moduleCache: Map<string, WebAssembly.Module> = new Map();
   private sql: any;
+  private blobStore: R2Bucket | null;
 
-  constructor(sql: any) {
+  constructor(sql: any, blobStore?: R2Bucket | null) {
     this.sql = sql;
+    this.blobStore = blobStore || null;
   }
 
   /** Touch a cache entry (move to end for LRU), evict oldest if over limit */
@@ -318,11 +320,21 @@ export class ContractExecutor {
     const wasmHash = await sha256(bytesToHex(wasmBytes));
     const address = await sha256(`${deployer}:${wasmHash}:${seq}`);
 
-    this.sql.exec(
-      `INSERT INTO contracts (address, deployer, wasm_hash, wasm_bytes, created_at, deploy_seq)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      address, deployer, wasmHash, wasmBytes, Date.now(), seq,
-    );
+    // Store WASM bytes in R2 if available, otherwise inline in SQLite
+    if (this.blobStore) {
+      await this.blobStore.put(`wasm/${wasmHash}`, meteredBytes);
+      this.sql.exec(
+        `INSERT INTO contracts (address, deployer, wasm_hash, wasm_bytes, created_at, deploy_seq)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        address, deployer, wasmHash, new Uint8Array(0), Date.now(), seq,
+      );
+    } else {
+      this.sql.exec(
+        `INSERT INTO contracts (address, deployer, wasm_hash, wasm_bytes, created_at, deploy_seq)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        address, deployer, wasmHash, wasmBytes, Date.now(), seq,
+      );
+    }
 
     this.cacheSet(address, module);
     return address;
@@ -1085,9 +1097,20 @@ export class ContractExecutor {
   private async getModule(address: string): Promise<WebAssembly.Module | null> {
     const cached = this.cacheGet(address);
     if (cached) return cached;
-    const rows = [...this.sql.exec("SELECT wasm_bytes FROM contracts WHERE address = ?", address)];
+
+    const rows = [...this.sql.exec("SELECT wasm_hash, wasm_bytes FROM contracts WHERE address = ?", address)];
     if (rows.length === 0) return null;
-    const module = await WebAssembly.compile(rows[0].wasm_bytes as Uint8Array);
+
+    let wasmBytes = rows[0].wasm_bytes as Uint8Array;
+
+    // If wasm_bytes is empty (stored in R2), fetch from R2
+    if (this.blobStore && (!wasmBytes || wasmBytes.length === 0)) {
+      const obj = await this.blobStore.get(`wasm/${rows[0].wasm_hash}`);
+      if (!obj) return null;
+      wasmBytes = new Uint8Array(await obj.arrayBuffer());
+    }
+
+    const module = await WebAssembly.compile(wasmBytes);
     this.cacheSet(address, module);
     return module;
   }

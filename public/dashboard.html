@@ -1,0 +1,1671 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Persistia Explorer</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&display=swap');
+
+    :root {
+      --bg: #0a0a0f;
+      --surface: #12121a;
+      --surface-2: #1a1a25;
+      --border: #2a2a3a;
+      --text: #e0e0e8;
+      --text-dim: #7a7a8e;
+      --accent: #6c5ce7;
+      --accent-dim: rgba(108,92,231,0.15);
+      --green: #00d2a0;
+      --green-dim: rgba(0,210,160,0.15);
+      --yellow: #ffd166;
+      --yellow-dim: rgba(255,209,102,0.15);
+      --red: #ff6b6b;
+      --red-dim: rgba(255,107,107,0.15);
+      --blue: #48bfe3;
+      --blue-dim: rgba(72,191,227,0.15);
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 13px;
+      min-height: 100vh;
+    }
+
+    /* ─── Header ─────────────────────────────────────────── */
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 16px 24px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+    }
+
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .logo-icon {
+      width: 32px;
+      height: 32px;
+      background: var(--accent);
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+      font-size: 16px;
+    }
+
+    .logo-text {
+      font-size: 18px;
+      font-weight: 600;
+      letter-spacing: -0.5px;
+    }
+
+    .logo-tag {
+      font-size: 10px;
+      color: var(--text-dim);
+      background: var(--surface-2);
+      padding: 2px 8px;
+      border-radius: 4px;
+      margin-left: 8px;
+    }
+
+    .header-right {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--green);
+      animation: pulse 2s infinite;
+    }
+
+    .status-dot.offline { background: var(--red); animation: none; }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
+    .node-url {
+      color: var(--text-dim);
+      font-size: 11px;
+    }
+
+    /* ─── Stats Bar ──────────────────────────────────────── */
+    .stats-bar {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 1px;
+      background: var(--border);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .stat-card {
+      background: var(--surface);
+      padding: 16px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .stat-label {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: var(--text-dim);
+    }
+
+    .stat-value {
+      font-size: 22px;
+      font-weight: 600;
+      letter-spacing: -1px;
+    }
+
+    .stat-sub {
+      font-size: 10px;
+      color: var(--text-dim);
+    }
+
+    /* ─── Main Layout ────────────────────────────────────── */
+    .main {
+      display: grid;
+      grid-template-columns: 1fr 320px;
+      grid-template-rows: 1fr 240px;
+      height: calc(100vh - 130px);
+      gap: 1px;
+      background: var(--border);
+    }
+
+    .main .dag-panel { grid-column: 1; grid-row: 1; min-height: 0; }
+    .main .events-panel { grid-column: 2; grid-row: 1 / 3; }
+    .main .bottom-row {
+      grid-column: 1; grid-row: 2;
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 1px;
+      background: var(--border);
+      max-height: 240px;
+      overflow: hidden;
+    }
+
+    .panel {
+      background: var(--surface);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    .panel-title {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: var(--text-dim);
+      font-weight: 500;
+    }
+
+    .panel-body {
+      flex: 1;
+      overflow: auto;
+      position: relative;
+    }
+
+    /* ─── DAG Visualization ──────────────────────────────── */
+    #dag-canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+
+    .dag-panel .panel-body { overflow: auto; }
+
+    /* ─── Event Log ──────────────────────────────────────── */
+    .event-list {
+      padding: 0;
+      list-style: none;
+    }
+
+    .event-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      padding: 8px 16px;
+      border-bottom: 1px solid rgba(42,42,58,0.5);
+      font-size: 11px;
+      transition: background 0.15s;
+    }
+
+    .event-item:hover { background: var(--surface-2); }
+    .event-item[data-round] { cursor: crosshair; }
+    .event-item[data-round]:hover { background: rgba(108,92,231,0.1); }
+
+    .event-time {
+      color: var(--text-dim);
+      white-space: nowrap;
+      min-width: 55px;
+    }
+
+    .event-badge {
+      padding: 1px 6px;
+      border-radius: 3px;
+      font-size: 10px;
+      font-weight: 500;
+      white-space: nowrap;
+    }
+
+    .badge-commit { background: var(--green-dim); color: var(--green); }
+    .badge-vertex { background: var(--accent-dim); color: var(--accent); }
+    .badge-event { background: var(--blue-dim); color: var(--blue); }
+    .badge-contract { background: var(--yellow-dim); color: var(--yellow); }
+    .badge-zk { background: var(--red-dim); color: var(--red); }
+
+    .event-detail {
+      color: var(--text-dim);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .event-detail .mono {
+      color: var(--text);
+      font-weight: 500;
+    }
+
+    /* ─── Node List ──────────────────────────────────────── */
+    .node-list { padding: 8px 0; }
+
+    .node-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 16px;
+      border-bottom: 1px solid rgba(42,42,58,0.3);
+    }
+
+    .node-avatar {
+      width: 28px;
+      height: 28px;
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 11px;
+      font-weight: 600;
+      flex-shrink: 0;
+    }
+
+    .node-info { flex: 1; min-width: 0; }
+    .node-pk {
+      font-size: 11px;
+      color: var(--text);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .node-meta {
+      font-size: 10px;
+      color: var(--text-dim);
+      margin-top: 2px;
+    }
+
+    .node-round {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--accent);
+    }
+
+    /* ─── ZK Status ──────────────────────────────────────── */
+    .zk-bar {
+      padding: 12px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .zk-progress {
+      height: 4px;
+      background: var(--surface-2);
+      border-radius: 2px;
+      overflow: hidden;
+    }
+
+    .zk-progress-fill {
+      height: 100%;
+      background: var(--accent);
+      border-radius: 2px;
+      transition: width 0.5s ease;
+    }
+
+    .zk-stats {
+      display: flex;
+      justify-content: space-between;
+      font-size: 10px;
+      color: var(--text-dim);
+    }
+
+    /* ─── Finality Levels ─────────────────────────────────── */
+    .finality-levels { padding: 8px 12px; }
+
+    .finality-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 5px 0;
+      font-size: 11px;
+    }
+
+    .finality-row + .finality-row {
+      border-top: 1px solid rgba(42,42,58,0.3);
+    }
+
+    .finality-badge {
+      width: 22px;
+      height: 18px;
+      border-radius: 3px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 9px;
+      font-weight: 700;
+      flex-shrink: 0;
+    }
+
+    .finality-name {
+      flex: 1;
+      min-width: 0;
+      color: var(--text-dim);
+      font-size: 10px;
+    }
+
+    .finality-value {
+      font-weight: 600;
+      font-size: 11px;
+      text-align: right;
+      white-space: nowrap;
+    }
+
+    .finality-bar-track {
+      height: 3px;
+      background: var(--surface-2);
+      border-radius: 2px;
+      margin-top: 6px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .finality-bar-fill {
+      height: 100%;
+      border-radius: 2px;
+      transition: width 0.6s ease;
+      position: absolute;
+      left: 0;
+      top: 0;
+    }
+
+    /* ─── Adaptive Panel ─────────────────────────────────── */
+    .adaptive-grid {
+      padding: 8px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      font-size: 11px;
+    }
+    .adaptive-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .adaptive-label {
+      color: var(--text-dim);
+      font-size: 10px;
+      white-space: nowrap;
+    }
+    .adaptive-value {
+      font-weight: 600;
+      text-align: right;
+      white-space: nowrap;
+    }
+    .adaptive-bar {
+      height: 6px;
+      background: var(--surface-2);
+      border-radius: 3px;
+      overflow: hidden;
+      position: relative;
+    }
+    .adaptive-bar-fill {
+      height: 100%;
+      border-radius: 3px;
+      transition: width 0.6s ease, background 0.3s ease;
+    }
+    .adaptive-indicator {
+      display: inline-block;
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      margin-right: 4px;
+    }
+
+    /* ─── Scrollbar ──────────────────────────────────────── */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #3a3a4a; }
+
+    /* ─── Responsive ─────────────────────────────────────── */
+    @media (max-width: 900px) {
+      .stats-bar { grid-template-columns: repeat(3, 1fr); }
+      .main { grid-template-columns: 1fr; grid-template-rows: 300px auto auto; }
+      .dag-panel { grid-row: auto; }
+      .verify-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="logo">
+      <div class="logo-icon">P</div>
+      <span class="logo-text">Persistia</span>
+      <span class="logo-tag">v0.5.0</span>
+    </div>
+    <div class="header-right" style="display:flex;align-items:center;gap:16px">
+      <a href="/game" style="color:var(--accent);text-decoration:none;font-size:12px;padding:4px 12px;border:1px solid var(--accent);border-radius:6px;transition:all 0.15s" onmouseover="this.style.background='var(--accent-dim)'" onmouseout="this.style.background='transparent'">Game World</a>
+      <a href="/verifier" style="color:var(--green);text-decoration:none;font-size:12px;padding:4px 12px;border:1px solid var(--green);border-radius:6px;transition:all 0.15s" onmouseover="this.style.background='rgba(0,210,160,0.15)'" onmouseout="this.style.background='transparent'">Verifier</a>
+      <a href="/wallet" style="color:#d29922;text-decoration:none;font-size:12px;padding:4px 12px;border:1px solid rgba(210,153,34,0.4);border-radius:6px;transition:all 0.15s" onmouseover="this.style.background='rgba(210,153,34,0.15)'" onmouseout="this.style.background='transparent'">Wallet</a>
+      <a href="https://github.com/carni-ships/Persistia" target="_blank" rel="noopener" style="color:var(--text-dim);text-decoration:none;font-size:14px;transition:color 0.15s" onmouseover="this.style.color='#fff'" onmouseout="this.style.color='var(--text-dim)'" title="GitHub">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      </a>
+      <a href="/blog/introducing-persistia" target="_blank" style="color:var(--text-dim);text-decoration:none;font-size:12px;transition:color 0.15s" onmouseover="this.style.color='#fff'" onmouseout="this.style.color='var(--text-dim)'" title="Blog">Blog</a>
+      <div style="display:flex;align-items:center;gap:8px">
+        <div class="status-dot" id="status-dot"></div>
+        <span class="node-url" id="node-url">connecting...</span>
+      </div>
+    </div>
+  </header>
+
+  <div class="stats-bar">
+    <div class="stat-card">
+      <div class="stat-label">Round</div>
+      <div class="stat-value" id="s-round">--</div>
+      <div class="stat-sub">current consensus round</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Finalized</div>
+      <div class="stat-value" id="s-finalized">--</div>
+      <div class="stat-sub">committed round</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Events</div>
+      <div class="stat-value" id="s-events">--</div>
+      <div class="stat-sub">total finalized</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Nodes</div>
+      <div class="stat-value" id="s-nodes">--</div>
+      <div class="stat-sub">active validators</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">ZK Proofs</div>
+      <div class="stat-value" id="s-zk">--</div>
+      <div class="stat-sub" id="s-zk-sub">chain length</div>
+      <div class="zk-bar" style="margin-top:6px">
+        <div class="zk-progress" style="height:4px">
+          <div class="zk-progress-fill" id="zk-fill" style="width:0%"></div>
+        </div>
+        <div class="zk-stats" style="font-size:9px;margin-top:2px">
+          <span id="zk-proven">0 / 0 blocks</span>
+          <span id="zk-gap"></span>
+        </div>
+        <div id="zk-lineages" style="margin-top:4px;font-size:9px;color:var(--text-dim)"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="main">
+    <!-- DAG Visualization -->
+    <div class="panel dag-panel">
+      <div class="panel-header">
+        <span class="panel-title">DAG Consensus</span>
+        <span style="font-size:10px;color:var(--text-dim)" id="dag-info">rounds shown: 0</span>
+      </div>
+      <div class="panel-body">
+        <canvas id="dag-canvas"></canvas>
+      </div>
+    </div>
+
+    <!-- Live Events (stretches full height) -->
+    <div class="panel events-panel">
+      <div class="panel-header">
+        <span class="panel-title">Live Events</span>
+        <span style="font-size:10px;color:var(--text-dim)" id="event-count">0</span>
+      </div>
+      <div class="panel-body">
+        <ul class="event-list" id="event-list"></ul>
+      </div>
+    </div>
+
+    <!-- Bottom row: Validators + Finality side by side -->
+    <div class="bottom-row">
+      <div class="panel">
+        <div class="panel-header">
+          <span class="panel-title">Validators</span>
+        </div>
+        <div class="panel-body">
+          <div class="node-list" id="node-list"></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <span class="panel-title">Finality Levels</span>
+        </div>
+        <div class="panel-body">
+          <div class="finality-levels" id="finality-levels">
+            <div class="finality-row">
+              <div class="finality-badge" style="background:rgba(72,191,227,0.2);color:#48bfe3">L0</div>
+              <div class="finality-name">Optimistic</div>
+              <div class="finality-value" style="color:#48bfe3" id="fin-l0">--</div>
+            </div>
+            <div class="finality-row">
+              <div class="finality-badge" style="background:rgba(108,92,231,0.2);color:#6c5ce7">L1</div>
+              <div class="finality-name">DAG Inclusion</div>
+              <div class="finality-value" style="color:#6c5ce7" id="fin-l1">--</div>
+            </div>
+            <div class="finality-row">
+              <div class="finality-badge" style="background:rgba(0,210,160,0.2);color:#00d2a0">L2</div>
+              <div class="finality-name">BFT Commit</div>
+              <div class="finality-value" style="color:#00d2a0" id="fin-l2">--</div>
+            </div>
+            <div class="finality-row">
+              <div class="finality-badge" style="background:rgba(255,107,107,0.2);color:#ff6b6b">L3</div>
+              <div class="finality-name">ZK Proven</div>
+              <div class="finality-value" style="color:#ff6b6b" id="fin-l3">--</div>
+            </div>
+            <div class="finality-row">
+              <div class="finality-badge" style="background:rgba(255,209,102,0.2);color:#ffd166">L4</div>
+              <div class="finality-name">DA Anchored</div>
+              <div class="finality-value" style="color:#ffd166" id="fin-l4">--</div>
+            </div>
+            <div class="finality-bar-track">
+              <div class="finality-bar-fill" id="fin-bar-l4" style="width:0%;background:#ffd166;opacity:0.4;z-index:1"></div>
+              <div class="finality-bar-fill" id="fin-bar-l3" style="width:0%;background:#ff6b6b;opacity:0.5;z-index:2"></div>
+              <div class="finality-bar-fill" id="fin-bar-l2" style="width:0%;background:#00d2a0;opacity:0.6;z-index:3"></div>
+              <div class="finality-bar-fill" id="fin-bar-l1" style="width:0%;background:#6c5ce7;opacity:0.7;z-index:4"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Adaptive Parameters Panel -->
+      <div class="panel">
+        <div class="panel-header">
+          <span class="panel-title">Adaptive Params</span>
+          <span class="panel-title" id="adaptive-status" style="color:var(--green)">active</span>
+        </div>
+        <div class="panel-body">
+          <div class="adaptive-grid" id="adaptive-grid">
+            <div class="adaptive-row">
+              <span class="adaptive-label">Round Interval</span>
+              <span class="adaptive-value" id="ap-interval" style="color:var(--accent)">--</span>
+            </div>
+            <div class="adaptive-bar">
+              <div class="adaptive-bar-fill" id="ap-interval-bar" style="width:33%;background:var(--accent)"></div>
+            </div>
+            <div class="adaptive-row">
+              <span class="adaptive-label">Max Events/Vertex</span>
+              <span class="adaptive-value" id="ap-max-events" style="color:var(--blue)">--</span>
+            </div>
+            <div class="adaptive-row">
+              <span class="adaptive-label">Utilization</span>
+              <span class="adaptive-value" id="ap-util">--</span>
+            </div>
+            <div class="adaptive-bar">
+              <div class="adaptive-bar-fill" id="ap-util-bar" style="width:0%;background:var(--green)"></div>
+            </div>
+            <div class="adaptive-row">
+              <span class="adaptive-label">Prover Lag</span>
+              <span class="adaptive-value" id="ap-prover-lag">--</span>
+            </div>
+            <div class="adaptive-row">
+              <span class="adaptive-label">Empty Rounds</span>
+              <span class="adaptive-value" id="ap-empty" style="color:var(--text-dim)">0</span>
+            </div>
+            <div class="adaptive-row">
+              <span class="adaptive-label">Trend</span>
+              <span class="adaptive-value" id="ap-trend" style="color:var(--text-dim)">--</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+// ─── Config ──────────────────────────────────────────────────────────────────
+const params = new URLSearchParams(location.search);
+const NODE = params.get('node') || location.origin;
+const SHARD = params.get('shard') || 'node-1';
+const POLL_MS = 3000;
+
+let connected = false;
+let dagData = { vertices: [], commits: new Set() };
+let events = [];
+let nodeColors = {};
+let highlightedRound = null;
+let highlightedAuthor = null;
+const COLORS = [
+  '#6c5ce7','#00d2a0','#48bfe3','#ffd166','#ff6b6b',
+  '#a29bfe','#55efc4','#74b9ff','#fdcb6e','#fab1a0',
+  '#e17055','#0984e3','#00cec9','#e84393','#636e72',
+];
+
+function nodeColor(pubkey) {
+  if (!nodeColors[pubkey]) {
+    const idx = Object.keys(nodeColors).length % COLORS.length;
+    nodeColors[pubkey] = COLORS[idx];
+  }
+  return nodeColors[pubkey];
+}
+
+function shortKey(pk) {
+  if (!pk) return '???';
+  return pk.slice(0, 6) + '..' + pk.slice(-4);
+}
+
+function timeAgo(ts) {
+  if (!ts || isNaN(ts)) return 'unknown';
+  const s = Math.floor((Date.now() - ts) / 1000);
+  if (s < 0) return 'just now';
+  if (s < 60) return s + 's ago';
+  if (s < 3600) return Math.floor(s/60) + 'm ago';
+  if (s < 86400) return Math.floor(s/3600) + 'h ago';
+  return Math.floor(s/86400) + 'd ago';
+}
+
+// ─── API ─────────────────────────────────────────────────────────────────────
+async function api(path) {
+  const sep = path.includes('?') ? '&' : '?';
+  const res = await fetch(`${NODE}${path}${sep}shard=${SHARD}`);
+  if (!res.ok) throw new Error(`${res.status}`);
+  return res.json();
+}
+
+// ─── Polling ─────────────────────────────────────────────────────────────────
+let lastSyncRound = 0;
+let lastSyncSeq = 0;
+
+async function poll() {
+  try {
+    // Fetch all data in parallel
+    const [status, sync, zkStatus, anchorStatus] = await Promise.all([
+      api('/dag/status'),
+      api(`/dag/sync?after_round=${lastSyncRound}&after_seq=${lastSyncSeq}&limit=200`),
+      api('/proof/zk/status').catch(() => null),
+      api('/anchor/latest').catch(() => null),
+    ]);
+
+    if (!connected) {
+      connected = true;
+      document.getElementById('status-dot').classList.remove('offline');
+      document.getElementById('node-url').textContent = NODE.replace(/^https?:\/\//, '');
+    }
+
+    // Stats bar
+    document.getElementById('s-round').textContent = status.current_round;
+    document.getElementById('s-finalized').textContent = status.last_committed_round >= 0
+      ? status.last_committed_round : '--';
+    document.getElementById('s-events').textContent = status.finalized_seq;
+    document.getElementById('s-nodes').textContent = status.active_nodes;
+
+    // Update adaptive params panel
+    updateAdaptivePanel(status);
+
+    // Process DAG sync data
+    if (sync.vertices && sync.vertices.length > 0) {
+      for (const v of sync.vertices) {
+        dagData.vertices.push({
+          hash: v.hash,
+          author: v.author,
+          round: v.round,
+          refs: v.refs_json ? JSON.parse(v.refs_json) : [],
+          events: v.events_json ? JSON.parse(v.events_json) : [],
+          signature: v.signature,
+        });
+
+        // Add to event log
+        addEvent('vertex', `Round ${v.round}`, shortKey(v.author), nodeColor(v.author), null, v.round);
+      }
+
+      lastSyncRound = Math.max(lastSyncRound, ...sync.vertices.map(v => v.round));
+    }
+
+    if (sync.commits) {
+      for (const c of sync.commits) {
+        dagData.commits.add(c.anchor_hash);
+        addEvent('commit', `Round ${c.round} finalized`, shortKey(c.anchor_hash), null, null, c.round);
+      }
+    }
+
+    // Mark initial sync complete after first HTTP poll
+    if (!dagAnim.initialSyncDone) {
+      setTimeout(() => { dagAnim.initialSyncDone = true; }, 500);
+    }
+
+    // Process direct-apply events (single-node mode)
+    if (sync.recent_events && sync.recent_events.length > 0) {
+      for (const ev of sync.recent_events) {
+        const et = ev.type || 'unknown';
+        const badge = et.startsWith('contract.') ? 'contract' : et === 'craft' ? 'event' : 'event';
+        let detail = et;
+        try {
+          const p = typeof ev.payload === 'string' ? JSON.parse(ev.payload) : ev.payload;
+          if (et === 'place') detail = `place ${p.block_type || ''} at (${p.x},${p.z})`;
+          else if (et === 'break') detail = `break at (${p.x},${p.z})`;
+          else if (et === 'craft') detail = `craft ${p.recipe}`;
+          else if (et === 'contract.deploy') detail = 'deploy contract';
+          else if (et === 'contract.call') detail = `call ${p.method}`;
+        } catch {}
+        addEvent(badge, detail, shortKey(ev.pubkey), null);
+      }
+      lastSyncSeq = Math.max(lastSyncSeq, ...sync.recent_events.map(e => e.seq));
+    }
+
+    // ZK status
+    if (zkStatus) {
+      const active = zkStatus.active_lineage;
+      const lineages = zkStatus.lineages || [];
+      // Show active lineage chain length, fall back to overall
+      const chainLen = active ? active.chain_length : (zkStatus.max_chain_length || zkStatus.total_proofs || 0);
+      document.getElementById('s-zk').textContent = chainLen;
+
+      const latestProven = active ? active.last_block : (zkStatus.latest_proven_block || 0);
+      const lastCommitted = zkStatus.last_committed_round || 0;
+      const gap = active ? active.gap : (zkStatus.proof_gap || 0);
+      const pct = lastCommitted > 0 ? Math.min(100, (latestProven / lastCommitted) * 100) : 0;
+      document.getElementById('zk-fill').style.width = pct + '%';
+      document.getElementById('zk-proven').textContent = `R${latestProven} / R${lastCommitted}`;
+      document.getElementById('zk-gap').textContent = gap > 0 ? `gap: ${gap}` : 'caught up';
+
+      // Render lineages
+      const lineageEl = document.getElementById('zk-lineages');
+      if (lineages.length > 0) {
+        lineageEl.innerHTML = lineages.map((l, i) => {
+          const rootShort = (l.genesis_root || '').slice(0, 8);
+          const isActive = i === 0;
+          const color = isActive ? 'var(--green)' : 'var(--text-dim)';
+          const label = isActive ? 'active' : 'old';
+          const age = l.last_proof_at ? timeAgo(l.last_proof_at) : '';
+          return `<div style="display:flex;justify-content:space-between;margin-top:2px">
+            <span style="color:${color}">${label} · ${rootShort}…</span>
+            <span>R${l.first_block}→R${l.last_block} · ${l.chain_length} proofs${age ? ' · ' + age : ''}</span>
+          </div>`;
+        }).join('');
+      } else {
+        lineageEl.innerHTML = '';
+      }
+    }
+
+    // Finality levels — anchor response includes bundle with last_committed_round
+    updateFinality(status, zkStatus, anchorStatus && !anchorStatus.error ? anchorStatus : null);
+
+    // Update nodes panel
+    try {
+      const peers = await api('/admin/peers');
+      const allPeers = peers.peers || [];
+      renderNodes(allPeers);
+      // Count nodes with vertices in last 20 rounds (matches DAG chart filter)
+      const currentRound = status.current_round || 0;
+      const activePeers = allPeers.filter(p => p.last_vertex_round > currentRound - 20);
+      document.getElementById('s-nodes').textContent = activePeers.length;
+    } catch {}
+
+    // Render DAG
+    renderDAG();
+
+  } catch (err) {
+    if (connected) {
+      connected = false;
+      document.getElementById('status-dot').classList.add('offline');
+      document.getElementById('node-url').textContent = 'disconnected';
+    }
+  }
+}
+
+// ─── Event Log ───────────────────────────────────────────────────────────────
+function addEvent(type, detail, extra, color, serverTime, round) {
+  events.unshift({ type, detail, extra, color, time: serverTime || Date.now(), round: round || null });
+  if (events.length > 200) events.length = 200;
+  renderEvents();
+}
+
+function renderEvents() {
+  const list = document.getElementById('event-list');
+  const badgeClass = {
+    vertex: 'badge-vertex',
+    commit: 'badge-commit',
+    event: 'badge-event',
+    contract: 'badge-contract',
+    zk: 'badge-zk',
+  };
+
+  list.innerHTML = events.slice(0, 50).map(e => `
+    <li class="event-item" ${e.round ? `data-round="${e.round}"` : ''}>
+      <span class="event-time">${timeAgo(e.time)}</span>
+      <span class="event-badge ${badgeClass[e.type] || 'badge-event'}">${e.type}</span>
+      <span class="event-detail">${e.detail}${e.extra ? ` <span class="mono">${e.extra}</span>` : ''}</span>
+    </li>
+  `).join('');
+
+  // Hover handlers for DAG highlight
+  for (const li of list.querySelectorAll('li[data-round]')) {
+    li.addEventListener('mouseenter', () => {
+      highlightedRound = parseInt(li.dataset.round);
+      renderDAG();
+    });
+    li.addEventListener('mouseleave', () => {
+      highlightedRound = null;
+      renderDAG();
+    });
+  }
+
+  document.getElementById('event-count').textContent = events.length;
+}
+
+// ─── Node List ───────────────────────────────────────────────────────────────
+function renderNodes(nodes) {
+  const list = document.getElementById('node-list');
+  if (!nodes.length) {
+    list.innerHTML = '<div style="padding:16px;color:var(--text-dim);font-size:11px">No peers registered yet</div>';
+    return;
+  }
+  list.innerHTML = nodes.map(n => {
+    const c = nodeColor(n.pubkey);
+    return `
+      <div class="node-item" data-pubkey="${n.pubkey}" style="cursor:crosshair">
+        <div class="node-avatar" style="background:${c}20;color:${c}">${shortKey(n.pubkey).slice(0,2)}</div>
+        <div class="node-info">
+          <div class="node-pk">${shortKey(n.pubkey)}${n.is_self ? ' (self)' : ''}</div>
+          <div class="node-meta">${n.url || 'local'} &middot; seen ${timeAgo(n.last_seen)}</div>
+        </div>
+        <div class="node-round">R${n.last_vertex_round}</div>
+      </div>
+    `;
+  }).join('');
+  // Hover handlers for DAG row highlighting
+  list.querySelectorAll('.node-item[data-pubkey]').forEach(el => {
+    el.addEventListener('mouseenter', () => {
+      highlightedAuthor = el.dataset.pubkey;
+      el.style.background = 'rgba(108,92,231,0.1)';
+    });
+    el.addEventListener('mouseleave', () => {
+      highlightedAuthor = null;
+      el.style.background = '';
+    });
+  });
+}
+
+// ─── Finality Levels ──────────────────────────────────────────────────────────
+let finalityState = { l0: 0, l1: 0, l2: 0, l3: 0, l4: 0 };
+
+function updateFinality(status, zkStatus, anchorStatus) {
+  // L0: events accepted but awaiting vertex inclusion
+  const pending = status.pending_events || 0;
+  // L1: current round (DAG inclusion — events are in signed vertices)
+  const l1 = status.current_round || 0;
+  // L2: last committed round (BFT commit)
+  const l2 = status.last_committed_round >= 0 ? status.last_committed_round : 0;
+  // L3: latest ZK proven block
+  const l3 = zkStatus ? (zkStatus.latest_proven_block || 0) : finalityState.l3;
+  // L4: latest anchored block (from anchor bundle, even if not confirmed on-chain)
+  const l4 = anchorStatus ? (anchorStatus.bundle?.last_committed_round || 0) : finalityState.l4;
+
+  finalityState = { l0: pending, l1, l2, l3, l4 };
+
+  document.getElementById('fin-l0').textContent = pending > 0 ? `${pending} queued` : 'clear';
+  document.getElementById('fin-l1').textContent = l1 > 0 ? `R${l1}` : '--';
+  document.getElementById('fin-l2').textContent = l2 > 0 ? `R${l2}` : '--';
+  document.getElementById('fin-l3').textContent = l3 > 0 ? `R${l3}` : '--';
+  const l4Status = anchorStatus?.status;
+  if (l4 > 0 && l4Status === 'confirmed') {
+    document.getElementById('fin-l4').textContent = `R${l4}`;
+  } else if (l4 > 0) {
+    document.getElementById('fin-l4').textContent = `R${l4}`;
+    document.getElementById('fin-l4').style.opacity = '0.5';
+  } else {
+    document.getElementById('fin-l4').textContent = '--';
+    document.getElementById('fin-l4').style.opacity = '0.5';
+  }
+
+  // Stacked bar: each level as % of L1 (the frontier)
+  if (l1 > 0) {
+    const pct = (v) => Math.min(100, (v / l1) * 100).toFixed(1) + '%';
+    document.getElementById('fin-bar-l1').style.width = '100%';
+    document.getElementById('fin-bar-l2').style.width = pct(l2);
+    document.getElementById('fin-bar-l3').style.width = pct(l3);
+    document.getElementById('fin-bar-l4').style.width = pct(l4);
+  }
+}
+
+// ─── Adaptive Panel ──────────────────────────────────────────────────────────
+let prevIntervalMs = null;
+
+function updateAdaptivePanel(status) {
+  const adaptive = status.adaptive;
+  if (!adaptive) return;
+
+  const intervalMs = status.round_interval_ms || 60000;
+  const enabled = adaptive.enabled;
+  const proverLag = adaptive.prover_lag;
+  const emptyRounds = adaptive.consecutive_empty_rounds || 0;
+
+  // Status indicator
+  const statusEl = document.getElementById('adaptive-status');
+  if (enabled) {
+    statusEl.textContent = 'active';
+    statusEl.style.color = 'var(--green)';
+  } else {
+    statusEl.textContent = 'disabled';
+    statusEl.style.color = 'var(--text-dim)';
+  }
+
+  // Round interval with unit
+  const intervalEl = document.getElementById('ap-interval');
+  if (intervalMs >= 1000) {
+    intervalEl.textContent = (intervalMs / 1000).toFixed(1) + 's';
+  } else {
+    intervalEl.textContent = intervalMs + 'ms';
+  }
+
+  // Interval bar: position within 1s–180s bounds
+  const minMs = 1000, maxMs = 180000;
+  const intervalPct = Math.max(0, Math.min(100, ((intervalMs - minMs) / (maxMs - minMs)) * 100));
+  const intervalBar = document.getElementById('ap-interval-bar');
+  intervalBar.style.width = intervalPct.toFixed(1) + '%';
+  // Color: green when fast, yellow mid, red when slow
+  if (intervalPct < 33) {
+    intervalBar.style.background = 'var(--green)';
+  } else if (intervalPct < 66) {
+    intervalBar.style.background = 'var(--yellow)';
+  } else {
+    intervalBar.style.background = 'var(--red)';
+  }
+
+  // Max events
+  document.getElementById('ap-max-events').textContent = status.max_events_per_vertex || '--';
+
+  // Pending events as utilization proxy
+  const maxEv = status.max_events_per_vertex || 50;
+  const pending = status.pending_events || 0;
+  const utilPct = Math.min(100, (pending / maxEv) * 100);
+  document.getElementById('ap-util').textContent = utilPct.toFixed(0) + '% (' + pending + ' pending)';
+
+  const utilBar = document.getElementById('ap-util-bar');
+  utilBar.style.width = utilPct.toFixed(1) + '%';
+  if (utilPct < 50) {
+    utilBar.style.background = 'var(--green)';
+  } else if (utilPct < 80) {
+    utilBar.style.background = 'var(--yellow)';
+  } else {
+    utilBar.style.background = 'var(--red)';
+  }
+
+  // Prover lag
+  const lagEl = document.getElementById('ap-prover-lag');
+  if (proverLag === null || proverLag === undefined) {
+    lagEl.textContent = 'no proofs';
+    lagEl.style.color = 'var(--text-dim)';
+  } else if (proverLag <= 30) {
+    lagEl.textContent = proverLag + ' rounds';
+    lagEl.style.color = 'var(--green)';
+  } else if (proverLag <= 100) {
+    lagEl.textContent = proverLag + ' rounds (braking)';
+    lagEl.style.color = 'var(--yellow)';
+  } else {
+    lagEl.textContent = proverLag + ' rounds (max brake)';
+    lagEl.style.color = 'var(--red)';
+  }
+
+  // Empty rounds
+  const emptyEl = document.getElementById('ap-empty');
+  emptyEl.textContent = emptyRounds;
+  emptyEl.style.color = emptyRounds > 3 ? 'var(--yellow)' : 'var(--text-dim)';
+
+  // Trend arrow
+  const trendEl = document.getElementById('ap-trend');
+  if (prevIntervalMs !== null) {
+    const delta = intervalMs - prevIntervalMs;
+    if (Math.abs(delta) < 100) {
+      trendEl.textContent = '→ stable';
+      trendEl.style.color = 'var(--text-dim)';
+    } else if (delta < 0) {
+      trendEl.textContent = '↑ speeding up';
+      trendEl.style.color = 'var(--green)';
+    } else {
+      trendEl.textContent = '↓ slowing down';
+      trendEl.style.color = 'var(--yellow)';
+    }
+  }
+  prevIntervalMs = intervalMs;
+}
+
+// ─── DAG Canvas (Animated) ───────────────────────────────────────────────────
+const dagAnim = {
+  particles: [],       // flying particles along edges
+  pulses: [],          // expanding rings on new vertices
+  commitFlashes: [],   // flash effects on commits
+  knownHashes: new Set(),
+  knownCommits: new Set(),
+  time: 0,
+  running: false,
+  initialSyncDone: false, // suppress effects during initial bulk sync
+};
+
+function spawnPulse(x, y, color) {
+  dagAnim.pulses.push({ x, y, color, birth: dagAnim.time, radius: 0, alpha: 1 });
+}
+
+function spawnCommitFlash(x, y) {
+  dagAnim.commitFlashes.push({ x, y, birth: dagAnim.time, radius: 0, alpha: 1 });
+}
+
+function spawnEdgeParticle(x1, y1, x2, y2, color) {
+  dagAnim.particles.push({
+    x1, y1, x2, y2, color,
+    t: 0, speed: 0.008 + Math.random() * 0.006,
+  });
+}
+
+function renderDAG() {
+  // just flag a re-render; the animation loop handles drawing
+  if (!dagAnim.running) {
+    dagAnim.running = true;
+    requestAnimationFrame(dagAnimLoop);
+  }
+}
+
+function dagAnimLoop(ts) {
+  dagAnim.time = ts;
+  drawDAGFrame();
+  dagAnim.running = true;
+  requestAnimationFrame(dagAnimLoop);
+}
+
+function drawDAGFrame() {
+  const canvas = document.getElementById('dag-canvas');
+  const container = canvas.parentElement;
+  const dpr = window.devicePixelRatio || 1;
+  const cw = container.clientWidth;
+
+  const vertices = dagData.vertices;
+
+  // Pre-compute author count to determine needed canvas height
+  let neededH;
+  const ROW_H = 50;
+  const PAD_T = 40;
+  if (vertices.length === 0) {
+    neededH = container.clientHeight;
+  } else {
+    const rounds = [...new Set(vertices.map(v => v.round))].sort((a,b) => a-b);
+    const recentCutoff = rounds.length > 0 ? rounds[rounds.length - 1] - 20 : 0;
+    const recentAuthors = new Set(vertices.filter(v => v.round >= recentCutoff).map(v => v.author));
+    neededH = Math.max(container.clientHeight, PAD_T + recentAuthors.size * ROW_H + 20);
+  }
+  const ch = neededH;
+
+  if (canvas.width !== cw * dpr || canvas.height !== ch * dpr) {
+    canvas.width = cw * dpr;
+    canvas.height = ch * dpr;
+    canvas.style.width = cw + 'px';
+    canvas.style.height = ch + 'px';
+  }
+
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const W = cw, H = ch;
+
+  // Subtle dark clear with slight trail
+  ctx.fillStyle = 'rgba(13,17,23,0.92)';
+  ctx.fillRect(0, 0, W, H);
+
+  if (vertices.length === 0) {
+    ctx.fillStyle = '#7a7a8e';
+    ctx.font = '12px JetBrains Mono';
+    ctx.textAlign = 'center';
+    ctx.fillText('Waiting for DAG vertices...', W/2, H/2);
+    ctx.fillText('Vertices appear as rounds are produced', W/2, H/2 + 20);
+    return;
+  }
+
+  const rounds = [...new Set(vertices.map(v => v.round))].sort((a,b) => a-b);
+  // Only show authors active in the last 20 rounds (hide dead/inactive nodes)
+  const recentCutoff = rounds.length > 0 ? rounds[rounds.length - 1] - 20 : 0;
+  const recentAuthors = new Set(vertices.filter(v => v.round >= recentCutoff).map(v => v.author));
+  const authors = [...recentAuthors];
+
+  const COL_W = 60;
+  const PAD_L = 70;
+  const maxCols = Math.floor((W - PAD_L - 220) / COL_W); // 220 = legend width + padding
+  const visibleRounds = rounds.slice(-maxCols);
+  const minRound = visibleRounds[0] || 0;
+
+  document.getElementById('dag-info').textContent =
+    `rounds ${visibleRounds[0] || 0}–${visibleRounds[visibleRounds.length-1] || 0} | ${authors.length} nodes`;
+
+  // Build position map
+  const posMap = new Map();
+  for (const v of vertices) {
+    if (v.round < minRound) continue;
+    const col = v.round - minRound;
+    const row = authors.indexOf(v.author);
+    if (col < 0 || row < 0) continue;
+    const x = PAD_L + col * COL_W + COL_W/2;
+    const y = PAD_T + row * ROW_H + ROW_H/2;
+    posMap.set(v.hash, { x, y, v });
+
+    // Spawn effects only for vertices arriving after initial sync
+    if (!dagAnim.knownHashes.has(v.hash)) {
+      dagAnim.knownHashes.add(v.hash);
+      if (dagAnim.initialSyncDone) {
+        spawnPulse(x, y, nodeColor(v.author));
+        if (v.refs) {
+          for (const ref of v.refs) {
+            const rp = posMap.get(ref);
+            if (rp) spawnEdgeParticle(rp.x, rp.y, x, y, nodeColor(v.author));
+          }
+        }
+      }
+    }
+
+    // Commit flash only after initial sync
+    if (dagData.commits.has(v.hash) && !dagAnim.knownCommits.has(v.hash)) {
+      dagAnim.knownCommits.add(v.hash);
+      if (dagAnim.initialSyncDone) {
+        spawnCommitFlash(x, y);
+      }
+    }
+  }
+
+  // ─── Draw round column indicators ─────────────────────────────────────
+  const t = dagAnim.time * 0.001;
+  for (let i = 0; i < visibleRounds.length; i++) {
+    const x = PAD_L + i * COL_W + COL_W/2;
+    // Subtle column glow for even rounds (commit-eligible)
+    if (visibleRounds[i] % 2 === 0) {
+      const grad = ctx.createLinearGradient(x, PAD_T - 10, x, PAD_T + authors.length * ROW_H);
+      grad.addColorStop(0, 'rgba(0,210,160,0.03)');
+      grad.addColorStop(0.5, 'rgba(0,210,160,0.06)');
+      grad.addColorStop(1, 'rgba(0,210,160,0.02)');
+      ctx.fillStyle = grad;
+      ctx.fillRect(x - COL_W/2, PAD_T - 10, COL_W, authors.length * ROW_H + 20);
+    }
+  }
+
+  // ─── Hover highlight column ──────────────────────────────────────────
+  if (highlightedRound !== null) {
+    const hi = visibleRounds.indexOf(highlightedRound);
+    if (hi >= 0) {
+      const hx = PAD_L + hi * COL_W + COL_W/2;
+      const colH = authors.length * ROW_H + 20;
+      ctx.fillStyle = 'rgba(108,92,231,0.15)';
+      ctx.fillRect(hx - COL_W/2, PAD_T - 10, COL_W, colH);
+      // Bright border lines
+      ctx.strokeStyle = 'rgba(108,92,231,0.5)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(hx - COL_W/2, PAD_T - 10);
+      ctx.lineTo(hx - COL_W/2, PAD_T - 10 + colH);
+      ctx.moveTo(hx + COL_W/2, PAD_T - 10);
+      ctx.lineTo(hx + COL_W/2, PAD_T - 10 + colH);
+      ctx.stroke();
+    }
+  }
+
+  // ─── Hover highlight row (validator) ────────────────────────────────
+  if (highlightedAuthor !== null) {
+    const hi = authors.indexOf(highlightedAuthor);
+    if (hi >= 0) {
+      const hy = PAD_T + hi * ROW_H + ROW_H/2;
+      const rowW = visibleRounds.length * COL_W + 20;
+      ctx.fillStyle = 'rgba(108,92,231,0.12)';
+      ctx.fillRect(PAD_L - 10, hy - ROW_H/2, rowW, ROW_H);
+      ctx.strokeStyle = 'rgba(108,92,231,0.4)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(PAD_L - 10, hy - ROW_H/2);
+      ctx.lineTo(PAD_L - 10 + rowW, hy - ROW_H/2);
+      ctx.moveTo(PAD_L - 10, hy + ROW_H/2);
+      ctx.lineTo(PAD_L - 10 + rowW, hy + ROW_H/2);
+      ctx.stroke();
+    }
+  }
+
+  // ─── Round labels ─────────────────────────────────────────────────────
+  ctx.font = '10px JetBrains Mono';
+  ctx.textAlign = 'center';
+  for (let i = 0; i < visibleRounds.length; i++) {
+    const x = PAD_L + i * COL_W + COL_W/2;
+    const isHighlighted = visibleRounds[i] === highlightedRound;
+    ctx.fillStyle = isHighlighted ? '#e0e0e8'
+      : visibleRounds[i] % 2 === 0 ? 'rgba(0,210,160,0.5)' : '#4a4a5e';
+    ctx.font = isHighlighted ? 'bold 10px JetBrains Mono' : '10px JetBrains Mono';
+    ctx.fillText('R' + visibleRounds[i], x, 16);
+  }
+  ctx.font = '10px JetBrains Mono';
+
+  // ─── Author labels ────────────────────────────────────────────────────
+  ctx.textAlign = 'right';
+  for (let i = 0; i < authors.length; i++) {
+    const y = PAD_T + i * ROW_H + ROW_H/2;
+    const isAuthorHighlighted = authors[i] === highlightedAuthor;
+    ctx.fillStyle = isAuthorHighlighted ? '#e0e0e8' : nodeColor(authors[i]);
+    ctx.globalAlpha = isAuthorHighlighted ? 1 : 0.7;
+    ctx.font = isAuthorHighlighted ? 'bold 10px JetBrains Mono' : '10px JetBrains Mono';
+    ctx.fillText(shortKey(authors[i]), PAD_L - 8, y + 4);
+    ctx.globalAlpha = 1;
+  }
+  ctx.font = '10px JetBrains Mono';
+
+  // ─── Grid lines (subtle, animated dash) ───────────────────────────────
+  ctx.lineWidth = 1;
+  for (let i = 0; i < authors.length; i++) {
+    const y = PAD_T + i * ROW_H + ROW_H/2;
+    ctx.strokeStyle = 'rgba(42,42,58,0.25)';
+    ctx.setLineDash([4, 8]);
+    ctx.lineDashOffset = -t * 12;
+    ctx.beginPath();
+    ctx.moveTo(PAD_L, y);
+    ctx.lineTo(W - 10, y);
+    ctx.stroke();
+  }
+  ctx.setLineDash([]);
+  ctx.lineDashOffset = 0;
+
+  // ─── Edges with gradient ──────────────────────────────────────────────
+  for (const [hash, pos] of posMap) {
+    const v = pos.v;
+    if (!v.refs) continue;
+    for (const ref of v.refs) {
+      const refPos = posMap.get(ref);
+      if (!refPos) continue;
+      const isCommitEdge = dagData.commits.has(hash) || dagData.commits.has(ref);
+      const grad = ctx.createLinearGradient(refPos.x, refPos.y, pos.x, pos.y);
+      if (isCommitEdge) {
+        grad.addColorStop(0, 'rgba(0,210,160,0.1)');
+        grad.addColorStop(1, 'rgba(0,210,160,0.35)');
+      } else {
+        grad.addColorStop(0, 'rgba(108,92,231,0.08)');
+        grad.addColorStop(1, 'rgba(108,92,231,0.22)');
+      }
+      ctx.strokeStyle = grad;
+      ctx.lineWidth = isCommitEdge ? 1.5 : 1;
+      ctx.beginPath();
+      ctx.moveTo(refPos.x, refPos.y);
+      // Slight curve for visual interest
+      const mx = (refPos.x + pos.x) / 2;
+      const my = (refPos.y + pos.y) / 2 - 6;
+      ctx.quadraticCurveTo(mx, my, pos.x, pos.y);
+      ctx.stroke();
+    }
+  }
+
+  // ─── Edge particles ───────────────────────────────────────────────────
+  for (let i = dagAnim.particles.length - 1; i >= 0; i--) {
+    const p = dagAnim.particles[i];
+    p.t += p.speed;
+    if (p.t > 1) { dagAnim.particles.splice(i, 1); continue; }
+    const px = p.x1 + (p.x2 - p.x1) * p.t;
+    const py = p.y1 + (p.y2 - p.y1) * p.t - Math.sin(p.t * Math.PI) * 6;
+    const alpha = Math.sin(p.t * Math.PI);
+    ctx.globalAlpha = alpha * 0.9;
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(px, py, 2.5, 0, Math.PI * 2);
+    ctx.fill();
+    // Trail
+    ctx.globalAlpha = alpha * 0.3;
+    ctx.beginPath();
+    ctx.arc(px - (p.x2 - p.x1) * 0.02, py - (p.y2 - p.y1) * 0.02, 1.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  // ─── Vertices ─────────────────────────────────────────────────────────
+  for (const [hash, pos] of posMap) {
+    const v = pos.v;
+    const isCommitted = dagData.commits.has(hash);
+    const color = nodeColor(v.author);
+    const baseR = isCommitted ? 10 : 7;
+    // Subtle breathing on vertices
+    const breathe = 1 + Math.sin(dagAnim.time * 0.003 + pos.x * 0.1) * 0.08;
+    const r = baseR * breathe;
+
+    // Ambient glow
+    const glowR = r * 2.5;
+    const glow = ctx.createRadialGradient(pos.x, pos.y, r * 0.5, pos.x, pos.y, glowR);
+    if (isCommitted) {
+      glow.addColorStop(0, 'rgba(0,210,160,0.25)');
+      glow.addColorStop(1, 'rgba(0,210,160,0)');
+    } else {
+      const c = color;
+      glow.addColorStop(0, c + '20');
+      glow.addColorStop(1, c + '00');
+    }
+    ctx.fillStyle = glow;
+    ctx.fillRect(pos.x - glowR, pos.y - glowR, glowR * 2, glowR * 2);
+
+    // Main vertex shape
+    ctx.fillStyle = isCommitted ? '#00d2a0' : color;
+    ctx.beginPath();
+    if (isCommitted) {
+      // Diamond
+      ctx.moveTo(pos.x, pos.y - r);
+      ctx.lineTo(pos.x + r, pos.y);
+      ctx.lineTo(pos.x, pos.y + r);
+      ctx.lineTo(pos.x - r, pos.y);
+      ctx.closePath();
+    } else {
+      ctx.arc(pos.x, pos.y, r, 0, Math.PI * 2);
+    }
+    ctx.fill();
+
+    // Inner highlight
+    const hl = ctx.createRadialGradient(pos.x - r*0.3, pos.y - r*0.3, 0, pos.x, pos.y, r);
+    hl.addColorStop(0, 'rgba(255,255,255,0.2)');
+    hl.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = hl;
+    ctx.fill();
+
+    // Border
+    ctx.strokeStyle = isCommitted ? '#00d2a0' : color;
+    ctx.lineWidth = isCommitted ? 2 : 1;
+    ctx.stroke();
+
+    // Event count badge
+    const evCount = v.events ? v.events.length : 0;
+    if (evCount > 0) {
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 8px JetBrains Mono';
+      ctx.textAlign = 'center';
+      ctx.fillText(evCount, pos.x, pos.y + 3);
+    }
+  }
+
+  // ─── Pulse rings (new vertex arrival) ─────────────────────────────────
+  for (let i = dagAnim.pulses.length - 1; i >= 0; i--) {
+    const p = dagAnim.pulses[i];
+    const age = (dagAnim.time - p.birth) / 1000;
+    if (age > 1.2) { dagAnim.pulses.splice(i, 1); continue; }
+    const radius = 8 + age * 30;
+    const alpha = Math.max(0, 1 - age / 1.2);
+    ctx.strokeStyle = p.color;
+    ctx.globalAlpha = alpha * 0.6;
+    ctx.lineWidth = 2 - age * 1.2;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  // ─── Commit flash (expanding green ring + burst) ──────────────────────
+  for (let i = dagAnim.commitFlashes.length - 1; i >= 0; i--) {
+    const f = dagAnim.commitFlashes[i];
+    const age = (dagAnim.time - f.birth) / 1000;
+    if (age > 1.5) { dagAnim.commitFlashes.splice(i, 1); continue; }
+
+    // Expanding ring
+    const radius = 10 + age * 50;
+    const alpha = Math.max(0, 1 - age / 1.5);
+    ctx.strokeStyle = '#00d2a0';
+    ctx.globalAlpha = alpha * 0.5;
+    ctx.lineWidth = 3 - age * 1.5;
+    ctx.beginPath();
+    ctx.arc(f.x, f.y, radius, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // Second ring offset
+    if (age > 0.1) {
+      const r2 = 10 + (age - 0.1) * 40;
+      ctx.globalAlpha = alpha * 0.3;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(f.x, f.y, r2, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    ctx.globalAlpha = 1;
+  }
+
+  // ─── Legend (isolated canvas state to prevent ghosting) ─────────────────
+  ctx.save();
+  ctx.globalAlpha = 1;
+  ctx.setLineDash([]);
+  ctx.lineDashOffset = 0;
+
+  const lw = 200, lh = 148;
+  const legendX = W - lw - 6, legendY = H - lh - 6;
+
+  // Opaque background — clearRect then fill to fully eliminate trail artifacts
+  ctx.clearRect(legendX, legendY, lw, lh);
+  ctx.fillStyle = '#12121c';
+  ctx.fillRect(legendX, legendY, lw, lh);
+  ctx.strokeStyle = 'rgba(108,92,231,0.25)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.roundRect(legendX, legendY, lw, lh, 6);
+  ctx.stroke();
+
+  const lTextX = legendX + 28;
+  ctx.font = 'bold 9px JetBrains Mono';
+  ctx.fillStyle = '#8a8aaa';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('LEGEND', legendX + 10, legendY + 12);
+
+  let ly = legendY + 28;
+  const lSpacing = 17;
+  const labelStyle = () => { ctx.fillStyle = '#b0b0c8'; ctx.font = '8.5px JetBrains Mono'; ctx.textAlign = 'left'; };
+
+  // Pending vertex (circle)
+  ctx.fillStyle = '#6c5ce7';
+  ctx.beginPath();
+  ctx.arc(legendX + 16, ly, 5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 7px JetBrains Mono';
+  ctx.textAlign = 'center';
+  ctx.fillText('3', legendX + 16, ly);
+  labelStyle();
+  ctx.fillText('Pending vertex (events)', lTextX, ly);
+
+  ly += lSpacing;
+  // Committed vertex (diamond)
+  ctx.fillStyle = '#00d2a0';
+  ctx.beginPath();
+  ctx.moveTo(legendX + 16, ly - 5);
+  ctx.lineTo(legendX + 21, ly);
+  ctx.lineTo(legendX + 16, ly + 5);
+  ctx.lineTo(legendX + 11, ly);
+  ctx.closePath();
+  ctx.fill();
+  labelStyle();
+  ctx.fillText('Committed vertex', lTextX, ly);
+
+  ly += lSpacing;
+  // Edge reference
+  ctx.strokeStyle = 'rgba(108,92,231,0.5)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(legendX + 10, ly);
+  ctx.lineTo(legendX + 22, ly);
+  ctx.stroke();
+  labelStyle();
+  ctx.fillText('DAG reference (edge)', lTextX, ly);
+
+  ly += lSpacing;
+  // Commit edge
+  ctx.strokeStyle = 'rgba(0,210,160,0.6)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(legendX + 10, ly);
+  ctx.lineTo(legendX + 22, ly);
+  ctx.stroke();
+  labelStyle();
+  ctx.fillText('Commit edge', lTextX, ly);
+
+  ly += lSpacing;
+  // Even round column
+  ctx.fillStyle = 'rgba(0,210,160,0.15)';
+  ctx.fillRect(legendX + 10, ly - 6, 12, 12);
+  ctx.fillStyle = 'rgba(0,210,160,0.6)';
+  ctx.font = 'bold 7px JetBrains Mono';
+  ctx.textAlign = 'center';
+  ctx.fillText('R2', legendX + 16, ly);
+  labelStyle();
+  ctx.fillText('Even round (commit)', lTextX, ly);
+
+  ly += lSpacing;
+  // Validator color
+  ctx.fillStyle = '#ff6b6b';
+  ctx.beginPath();
+  ctx.arc(legendX + 13, ly, 3.5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#ffd93d';
+  ctx.beginPath();
+  ctx.arc(legendX + 20, ly, 3.5, 0, Math.PI * 2);
+  ctx.fill();
+  labelStyle();
+  ctx.fillText('Color = validator ID', lTextX, ly);
+
+  ly += lSpacing;
+  // Number inside vertex
+  ctx.fillStyle = '#555';
+  ctx.beginPath();
+  ctx.arc(legendX + 16, ly, 5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 7px JetBrains Mono';
+  ctx.textAlign = 'center';
+  ctx.fillText('N', legendX + 16, ly);
+  labelStyle();
+  ctx.fillText('N = event count', lTextX, ly);
+
+  ctx.restore();
+}
+
+// ─── WebSocket (live updates) ────────────────────────────────────────────────
+let dashWs = null;
+function connectWS() {
+  const wsUrl = NODE.replace(/^http/, 'ws') + '/?shard=' + SHARD;
+  let ws;
+  try {
+    ws = new WebSocket(wsUrl);
+  } catch { return; }
+  dashWs = ws;
+
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ type: 'join', pubkey: 'dashboard' }));
+    // Subscribe to all push channels — eliminates HTTP polling
+    ws.send(JSON.stringify({ type: 'subscribe', channels: ['dag', 'status', 'peers', 'zk'] }));
+    // Initial sync via WS instead of HTTP
+    ws.send(JSON.stringify({ type: 'sync', after_round: lastSyncRound, limit: 500 }));
+    ws.send(JSON.stringify({ type: 'status' }));
+  };
+
+  ws.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+
+      // Server-pushed status update (replaces polling /dag/status)
+      if (msg.type === 'status.update' || msg.type === 'status.result') {
+        if (!connected) {
+          connected = true;
+          document.getElementById('status-dot').classList.remove('offline');
+          document.getElementById('node-url').textContent = NODE.replace(/^https?:\/\//, '');
+        }
+        document.getElementById('s-round').textContent = msg.current_round;
+        document.getElementById('s-finalized').textContent = msg.last_committed_round >= 0
+          ? msg.last_committed_round : '--';
+        document.getElementById('s-events').textContent = msg.finalized_seq;
+        document.getElementById('s-nodes').textContent = msg.active_nodes;
+        updateFinality(msg, null, null);
+        updateAdaptivePanel(msg);
+        return;
+      }
+
+      // Server-pushed peer list (replaces polling /admin/peers)
+      if (msg.type === 'peers.update') {
+        renderNodes(msg.peers || []);
+        return;
+      }
+
+      // WS-based sync response (replaces polling /dag/sync)
+      if (msg.type === 'sync.result') {
+        if (msg.vertices && msg.vertices.length > 0) {
+          for (const v of msg.vertices) {
+            dagData.vertices.push({
+              hash: v.hash, author: v.author, round: v.round,
+              refs: v.refs_json ? JSON.parse(v.refs_json) : [],
+              events: v.events_json ? JSON.parse(v.events_json) : [],
+              signature: v.signature,
+            });
+            if (dagAnim.initialSyncDone) {
+              addEvent('vertex', `Round ${v.round}`, shortKey(v.author), nodeColor(v.author), v.received_at || v.timestamp, v.round);
+            }
+          }
+          lastSyncRound = Math.max(lastSyncRound, ...msg.vertices.map(v => v.round));
+        }
+        if (msg.commits) {
+          for (const c of msg.commits) {
+            dagData.commits.add(c.anchor_hash);
+            if (dagAnim.initialSyncDone) {
+              addEvent('commit', `Round ${c.round} finalized`, shortKey(c.anchor_hash), null, c.committed_at, c.round);
+            }
+          }
+        }
+        renderDAG();
+        // Seed event log with recent history on first sync (use server timestamps)
+        if (!dagAnim.initialSyncDone) {
+          const recentVertices = (msg.vertices || []).slice(-20);
+          const recentCommits = (msg.commits || []).slice(-10);
+          // Build combined list sorted by time, oldest first
+          const seed = [];
+          for (const v of recentVertices) {
+            seed.push({ type: 'vertex', detail: `Round ${v.round}`, extra: shortKey(v.author), color: nodeColor(v.author), time: v.received_at || v.timestamp || 0, round: v.round });
+          }
+          for (const c of recentCommits) {
+            seed.push({ type: 'commit', detail: `Round ${c.round} finalized`, extra: shortKey(c.anchor_hash), color: null, time: c.committed_at || 0, round: c.round });
+          }
+          seed.sort((a, b) => b.time - a.time); // newest first
+          events.push(...seed);
+          if (events.length > 200) events.length = 200;
+          renderEvents();
+        }
+        if (!dagAnim.initialSyncDone) {
+          setTimeout(() => { dagAnim.initialSyncDone = true; }, 500);
+        }
+        return;
+      }
+
+      // Live push events — use server timestamps so "time ago" reflects when events happened on-chain
+      if (msg.type === 'vertex.new') {
+        addEvent('vertex', `Round ${msg.round}`, shortKey(msg.author), nodeColor(msg.author), msg.timestamp, msg.round);
+      } else if (msg.type === 'commit') {
+        addEvent('commit', `Round ${msg.round} finalized`, '', null, msg.timestamp, msg.round);
+      } else if (msg.type === 'event.finalized' || msg.type === 'event.pending') {
+        const et = msg.event?.type || 'unknown';
+        const badge = et.startsWith('contract.') ? 'contract' : 'event';
+        addEvent(badge, et, shortKey(msg.event?.pubkey), null, msg.event?.timestamp, msg.round);
+      } else if (msg.type === 'zk.proof_submitted') {
+        addEvent('zk', `Block ${msg.block_number} proved`, '', null, msg.timestamp, msg.block_number);
+        // Auto-refresh verifier if tab is active
+        if (verifierAutoRan && document.getElementById('tab-verifier').classList.contains('active')) {
+          setTimeout(runVerification, 1000);
+        }
+      }
+    } catch {}
+  };
+
+  ws.onclose = () => {
+    dashWs = null;
+    connected = false;
+    document.getElementById('status-dot').classList.add('offline');
+    setTimeout(connectWS, 5000);
+  };
+}
+
+// ─── Init ────────────────────────────────────────────────────────────────────
+document.getElementById('status-dot').classList.add('offline');
+
+// Handle resize
+window.addEventListener('resize', () => renderDAG());
+
+// Start WS (primary) and polling as rare fallback for ZK status
+connectWS();
+poll();
+setInterval(poll, 60000); // Fallback only — most data arrives via WS push
+setInterval(renderEvents, 5000); // Keep event timestamps fresh
+</script>
+</body>
+</html>

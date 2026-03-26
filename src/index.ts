@@ -1,10 +1,18 @@
 import { PersistiaWorldV4 } from "./PersistiaDO";
-import DASHBOARD_HTML from "../client/dashboard.html";
-import GAME_HTML from "../client/game.html";
-import VERIFIER_HTML from "../client/verifier.html";
-import WALLET_HTML from "../client/wallet.html";
 import { APP_SDK_JS } from "./app-sdk";
 export { PersistiaWorldV4 };
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+interface Env {
+  PERSISTIA_WORLD: DurableObjectNamespace;
+  BLOB_STORE?: R2Bucket;
+  RELAY_QUEUE?: Queue;
+  ASSETS?: { fetch: (req: Request) => Promise<Response> };
+  [key: string]: any;
+}
+
+// ─── Constants ────────────────────────────────────────────────────────────────
 
 const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
@@ -12,15 +20,45 @@ const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
-const MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024; // 2MB — reject oversized payloads before they reach the DO
+const MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024; // 2MB
+
+// Cache TTLs for read-heavy endpoints (seconds)
+const CACHE_TTL_STATUS = 5;         // /dag/status — changes each round
+const CACHE_TTL_CHAIN = 30;         // /proof/zk/chain — changes per proof
+const CACHE_TTL_GOV_CONFIG = 30;    // /governance/config — changes rarely
+const CACHE_TTL_VALIDATOR = 15;     // /validator/list — changes on join/leave
+
+// Endpoints eligible for edge caching (GET only, matched by prefix)
+const CACHEABLE_ENDPOINTS: Record<string, number> = {
+  "/dag/status": CACHE_TTL_STATUS,
+  "/proof/zk/chain": CACHE_TTL_CHAIN,
+  "/proof/zk/status": CACHE_TTL_CHAIN,
+  "/governance/config": CACHE_TTL_GOV_CONFIG,
+  "/validator/list": CACHE_TTL_VALIDATOR,
+  "/network": CACHE_TTL_STATUS,
+};
+
+// Static HTML routes served from Workers Static Assets
+const STATIC_ROUTES: Record<string, string> = {
+  "/": "/game.html",
+  "/game": "/game.html",
+  "/game.html": "/game.html",
+  "/dashboard": "/dashboard.html",
+  "/dashboard.html": "/dashboard.html",
+  "/verifier": "/verifier.html",
+  "/verifier.html": "/verifier.html",
+  "/wallet": "/wallet.html",
+  "/wallet.html": "/wallet.html",
+};
+
+// ─── Worker ───────────────────────────────────────────────────────────────────
 
 export default {
-  async fetch(request: Request, env: any): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
 
-    // Reject oversized request bodies early (before forwarding to Durable Object)
     const contentLength = request.headers.get("Content-Length");
     if (contentLength && parseInt(contentLength) > MAX_REQUEST_BODY_BYTES) {
       return corsResponse(JSON.stringify({ error: "Request body too large (max 2MB)" }), 413);
@@ -28,52 +66,62 @@ export default {
 
     const url = new URL(request.url);
 
-    // ─── Cross-shard relay ──────────────────────────────────────────────
-    // POST /relay — Worker picks up outbox messages from source shard
-    // and delivers them to the target shard's /xshard/receive endpoint.
+    // ─── Static HTML via Workers Static Assets (CDN edge) ──────────────
+    const staticFile = STATIC_ROUTES[url.pathname];
+    if (staticFile && request.method === "GET") {
+      if (env.ASSETS) {
+        const assetReq = new Request(new URL(staticFile, url.origin), request);
+        const res = await env.ASSETS.fetch(assetReq);
+        const response = new Response(res.body, res);
+        response.headers.set("Cache-Control", "public, max-age=3600");
+        for (const [k, v] of Object.entries(CORS_HEADERS)) {
+          response.headers.set(k, v);
+        }
+        return response;
+      }
+      // Fallback: assets binding not available (dev mode or external nodes)
+      // Let it fall through to DO routing which won't match — return 404
+    }
+
+    // ─── Edge Cache for read-heavy GET endpoints ───────────────────────
+    if (request.method === "GET") {
+      const cacheTtl = CACHEABLE_ENDPOINTS[url.pathname];
+      if (cacheTtl) {
+        const cache = caches.default;
+        const cacheKey = new Request(url.toString(), request);
+        const cached = await cache.match(cacheKey);
+        if (cached) return cached;
+
+        // Fetch from DO, cache the response
+        const doResponse = await routeToDO(request, url, env);
+        if (doResponse.ok) {
+          const cacheable = new Response(doResponse.body, doResponse);
+          cacheable.headers.set("Cache-Control", `public, max-age=${cacheTtl}`);
+          for (const [k, v] of Object.entries(CORS_HEADERS)) {
+            cacheable.headers.set(k, v);
+          }
+          ctx.waitUntil(cache.put(cacheKey, cacheable.clone()));
+          return cacheable;
+        }
+        return doResponse;
+      }
+    }
+
+    // ─── Cross-shard relay via Queue ──────────────────────────────────
     if (url.pathname === "/relay" && request.method === "POST") {
       const { source_shard, target_shard } = await request.json() as any;
       if (!source_shard || !target_shard) {
         return corsResponse(JSON.stringify({ error: "source_shard and target_shard required" }), 400);
       }
 
-      // 1. Get pending outbox messages from source shard
-      const sourceId = env.PERSISTIA_WORLD.idFromName(source_shard);
-      const sourceStub = env.PERSISTIA_WORLD.get(sourceId);
-      const outboxRes = await sourceStub.fetch(new Request(`${url.origin}/xshard/outbox?status=pending`));
-      const outbox = await outboxRes.json() as any;
-
-      if (!outbox.messages || outbox.messages.length === 0) {
-        return corsResponse(JSON.stringify({ relayed: 0 }));
+      if (env.RELAY_QUEUE) {
+        // Async relay via Queue — non-blocking
+        await env.RELAY_QUEUE.send({ source_shard, target_shard });
+        return corsResponse(JSON.stringify({ queued: true, source_shard, target_shard }));
       }
 
-      // 2. Deliver each message to the target shard
-      let relayed = 0;
-      for (const row of outbox.messages) {
-        if (row.target_shard !== target_shard) continue;
-
-        const msg = typeof row.message_json === "string" ? JSON.parse(row.message_json) : row.message_json;
-        const targetId = env.PERSISTIA_WORLD.idFromName(target_shard);
-        const targetStub = env.PERSISTIA_WORLD.get(targetId);
-
-        const deliverRes = await targetStub.fetch(new Request(`${url.origin}/xshard/receive`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(msg),
-        }));
-        const receipt = await deliverRes.json() as any;
-
-        // 3. Acknowledge delivery on source shard
-        await sourceStub.fetch(new Request(`${url.origin}/xshard/ack`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message_id: row.id, status: receipt.status || "delivered" }),
-        }));
-
-        relayed++;
-      }
-
-      return corsResponse(JSON.stringify({ relayed }));
+      // Fallback: synchronous relay (Queue not configured)
+      return await synchronousRelay(url, env, source_shard, target_shard);
     }
 
     // ─── WebSocket upgrade — forward directly to DO ────────────────
@@ -86,34 +134,6 @@ export default {
       return stub.fetch(new Request(request.url, { method: request.method, headers, body: request.body }));
     }
 
-    // ─── Game UI ──────────────────────────────────────────────────────
-    if (url.pathname === "/" || url.pathname === "/game" || url.pathname === "/game.html") {
-      return new Response(GAME_HTML, {
-        headers: { "Content-Type": "text/html;charset=utf-8", ...CORS_HEADERS },
-      });
-    }
-
-    // ─── Dashboard ─────────────────────────────────────────────────────
-    if (url.pathname === "/dashboard" || url.pathname === "/dashboard.html") {
-      return new Response(DASHBOARD_HTML, {
-        headers: { "Content-Type": "text/html;charset=utf-8", ...CORS_HEADERS },
-      });
-    }
-
-    // ─── Verifier ─────────────────────────────────────────────────────
-    if (url.pathname === "/verifier" || url.pathname === "/verifier.html") {
-      return new Response(VERIFIER_HTML, {
-        headers: { "Content-Type": "text/html;charset=utf-8", ...CORS_HEADERS },
-      });
-    }
-
-    // ─── Wallet ──────────────────────────────────────────────────────
-    if (url.pathname === "/wallet" || url.pathname === "/wallet.html") {
-      return new Response(WALLET_HTML, {
-        headers: { "Content-Type": "text/html;charset=utf-8", ...CORS_HEADERS },
-      });
-    }
-
     // ─── List shards ────────────────────────────────────────────────────
     if (url.pathname === "/shards") {
       return corsResponse(JSON.stringify({
@@ -123,11 +143,6 @@ export default {
     }
 
     // ─── Join network ─────────────────────────────────────────────────
-    // POST /join — External node announces itself to all seed shards.
-    // Body: { "url": "https://my-node.example.workers.dev", "shard": "global-world",
-    //         "pubkey": "...", "pow_nonce": "...", "signature": "..." }
-    // The seed nodes add the joiner as a peer. If pubkey + pow_nonce are provided,
-    // also registers as a validator on each shard.
     if (url.pathname === "/join" && request.method === "POST") {
       const body = await request.json() as any;
       const joinerUrl = body.url;
@@ -136,13 +151,10 @@ export default {
         return corsResponse(JSON.stringify({ error: "url required (your node's public URL)" }), 400);
       }
 
-      // Determine the effective peer URL for this joiner
-      // External nodes use their root URL directly (no shard routing)
       const peerUrl = joinerShard === "global-world"
         ? joinerUrl
         : `${joinerUrl}/?shard=${joinerShard}`;
 
-      // Register joiner on all seed shards
       const shards = ["node-1", "node-2", "node-3"];
       const results: any[] = [];
       for (const seed of shards) {
@@ -150,7 +162,6 @@ export default {
           const seedId = env.PERSISTIA_WORLD.idFromName(seed);
           const seedStub = env.PERSISTIA_WORLD.get(seedId);
 
-          // Add as peer
           const addRes = await seedStub.fetch(new Request(`${url.origin}/addNode?shard=${seed}`, {
             method: "POST",
             headers: { "Content-Type": "application/json", "X-Shard-Name": seed },
@@ -159,7 +170,6 @@ export default {
           const r = await addRes.json() as any;
           const seedResult: any = { shard: seed, peer: r.ok ?? true };
 
-          // Register as validator if PoW provided
           if (body.pubkey && body.pow_nonce && body.signature) {
             try {
               const valRes = await seedStub.fetch(new Request(`${url.origin}/validator/register?shard=${seed}`, {
@@ -187,9 +197,7 @@ export default {
         }
       }
 
-      // Tell the joiner about the seed nodes (reverse peering)
       const seedUrls = shards.map(s => `${url.origin}/?shard=${s}`);
-
       return corsResponse(JSON.stringify({
         ok: true,
         message: body.pow_nonce
@@ -201,8 +209,6 @@ export default {
     }
 
     // ─── Network discovery ──────────────────────────────────────────────
-    // GET /network — public endpoint listing this node's identity + known peers
-    // Used by other nodes to discover and bootstrap into the network.
     if (url.pathname === "/network") {
       const shardName = url.searchParams.get("shard") || "global-world";
       const id = env.PERSISTIA_WORLD.idFromName(shardName);
@@ -233,13 +239,15 @@ export default {
     // ─── App SDK ──────────────────────────────────────────────────────
     if (url.pathname === "/app/sdk.js") {
       return new Response(APP_SDK_JS, {
-        headers: { "Content-Type": "application/javascript;charset=utf-8", "Cache-Control": "public, max-age=300", ...CORS_HEADERS },
+        headers: {
+          "Content-Type": "application/javascript;charset=utf-8",
+          "Cache-Control": "public, max-age=300",
+          ...CORS_HEADERS,
+        },
       });
     }
 
     // ─── On-Chain App Serving ────────────────────────────────────────
-    // Routes: /app/{contract_address}/...filepath
-    // Serves frontend files stored in contract state under _app/ prefix
     const appMatch = url.pathname.match(/^\/app\/([a-f0-9]{16,64})(\/.*)?$/);
     if (appMatch) {
       const contractAddress = appMatch[1];
@@ -248,7 +256,6 @@ export default {
       const appId = env.PERSISTIA_WORLD.idFromName(appShardName);
       const appStub = env.PERSISTIA_WORLD.get(appId);
 
-      // Proxy to DO's /app-serve endpoint
       const appHeaders = new Headers(request.headers);
       appHeaders.set("X-Shard-Name", appShardName);
       const appRes = await appStub.fetch(new Request(
@@ -279,28 +286,116 @@ export default {
     }
 
     // ─── Standard routing to shard DO ───────────────────────────────────
-    const shardName = url.searchParams.get("shard") || "global-world";
-    const id = env.PERSISTIA_WORLD.idFromName(shardName);
-    const stub = env.PERSISTIA_WORLD.get(id);
+    return routeToDO(request, url, env);
+  },
 
-    // Pass shard name as header so the DO knows its identity
-    const headers = new Headers(request.headers);
-    headers.set("X-Shard-Name", shardName);
-    const proxiedRequest = new Request(request.url, {
-      method: request.method,
-      headers,
-      body: request.body,
-    });
+  // ─── Queue Consumer (async cross-shard relay) ────────────────────────
+  async queue(batch: MessageBatch<{ source_shard: string; target_shard: string }>, env: Env): Promise<void> {
+    for (const msg of batch.messages) {
+      try {
+        const { source_shard, target_shard } = msg.body;
+        const origin = "https://persistia.workers.dev"; // internal origin for DO routing
 
-    const response = await stub.fetch(proxiedRequest);
+        const sourceId = env.PERSISTIA_WORLD.idFromName(source_shard);
+        const sourceStub = env.PERSISTIA_WORLD.get(sourceId);
+        const outboxRes = await sourceStub.fetch(new Request(`${origin}/xshard/outbox?status=pending`));
+        const outbox = await outboxRes.json() as any;
 
-    const newResponse = new Response(response.body, response);
-    for (const [k, v] of Object.entries(CORS_HEADERS)) {
-      newResponse.headers.set(k, v);
+        if (!outbox.messages || outbox.messages.length === 0) {
+          msg.ack();
+          continue;
+        }
+
+        for (const row of outbox.messages) {
+          if (row.target_shard !== target_shard) continue;
+
+          const msgBody = typeof row.message_json === "string" ? JSON.parse(row.message_json) : row.message_json;
+          const targetId = env.PERSISTIA_WORLD.idFromName(target_shard);
+          const targetStub = env.PERSISTIA_WORLD.get(targetId);
+
+          const deliverRes = await targetStub.fetch(new Request(`${origin}/xshard/receive`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(msgBody),
+          }));
+          const receipt = await deliverRes.json() as any;
+
+          await sourceStub.fetch(new Request(`${origin}/xshard/ack`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ message_id: row.id, status: receipt.status || "delivered" }),
+          }));
+        }
+
+        msg.ack();
+      } catch (e) {
+        console.error("Queue relay error:", e);
+        msg.retry();
+      }
     }
-    return newResponse;
   },
 };
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+async function routeToDO(request: Request, url: URL, env: Env): Promise<Response> {
+  const shardName = url.searchParams.get("shard") || "global-world";
+  const id = env.PERSISTIA_WORLD.idFromName(shardName);
+  const stub = env.PERSISTIA_WORLD.get(id);
+
+  const headers = new Headers(request.headers);
+  headers.set("X-Shard-Name", shardName);
+  const proxiedRequest = new Request(request.url, {
+    method: request.method,
+    headers,
+    body: request.body,
+  });
+
+  const response = await stub.fetch(proxiedRequest);
+
+  const newResponse = new Response(response.body, response);
+  for (const [k, v] of Object.entries(CORS_HEADERS)) {
+    newResponse.headers.set(k, v);
+  }
+  return newResponse;
+}
+
+async function synchronousRelay(url: URL, env: Env, source_shard: string, target_shard: string): Promise<Response> {
+  const sourceId = env.PERSISTIA_WORLD.idFromName(source_shard);
+  const sourceStub = env.PERSISTIA_WORLD.get(sourceId);
+  const outboxRes = await sourceStub.fetch(new Request(`${url.origin}/xshard/outbox?status=pending`));
+  const outbox = await outboxRes.json() as any;
+
+  if (!outbox.messages || outbox.messages.length === 0) {
+    return corsResponse(JSON.stringify({ relayed: 0 }));
+  }
+
+  let relayed = 0;
+  for (const row of outbox.messages) {
+    if (row.target_shard !== target_shard) continue;
+
+    const msg = typeof row.message_json === "string" ? JSON.parse(row.message_json) : row.message_json;
+    const targetId = env.PERSISTIA_WORLD.idFromName(target_shard);
+    const targetStub = env.PERSISTIA_WORLD.get(targetId);
+
+    const deliverRes = await targetStub.fetch(new Request(`${url.origin}/xshard/receive`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(msg),
+    }));
+    const receipt = await deliverRes.json() as any;
+
+    await sourceStub.fetch(new Request(`${url.origin}/xshard/ack`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message_id: row.id, status: receipt.status || "delivered" }),
+    }));
+
+    relayed++;
+  }
+
+  return corsResponse(JSON.stringify({ relayed }));
+}
 
 function corsResponse(body: string, status = 200): Response {
   return new Response(body, {

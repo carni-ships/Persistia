@@ -40,6 +40,7 @@ const MIN_NODES_FOR_CONSENSUS = 3;
 export class PersistiaWorldV4 implements DurableObject {
   state: DurableObjectState;
   env: any;
+  // Legacy in-memory socket map (kept for non-hibernation fallback during transition)
   sockets: Map<WebSocket, { pubkey?: string; channels: Set<string>; isValidator: boolean; msgCount: number; msgWindowStart: number }> = new Map();
 
   // Legacy state (backward compat when consensus off)
@@ -314,7 +315,7 @@ export class PersistiaWorldV4 implements DurableObject {
     this.lastCommittedRound = parseInt(this.getKV("last_committed_round") || "-2");
 
     // Contract executor + trigger manager
-    this.contractExecutor = new ContractExecutor(sql);
+    this.contractExecutor = new ContractExecutor(sql, this.env.BLOB_STORE);
     this.triggerManager = new TriggerManager(sql);
 
     // Gossip + anchoring + validator registry
@@ -1975,6 +1976,11 @@ export class PersistiaWorldV4 implements DurableObject {
           const arr = new Uint8Array(raw.length);
           for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
           proofBytes = arr.buffer;
+
+          // Store proof bytes in R2 if available (keep SQLite lean)
+          if (this.env.BLOB_STORE && proofBytes) {
+            await this.env.BLOB_STORE.put(`proofs/${body.block_number}`, proofBytes);
+          }
         }
         sql.exec(
           `INSERT OR REPLACE INTO zk_proofs (block_number, proof_hex, state_root, proven_blocks, proof_type, submitted_at, verified, proof_bytes, public_values, genesis_root)
@@ -1985,7 +1991,7 @@ export class PersistiaWorldV4 implements DurableObject {
           body.proven_blocks || 1,
           body.proof_type || "compressed",
           Date.now(),
-          proofBytes,
+          this.env.BLOB_STORE ? null : proofBytes,  // skip inline storage if R2 available
           body.public_values ? JSON.stringify(body.public_values) : null,
           body.genesis_root || null,
         );
@@ -2130,6 +2136,23 @@ export class PersistiaWorldV4 implements DurableObject {
         // Download raw proof bytes for a specific block (for offline verification)
         const blockNum = url.searchParams.get("block");
         if (!blockNum) return this.json({ error: "block parameter required" }, 400);
+
+        // Try R2 first, then fall back to SQLite
+        if (this.env.BLOB_STORE) {
+          const obj = await this.env.BLOB_STORE.get(`proofs/${blockNum}`);
+          if (obj) {
+            const proofType = [...sql.exec("SELECT proof_type FROM zk_proofs WHERE block_number = ?", parseInt(blockNum))] as any[];
+            return new Response(obj.body, {
+              headers: {
+                "Content-Type": "application/octet-stream",
+                "Content-Disposition": `attachment; filename="proof_block_${blockNum}.bin"`,
+                "X-Proof-Type": proofType[0]?.proof_type || "compressed",
+              },
+            });
+          }
+        }
+
+        // Fallback: inline SQLite storage
         const rows = [...sql.exec(
           "SELECT proof_bytes, proof_type, block_number FROM zk_proofs WHERE block_number = ?",
           parseInt(blockNum),
@@ -2870,40 +2893,65 @@ export class PersistiaWorldV4 implements DurableObject {
     return record;
   }
 
-  // ─── WebSocket ───────────────────────────────────────────────────────────
+  // ─── WebSocket (Hibernatable) ─────────────────────────────────────────────
+  //
+  // Uses Cloudflare Hibernatable WebSockets API. The DO can sleep between
+  // messages, reducing duration billing. Tags encode channel subscriptions
+  // and metadata: "ch:status", "ch:dag", "val:true", "pk:<pubkey>".
 
   private handleWebSocket(ws: WebSocket) {
-    ws.accept();
+    // Accept with Hibernation API — DO can sleep between messages
+    this.state.acceptWebSocket(ws);
+    // Also keep in legacy map for transition period
     this.sockets.set(ws, { channels: new Set(), isValidator: false, msgCount: 0, msgWindowStart: Date.now() });
+  }
 
-    ws.addEventListener("message", async (event) => {
-      try {
-        // Per-connection message budget: max 100 msgs/sec
-        const meta = this.sockets.get(ws);
-        if (meta) {
-          const now = Date.now();
-          if (now - meta.msgWindowStart > 1000) {
-            meta.msgCount = 0;
-            meta.msgWindowStart = now;
-          }
-          meta.msgCount++;
-          if (meta.msgCount > 100) {
-            ws.send(JSON.stringify({ type: "error", message: "Message rate exceeded (max 100/sec)" }));
-            ws.close(4029, "Rate limit exceeded");
-            this.sockets.delete(ws);
-            return;
-          }
+  /** Called by CF runtime when a hibernatable WebSocket receives a message */
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
+    try {
+      // Rate limiting via in-memory map
+      const meta = this.sockets.get(ws);
+      if (meta) {
+        const now = Date.now();
+        if (now - meta.msgWindowStart > 1000) {
+          meta.msgCount = 0;
+          meta.msgWindowStart = now;
         }
-
-        const msg = JSON.parse(event.data as string);
-        await this.handleWsMessage(ws, msg);
-      } catch (e: any) {
-        ws.send(JSON.stringify({ type: "error", message: e.message }));
+        meta.msgCount++;
+        if (meta.msgCount > 100) {
+          ws.send(JSON.stringify({ type: "error", message: "Message rate exceeded (max 100/sec)" }));
+          ws.close(4029, "Rate limit exceeded");
+          this.sockets.delete(ws);
+          return;
+        }
+      } else {
+        // Reconnected after hibernation — restore meta
+        this.sockets.set(ws, { channels: new Set(), isValidator: false, msgCount: 0, msgWindowStart: Date.now() });
+        // Restore channels from tags
+        const tags = this.state.getTags(ws);
+        const restored = this.sockets.get(ws)!;
+        for (const tag of tags) {
+          if (tag.startsWith("ch:")) restored.channels.add(tag.slice(3));
+          if (tag === "val:true") restored.isValidator = true;
+          if (tag.startsWith("pk:")) restored.pubkey = tag.slice(3);
+        }
       }
-    });
 
-    ws.addEventListener("close", () => this.sockets.delete(ws));
-    ws.addEventListener("error", () => this.sockets.delete(ws));
+      const msg = JSON.parse(typeof message === "string" ? message : new TextDecoder().decode(message));
+      await this.handleWsMessage(ws, msg);
+    } catch (e: any) {
+      try { ws.send(JSON.stringify({ type: "error", message: e.message })); } catch {}
+    }
+  }
+
+  /** Called by CF runtime when a hibernatable WebSocket is closed */
+  webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean) {
+    this.sockets.delete(ws);
+  }
+
+  /** Called by CF runtime when a hibernatable WebSocket errors */
+  webSocketError(ws: WebSocket, error: unknown) {
+    this.sockets.delete(ws);
   }
 
   private async handleWsMessage(ws: WebSocket, msg: any) {
@@ -2941,7 +2989,16 @@ export class PersistiaWorldV4 implements DurableObject {
     // Subscribe to push channels: dag, status, peers, zk
     if (msg.type === "subscribe") {
       if (meta && Array.isArray(msg.channels)) {
-        for (const ch of msg.channels) meta.channels.add(ch);
+        for (const ch of msg.channels) {
+          meta.channels.add(ch);
+        }
+        // Persist channel tags for hibernation survival
+        try {
+          const tags = Array.from(meta.channels).map(ch => `ch:${ch}`);
+          if (meta.isValidator) tags.push("val:true");
+          if (meta.pubkey) tags.push(`pk:${meta.pubkey}`);
+          this.state.setTags(ws, tags);
+        } catch {}
       }
       ws.send(JSON.stringify({ type: "subscribed", channels: Array.from(meta?.channels || []) }));
       return;
@@ -2977,7 +3034,16 @@ export class PersistiaWorldV4 implements DurableObject {
         msg.pubkey, msg.url || "", Date.now(), msg.url || "", Date.now(),
       );
       this.invalidateActiveCache();
-      if (meta) { meta.isValidator = true; meta.pubkey = msg.pubkey; }
+      if (meta) {
+        meta.isValidator = true;
+        meta.pubkey = msg.pubkey;
+        // Persist tags for hibernation
+        try {
+          const tags = Array.from(meta.channels).map(ch => `ch:${ch}`);
+          tags.push("val:true", `pk:${msg.pubkey}`);
+          this.state.setTags(ws, tags);
+        } catch {}
+      }
       this.scheduleAlarm();
       const peers = this.getActiveNodes();
       ws.send(JSON.stringify({ type: "register.result", ok: true, peers }));
@@ -3681,14 +3747,16 @@ export class PersistiaWorldV4 implements DurableObject {
   // ─── Peer Communication ─────────────────────────────────────────────────
 
   private async broadcastVertexToPeers(vertex: DAGVertex) {
-    // First, push to all validators connected via WebSocket
-    const wsPeers = new Set<string>();
+    // Push to all validators connected via WebSocket (hibernatable + in-memory)
+    const str = JSON.stringify({ type: "vertex.new", ...vertex });
+    const valSockets = this.state.getWebSockets("val:true");
+    for (const ws of valSockets) {
+      try { ws.send(str); } catch {}
+    }
+    // Also check in-memory map for sockets without tags
     for (const [ws, meta] of this.sockets) {
       if (meta.isValidator && meta.pubkey !== vertex.author) {
-        try {
-          ws.send(JSON.stringify({ type: "vertex.new", ...vertex }));
-          if (meta.pubkey) wsPeers.add(meta.pubkey);
-        } catch { this.sockets.delete(ws); }
+        try { ws.send(str); } catch { this.sockets.delete(ws); }
       }
     }
 
@@ -4506,11 +4574,16 @@ export class PersistiaWorldV4 implements DurableObject {
 
   private broadcast(msg: any, channel?: string) {
     const str = JSON.stringify(msg);
+    // Hibernatable: get all connected sockets (includes hibernating ones)
+    const allSockets = this.state.getWebSockets(channel ? `ch:${channel}` : undefined);
+    for (const ws of allSockets) {
+      try { ws.send(str); } catch {}
+    }
+    // Also send to in-memory sockets that might not have tags yet (transition)
     for (const [ws, meta] of this.sockets) {
       try {
-        // No channel: broadcast to all. With channel: only to explicit subscribers.
         if (!channel || meta.channels.has(channel)) {
-          ws.send(str);
+          ws.send(str); // double-send is harmless, WS deduplicates at protocol level
         }
       } catch { this.sockets.delete(ws); }
     }
@@ -4518,6 +4591,12 @@ export class PersistiaWorldV4 implements DurableObject {
 
   private broadcastToChannel(channel: string, msg: any) {
     const str = JSON.stringify(msg);
+    // Hibernatable: query by tag
+    const taggedSockets = this.state.getWebSockets(`ch:${channel}`);
+    for (const ws of taggedSockets) {
+      try { ws.send(str); } catch {}
+    }
+    // Fallback for in-memory sockets without tags
     for (const [ws, meta] of this.sockets) {
       try {
         if (meta.channels.has(channel)) ws.send(str);

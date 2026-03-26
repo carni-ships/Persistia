@@ -1,0 +1,715 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Persistia World</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0a0e14; overflow: hidden; font-family: 'Inter', -apple-system, system-ui, sans-serif; color: #c5cdd8; }
+canvas { display: block; }
+
+/* ─── Top Bar ─── */
+#topbar {
+  position: fixed; top: 0; left: 0; right: 0; height: 44px;
+  background: rgba(10,14,20,0.92); backdrop-filter: blur(12px);
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+  display: flex; align-items: center; padding: 0 16px; gap: 16px;
+  z-index: 100; font-size: 13px;
+}
+#topbar .logo { font-weight: 700; font-size: 15px; color: #fff; letter-spacing: -0.3px; }
+#topbar .logo span { color: #6c5ce7; }
+.stat { display: flex; align-items: center; gap: 5px; }
+.stat-label { color: #5a6270; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+.stat-val { color: #48bfe3; font-weight: 600; }
+.dot { width: 8px; height: 8px; border-radius: 50%; }
+.dot.on { background: #00d2a0; box-shadow: 0 0 6px #00d2a0; }
+.dot.off { background: #f85149; }
+
+/* ─── Sidebar ─── */
+#sidebar {
+  position: fixed; top: 44px; right: 0; bottom: 0; width: 300px;
+  background: rgba(10,14,20,0.94); backdrop-filter: blur(12px);
+  border-left: 1px solid rgba(255,255,255,0.06);
+  z-index: 90; display: flex; flex-direction: column;
+  overflow-y: auto;
+}
+.panel { padding: 14px 16px; border-bottom: 1px solid rgba(255,255,255,0.04); }
+.panel-title { font-size: 11px; text-transform: uppercase; letter-spacing: 0.8px; color: #5a6270; margin-bottom: 10px; font-weight: 600; }
+
+/* ─── Block Palette ─── */
+.palette { display: flex; gap: 6px; flex-wrap: wrap; }
+.pal-btn {
+  width: 44px; height: 44px; border-radius: 8px; cursor: pointer;
+  border: 2px solid transparent; transition: all 0.15s;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  font-size: 9px; color: rgba(255,255,255,0.7); gap: 2px;
+  position: relative;
+}
+.pal-btn .swatch { width: 24px; height: 24px; border-radius: 4px; }
+.pal-btn.active { border-color: #6c5ce7; background: rgba(108,92,231,0.15); }
+.pal-btn:hover { border-color: rgba(255,255,255,0.2); }
+.pal-btn .key {
+  position: absolute; top: 2px; right: 4px; font-size: 8px;
+  color: rgba(255,255,255,0.3); font-weight: 700;
+}
+
+/* ─── Inventory ─── */
+.inv-grid { display: flex; flex-wrap: wrap; gap: 6px; }
+.inv-item {
+  background: rgba(255,255,255,0.04); border-radius: 6px; padding: 6px 10px;
+  font-size: 12px; display: flex; align-items: center; gap: 6px;
+}
+.inv-item .inv-dot { width: 10px; height: 10px; border-radius: 2px; }
+.inv-item .inv-count { font-weight: 700; color: #fff; }
+
+/* ─── Craft Buttons ─── */
+.craft-grid { display: flex; flex-wrap: wrap; gap: 6px; }
+.craft-btn {
+  background: rgba(108,92,231,0.12); border: 1px solid rgba(108,92,231,0.3);
+  border-radius: 6px; padding: 8px 12px; cursor: pointer; font-family: inherit;
+  color: #c5cdd8; font-size: 12px; transition: all 0.15s;
+}
+.craft-btn:hover { background: rgba(108,92,231,0.25); border-color: #6c5ce7; }
+.craft-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+.craft-cost { font-size: 10px; color: #5a6270; margin-top: 2px; }
+
+/* ─── Activity Feed ─── */
+#activity {
+  flex: 1; overflow-y: auto; min-height: 0;
+}
+.feed-item {
+  padding: 6px 16px; font-size: 11px; display: flex; gap: 8px; align-items: baseline;
+  border-bottom: 1px solid rgba(255,255,255,0.02);
+  animation: fadeIn 0.3s;
+}
+@keyframes fadeIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; } }
+.feed-time { color: #3a4250; font-size: 10px; min-width: 50px; }
+.feed-badge {
+  font-size: 9px; font-weight: 700; text-transform: uppercase; padding: 1px 5px;
+  border-radius: 3px; letter-spacing: 0.3px;
+}
+.badge-place { background: rgba(0,210,160,0.15); color: #00d2a0; }
+.badge-break { background: rgba(248,81,73,0.15); color: #f85149; }
+.badge-craft { background: rgba(108,92,231,0.15); color: #6c5ce7; }
+.badge-join { background: rgba(72,191,227,0.15); color: #48bfe3; }
+.badge-consensus { background: rgba(210,153,34,0.15); color: #d29922; }
+.feed-text { color: #8b95a3; }
+.feed-actor { color: #48bfe3; }
+
+/* ─── Minimap ─── */
+#minimap-wrap {
+  position: fixed; bottom: 16px; left: 16px; z-index: 90;
+  background: rgba(10,14,20,0.85); border-radius: 10px; padding: 8px;
+  border: 1px solid rgba(255,255,255,0.06);
+}
+#minimap { border-radius: 6px; display: block; }
+
+/* ─── Coords ─── */
+#coords {
+  position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
+  background: rgba(10,14,20,0.8); border-radius: 8px; padding: 6px 14px;
+  font-size: 12px; color: #5a6270; z-index: 90; font-family: 'SF Mono', monospace;
+  border: 1px solid rgba(255,255,255,0.04);
+}
+#coords span { color: #c5cdd8; font-weight: 600; }
+
+/* ─── Toast ─── */
+.toast {
+  position: fixed; bottom: 60px; left: 50%; transform: translateX(-50%);
+  background: rgba(108,92,231,0.9); color: #fff; padding: 8px 18px;
+  border-radius: 8px; font-size: 13px; z-index: 200;
+  animation: toastIn 0.3s, toastOut 0.3s 2s forwards;
+  pointer-events: none;
+}
+@keyframes toastIn { from { opacity: 0; transform: translateX(-50%) translateY(10px); } }
+@keyframes toastOut { to { opacity: 0; transform: translateX(-50%) translateY(-10px); } }
+
+/* ─── Canvas area ─── */
+#world {
+  position: fixed; top: 44px; left: 0; right: 300px; bottom: 0;
+  cursor: crosshair;
+}
+#world canvas { width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+
+<div id="topbar">
+  <div class="logo"><span>P</span>ersistia</div>
+  <div class="stat"><div class="dot off" id="conn-dot"></div><span id="conn-text" style="color:#5a6270">connecting</span></div>
+  <div class="stat"><span class="stat-label">Round</span><span class="stat-val" id="s-round">0</span></div>
+  <div class="stat"><span class="stat-label">Seq</span><span class="stat-val" id="s-seq">0</span></div>
+  <div class="stat"><span class="stat-label">Nodes</span><span class="stat-val" id="s-nodes">0</span></div>
+  <div class="stat"><span class="stat-label">Blocks</span><span class="stat-val" id="s-blocks">0</span></div>
+  <div style="margin-left:auto;display:flex;gap:8px">
+    <a href="/dashboard" style="color:#6c5ce7;text-decoration:none;font-size:11px;padding:4px 12px;border:1px solid rgba(108,92,231,0.4);border-radius:6px;transition:all 0.15s" onmouseover="this.style.background='rgba(108,92,231,0.15)'" onmouseout="this.style.background='transparent'">Dashboard</a>
+    <a href="/verifier" style="color:#00d2a0;text-decoration:none;font-size:11px;padding:4px 12px;border:1px solid rgba(0,210,160,0.4);border-radius:6px;transition:all 0.15s" onmouseover="this.style.background='rgba(0,210,160,0.15)'" onmouseout="this.style.background='transparent'">Verifier</a>
+    <a href="/wallet" style="color:#d29922;text-decoration:none;font-size:11px;padding:4px 12px;border:1px solid rgba(210,153,34,0.4);border-radius:6px;transition:all 0.15s" onmouseover="this.style.background='rgba(210,153,34,0.15)'" onmouseout="this.style.background='transparent'">Wallet</a>
+  </div>
+  <div class="stat">
+    <span class="stat-label">ID</span><span class="stat-val" id="s-id" style="font-family:monospace;font-size:11px">-</span>
+  </div>
+</div>
+
+<div id="world"><canvas id="c"></canvas></div>
+
+<div id="sidebar">
+  <div class="panel">
+    <div class="panel-title">Blocks</div>
+    <div class="palette" id="palette"></div>
+  </div>
+  <div class="panel">
+    <div class="panel-title">Inventory</div>
+    <div class="inv-grid" id="inv-grid"></div>
+  </div>
+  <div class="panel">
+    <div class="panel-title">Craft</div>
+    <div class="craft-grid" id="craft-grid"></div>
+  </div>
+  <div class="panel" style="flex:1;min-height:0;display:flex;flex-direction:column;padding-bottom:0">
+    <div class="panel-title">Live Activity</div>
+    <div id="activity"></div>
+  </div>
+</div>
+
+<div id="minimap-wrap"><canvas id="minimap" width="160" height="160"></canvas></div>
+<div id="coords">(<span id="cx">0</span>, <span id="cz">0</span>)</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════════════════
+// PERSISTIA GAME CLIENT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const NODE = location.origin;
+
+const BLOCKS = {
+  1: { name: 'dirt',  color: '#8B6914', dark: '#6B4F0E', light: '#A67D1A' },
+  2: { name: 'stone', color: '#808080', dark: '#606060', light: '#999999' },
+  3: { name: 'wood',  color: '#654321', dark: '#4A3018', light: '#7D5A36' },
+  4: { name: 'grass', color: '#228B22', dark: '#1A6B1A', light: '#2EA82E' },
+};
+
+const RECIPES = {
+  house:  { cost: { dirt: 5, wood: 5 }, label: 'House', icon: '\u2302' },
+  wall:   { cost: { stone: 3 },         label: 'Wall',  icon: '\u2588' },
+  bridge: { cost: { wood: 8 },          label: 'Bridge', icon: '\u2550' },
+};
+
+// ─── State ───────────────────────────────────────────────────────────────────
+
+const world = new Map();   // "x,z" → blockType
+let inventory = {};
+let ledgerSeq = 0;
+let consensusRound = 0;
+let activeNodes = 0;
+
+let camX = 0, camZ = 0;       // camera center (world coords)
+let cursorX = 0, cursorZ = 0; // cursor grid position
+let selectedBlock = 1;
+let dragging = false;
+let dragStartX = 0, dragStartZ = 0, dragCamX = 0, dragCamZ = 0;
+let ws = null;
+let pubkeyB64 = '';
+let privateKey = null;
+let feed = [];
+const CELL = 28;
+const playerColors = {};
+const COLOR_POOL = ['#6c5ce7','#00d2a0','#48bfe3','#f85149','#d29922','#ff6b81','#a29bfe','#ffeaa7','#55efc4','#fd79a8'];
+let colorIdx = 0;
+
+// ─── Crypto ──────────────────────────────────────────────────────────────────
+
+function b64(bytes) { return btoa(String.fromCharCode(...bytes)); }
+function unb64(s) { const b = atob(s); const a = new Uint8Array(b.length); for(let i=0;i<b.length;i++) a[i]=b.charCodeAt(i); return a; }
+
+async function initKeys() {
+  const stored = localStorage.getItem('persistia_keys');
+  if (stored) {
+    const { pub, priv } = JSON.parse(stored);
+    privateKey = await crypto.subtle.importKey('pkcs8', unb64(priv), 'Ed25519', true, ['sign']);
+    pubkeyB64 = pub;
+  } else {
+    const kp = await crypto.subtle.generateKey('Ed25519', true, ['sign','verify']);
+    const pubRaw = await crypto.subtle.exportKey('raw', kp.publicKey);
+    const privPkcs8 = await crypto.subtle.exportKey('pkcs8', kp.privateKey);
+    pubkeyB64 = b64(new Uint8Array(pubRaw));
+    privateKey = kp.privateKey;
+    localStorage.setItem('persistia_keys', JSON.stringify({ pub: pubkeyB64, priv: b64(new Uint8Array(privPkcs8)) }));
+  }
+  document.getElementById('s-id').textContent = pubkeyB64.slice(0, 12) + '...';
+}
+
+async function sign(data) {
+  const enc = new TextEncoder().encode(JSON.stringify(data));
+  const sig = await crypto.subtle.sign('Ed25519', privateKey, enc);
+  return b64(new Uint8Array(sig));
+}
+
+// ─── Networking ──────────────────────────────────────────────────────────────
+
+function connect() {
+  const wsUrl = NODE.replace(/^http/, 'ws');
+  ws = new WebSocket(wsUrl);
+
+  ws.onopen = () => {
+    document.getElementById('conn-dot').className = 'dot on';
+    document.getElementById('conn-text').textContent = 'connected';
+    document.getElementById('conn-text').style.color = '#00d2a0';
+    ws.send(JSON.stringify({ type: 'join', pubkey: pubkeyB64 }));
+    ws.send(JSON.stringify({ type: 'subscribe', channels: ['status'] }));
+  };
+
+  ws.onmessage = (e) => {
+    try { handleMsg(JSON.parse(e.data)); } catch {}
+  };
+
+  ws.onclose = () => {
+    document.getElementById('conn-dot').className = 'dot off';
+    document.getElementById('conn-text').textContent = 'reconnecting';
+    document.getElementById('conn-text').style.color = '#d29922';
+    setTimeout(connect, 2000);
+  };
+}
+
+function handleMsg(msg) {
+  switch (msg.type) {
+    case 'state':
+      world.clear();
+      for (const b of msg.blocks) world.set(`${b.x},${b.z}`, b.block_type);
+      inventory = msg.inventory || {};
+      ledgerSeq = msg.seq || 0;
+      if (msg.consensus) {
+        consensusRound = msg.consensus.round || 0;
+        activeNodes = msg.consensus.active_nodes || 0;
+      }
+      addFeed('join', 'Connected to world', null);
+      updateAll();
+      break;
+
+    case 'event': case 'pending': case 'event.finalized':
+      applyEvent(msg.event);
+      break;
+
+    case 'finalized':
+      ledgerSeq = msg.event?.consensus_seq || ledgerSeq;
+      updateStats();
+      break;
+
+    case 'commit':
+      ledgerSeq = msg.finalized_seq || ledgerSeq;
+      consensusRound = msg.round || consensusRound;
+      addFeed('consensus', `Round ${msg.round} committed`, null);
+      updateStats();
+      break;
+
+    case 'status.update': case 'status.result':
+      consensusRound = msg.current_round || 0;
+      activeNodes = msg.active_nodes || 0;
+      ledgerSeq = msg.finalized_seq || ledgerSeq;
+      updateStats();
+      break;
+
+    case 'result':
+      if (!msg.ok) toast('Rejected: ' + msg.error);
+      break;
+  }
+}
+
+function applyEvent(ev) {
+  if (!ev) return;
+  ledgerSeq = ev.seq || ledgerSeq;
+  const p = ev.payload;
+  const actor = shortKey(ev.pubkey);
+
+  switch (ev.type) {
+    case 'place':
+      world.set(`${p.x},${p.z}`, p.block);
+      if (ev.pubkey === pubkeyB64) {
+        const item = BLOCKS[p.block]?.name;
+        if (item) inventory[item] = (inventory[item] || 0) - 1;
+      }
+      addFeed('place', `${BLOCKS[p.block]?.name || '?'} at (${p.x},${p.z})`, actor, ev.pubkey);
+      break;
+
+    case 'break': {
+      const key = `${p.x},${p.z}`;
+      const bt = world.get(key);
+      world.delete(key);
+      if (ev.pubkey === pubkeyB64 && bt) {
+        const item = BLOCKS[bt]?.name;
+        if (item) inventory[item] = (inventory[item] || 0) + 1;
+      }
+      addFeed('break', `block at (${p.x},${p.z})`, actor, ev.pubkey);
+      break;
+    }
+
+    case 'craft':
+      if (ev.pubkey === pubkeyB64) refreshInventory();
+      addFeed('craft', p.recipe, actor, ev.pubkey);
+      break;
+  }
+  updateAll();
+}
+
+async function submitAction(type, payload) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const timestamp = Date.now();
+  const signature = await sign({ type, payload, timestamp });
+  ws.send(JSON.stringify({
+    type: 'submit',
+    event: { type, payload, pubkey: pubkeyB64, signature, timestamp },
+  }));
+}
+
+async function refreshInventory() {
+  try {
+    const res = await fetch(`${NODE}/inventory?pubkey=${encodeURIComponent(pubkeyB64)}`);
+    const data = await res.json();
+    inventory = data.inventory || {};
+    updateInv();
+  } catch {}
+}
+
+// ─── Feed ────────────────────────────────────────────────────────────────────
+
+function addFeed(type, detail, actor, pubkey) {
+  feed.unshift({ type, detail, actor, pubkey, time: Date.now() });
+  if (feed.length > 100) feed.length = 100;
+  renderFeed();
+}
+
+function renderFeed() {
+  const el = document.getElementById('activity');
+  const html = feed.slice(0, 50).map(f => {
+    const t = new Date(f.time);
+    const ts = t.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    const badgeCls = f.type === 'place' ? 'badge-place' : f.type === 'break' ? 'badge-break'
+      : f.type === 'craft' ? 'badge-craft' : f.type === 'consensus' ? 'badge-consensus' : 'badge-join';
+    const actorHtml = f.actor ? `<span class="feed-actor" style="color:${getPlayerColor(f.pubkey)}">${f.actor}</span>` : '';
+    return `<div class="feed-item">
+      <span class="feed-time">${ts}</span>
+      <span class="feed-badge ${badgeCls}">${f.type}</span>
+      ${actorHtml}
+      <span class="feed-text">${f.detail}</span>
+    </div>`;
+  }).join('');
+  el.innerHTML = html;
+}
+
+function shortKey(k) { return k ? k.slice(0, 8) + '..' : ''; }
+
+function getPlayerColor(pubkey) {
+  if (!pubkey) return '#5a6270';
+  if (!playerColors[pubkey]) {
+    playerColors[pubkey] = COLOR_POOL[colorIdx % COLOR_POOL.length];
+    colorIdx++;
+  }
+  return playerColors[pubkey];
+}
+
+// ─── UI Updates ──────────────────────────────────────────────────────────────
+
+function updateAll() {
+  updateStats();
+  updateInv();
+  updateCrafts();
+}
+
+function updateStats() {
+  document.getElementById('s-round').textContent = consensusRound;
+  document.getElementById('s-seq').textContent = ledgerSeq;
+  document.getElementById('s-nodes').textContent = activeNodes;
+  document.getElementById('s-blocks').textContent = world.size;
+}
+
+function updateInv() {
+  const el = document.getElementById('inv-grid');
+  const items = Object.entries(inventory).filter(([,v]) => v > 0);
+  if (items.length === 0) { el.innerHTML = '<span style="color:#3a4250;font-size:12px">Empty</span>'; return; }
+  el.innerHTML = items.map(([name, count]) => {
+    const bt = Object.values(BLOCKS).find(b => b.name === name);
+    const col = bt ? bt.color : '#5a6270';
+    return `<div class="inv-item"><div class="inv-dot" style="background:${col}"></div>${name}<span class="inv-count">${count}</span></div>`;
+  }).join('');
+  updateCrafts();
+}
+
+function updateCrafts() {
+  const el = document.getElementById('craft-grid');
+  el.innerHTML = Object.entries(RECIPES).map(([key, r]) => {
+    const canAfford = Object.entries(r.cost).every(([item, need]) => (inventory[item] || 0) >= need);
+    const costStr = Object.entries(r.cost).map(([i,n]) => `${n} ${i}`).join(', ');
+    return `<button class="craft-btn" ${canAfford ? '' : 'disabled'} onclick="doCraft('${key}')">
+      ${r.icon} ${r.label}<div class="craft-cost">${costStr}</div>
+    </button>`;
+  }).join('');
+}
+
+function toast(msg) {
+  const t = document.createElement('div');
+  t.className = 'toast';
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 2500);
+}
+
+// ─── Palette ─────────────────────────────────────────────────────────────────
+
+function buildPalette() {
+  const el = document.getElementById('palette');
+  el.innerHTML = Object.entries(BLOCKS).map(([id, b]) =>
+    `<div class="pal-btn ${+id === selectedBlock ? 'active' : ''}" data-block="${id}" onclick="selectBlock(${id})">
+      <span class="key">${id}</span>
+      <div class="swatch" style="background:${b.color}"></div>
+      ${b.name}
+    </div>`
+  ).join('');
+}
+
+function selectBlock(n) {
+  selectedBlock = n;
+  document.querySelectorAll('.pal-btn').forEach(b => b.classList.toggle('active', +b.dataset.block === n));
+}
+
+function doCraft(recipe) { submitAction('craft', { recipe }); }
+
+// ─── Canvas Rendering ────────────────────────────────────────────────────────
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const mmCanvas = document.getElementById('minimap');
+const mmCtx = mmCanvas.getContext('2d');
+
+function resize() {
+  const wrap = document.getElementById('world');
+  canvas.width = wrap.clientWidth;
+  canvas.height = wrap.clientHeight;
+}
+window.addEventListener('resize', resize);
+
+function render() {
+  const w = canvas.width, h = canvas.height;
+  ctx.fillStyle = '#0a0e14';
+  ctx.fillRect(0, 0, w, h);
+
+  const offX = Math.floor(w / 2) - camX * CELL;
+  const offZ = Math.floor(h / 2) - camZ * CELL;
+
+  // Visible range
+  const sx = Math.floor(-offX / CELL) - 1;
+  const sz = Math.floor(-offZ / CELL) - 1;
+  const ex = sx + Math.ceil(w / CELL) + 2;
+  const ez = sz + Math.ceil(h / CELL) + 2;
+
+  // Grid
+  ctx.strokeStyle = 'rgba(255,255,255,0.025)';
+  ctx.lineWidth = 1;
+  for (let x = sx; x <= ex; x++) {
+    const px = x * CELL + offX;
+    ctx.beginPath(); ctx.moveTo(px, 0); ctx.lineTo(px, h); ctx.stroke();
+  }
+  for (let z = sz; z <= ez; z++) {
+    const pz = z * CELL + offZ;
+    ctx.beginPath(); ctx.moveTo(0, pz); ctx.lineTo(w, pz); ctx.stroke();
+  }
+
+  // Origin crosshair
+  ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+  ctx.lineWidth = 1;
+  const ox = offX, oz = offZ;
+  ctx.beginPath(); ctx.moveTo(ox, 0); ctx.lineTo(ox, h); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0, oz); ctx.lineTo(w, oz); ctx.stroke();
+
+  // Blocks — isometric-ish 3D cubes
+  for (const [key, bt] of world) {
+    const [bx, bz] = key.split(',').map(Number);
+    if (bx < sx - 1 || bx > ex + 1 || bz < sz - 1 || bz > ez + 1) continue;
+    const px = bx * CELL + offX;
+    const pz = bz * CELL + offZ;
+    const b = BLOCKS[bt];
+    if (!b) continue;
+
+    // Top face
+    ctx.fillStyle = b.light;
+    ctx.fillRect(px + 1, pz + 1, CELL - 2, CELL - 6);
+    // Front face
+    ctx.fillStyle = b.color;
+    ctx.fillRect(px + 1, pz + CELL - 5, CELL - 2, 4);
+    // Right shadow
+    ctx.fillStyle = b.dark;
+    ctx.fillRect(px + CELL - 4, pz + 1, 3, CELL - 2);
+
+    // Subtle border
+    ctx.strokeStyle = 'rgba(0,0,0,0.3)';
+    ctx.lineWidth = 0.5;
+    ctx.strokeRect(px + 0.5, pz + 0.5, CELL - 1, CELL - 1);
+  }
+
+  // Cursor highlight
+  const cpx = cursorX * CELL + offX;
+  const cpz = cursorZ * CELL + offZ;
+
+  // Ghost block preview
+  const selB = BLOCKS[selectedBlock];
+  if (selB && !world.has(`${cursorX},${cursorZ}`)) {
+    ctx.globalAlpha = 0.25;
+    ctx.fillStyle = selB.color;
+    ctx.fillRect(cpx + 1, cpz + 1, CELL - 2, CELL - 2);
+    ctx.globalAlpha = 1;
+  }
+
+  // Cursor ring
+  ctx.strokeStyle = 'rgba(108,92,231,0.7)';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(cpx, cpz, CELL, CELL);
+
+  // Coordinate text at cursor
+  ctx.fillStyle = 'rgba(108,92,231,0.5)';
+  ctx.font = '9px monospace';
+  ctx.fillText(`${cursorX},${cursorZ}`, cpx + 2, cpz - 3);
+
+  requestAnimationFrame(render);
+}
+
+// ─── Minimap ─────────────────────────────────────────────────────────────────
+
+function renderMinimap() {
+  const mw = 160, mh = 160;
+  mmCtx.fillStyle = '#0d1117';
+  mmCtx.fillRect(0, 0, mw, mh);
+
+  if (world.size === 0) return;
+
+  // Find bounds
+  let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+  for (const key of world.keys()) {
+    const [x, z] = key.split(',').map(Number);
+    minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+    minZ = Math.min(minZ, z); maxZ = Math.max(maxZ, z);
+  }
+
+  const rangeX = maxX - minX + 1;
+  const rangeZ = maxZ - minZ + 1;
+  const scale = Math.min((mw - 8) / rangeX, (mh - 8) / rangeZ, 4);
+  const ofsX = (mw - rangeX * scale) / 2;
+  const ofsZ = (mh - rangeZ * scale) / 2;
+
+  for (const [key, bt] of world) {
+    const [x, z] = key.split(',').map(Number);
+    const b = BLOCKS[bt];
+    if (!b) continue;
+    mmCtx.fillStyle = b.color;
+    mmCtx.fillRect(
+      ofsX + (x - minX) * scale,
+      ofsZ + (z - minZ) * scale,
+      Math.max(scale - 0.5, 1), Math.max(scale - 0.5, 1)
+    );
+  }
+
+  // Camera viewport indicator
+  const vw = canvas.width / CELL;
+  const vh = canvas.height / CELL;
+  mmCtx.strokeStyle = 'rgba(108,92,231,0.6)';
+  mmCtx.lineWidth = 1.5;
+  mmCtx.strokeRect(
+    ofsX + (camX - vw/2 - minX) * scale,
+    ofsZ + (camZ - vh/2 - minZ) * scale,
+    vw * scale, vh * scale
+  );
+}
+
+setInterval(renderMinimap, 500);
+
+// ─── Controls ────────────────────────────────────────────────────────────────
+
+document.addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+  switch (e.key) {
+    case '1': selectBlock(1); break;
+    case '2': selectBlock(2); break;
+    case '3': selectBlock(3); break;
+    case '4': selectBlock(4); break;
+  }
+});
+
+const worldEl = document.getElementById('world');
+
+worldEl.addEventListener('mousedown', (e) => {
+  if (e.button === 1 || (e.button === 0 && e.shiftKey)) {
+    // Middle click or shift+click: start panning
+    dragging = true;
+    dragStartX = e.clientX;
+    dragStartZ = e.clientY;
+    dragCamX = camX;
+    dragCamZ = camZ;
+    e.preventDefault();
+  }
+});
+
+worldEl.addEventListener('mousemove', (e) => {
+  if (dragging) {
+    camX = dragCamX - (e.clientX - dragStartX) / CELL;
+    camZ = dragCamZ - (e.clientY - dragStartZ) / CELL;
+    return;
+  }
+
+  const rect = canvas.getBoundingClientRect();
+  const offX = Math.floor(canvas.width / 2) - camX * CELL;
+  const offZ = Math.floor(canvas.height / 2) - camZ * CELL;
+  cursorX = Math.floor((e.clientX - rect.left - offX) / CELL);
+  cursorZ = Math.floor((e.clientY - rect.top - offZ) / CELL);
+  document.getElementById('cx').textContent = cursorX;
+  document.getElementById('cz').textContent = cursorZ;
+});
+
+document.addEventListener('mouseup', () => { dragging = false; });
+
+worldEl.addEventListener('click', (e) => {
+  if (e.shiftKey) return; // was panning
+  submitAction('place', { x: cursorX, z: cursorZ, block: selectedBlock, block_type: BLOCKS[selectedBlock]?.name });
+});
+
+worldEl.addEventListener('contextmenu', (e) => {
+  e.preventDefault();
+  submitAction('break', { x: cursorX, z: cursorZ });
+});
+
+worldEl.addEventListener('wheel', (e) => {
+  // Pan with scroll
+  camX += e.deltaX / CELL;
+  camZ += e.deltaY / CELL;
+  e.preventDefault();
+}, { passive: false });
+
+// ─── Polling for consensus stats ─────────────────────────────────────────────
+
+async function pollStatus() {
+  try {
+    const res = await fetch(`${NODE}/dag/status`);
+    const s = await res.json();
+    consensusRound = s.current_round || 0;
+    activeNodes = s.active_nodes || 0;
+    ledgerSeq = s.finalized_seq || ledgerSeq;
+    updateStats();
+  } catch {}
+}
+setInterval(pollStatus, 60000); // Rare fallback — status comes via WS push
+
+// ─── Boot ────────────────────────────────────────────────────────────────────
+
+async function boot() {
+  resize();
+  buildPalette();
+  await initKeys();
+  // Seed inventory via HTTP in case this is a new player
+  try { await fetch(`${NODE}/seed`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ pubkey: pubkeyB64 }) }); } catch {}
+  connect();
+  render();
+  pollStatus();
+}
+
+boot().catch(console.error);
+</script>
+</body>
+</html>

@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Persistia Wallet</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    background: #0d1117;
+    color: #c9d1d9;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 2rem;
+  }
+  h1 { color: #58a6ff; margin-bottom: 0.5rem; font-size: 1.5rem; }
+  .subtitle { color: #8b949e; font-size: 0.85rem; margin-bottom: 2rem; }
+  .card {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    padding: 1.5rem;
+    width: 100%;
+    max-width: 600px;
+    margin-bottom: 1rem;
+  }
+  .card h2 {
+    font-size: 0.9rem;
+    color: #8b949e;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 1rem;
+    border-bottom: 1px solid #21262d;
+    padding-bottom: 0.5rem;
+  }
+  .field { margin-bottom: 0.75rem; }
+  .field label {
+    display: block;
+    font-size: 0.75rem;
+    color: #8b949e;
+    margin-bottom: 0.25rem;
+  }
+  .field .value {
+    font-size: 0.85rem;
+    color: #f0f6fc;
+    word-break: break-all;
+    background: #0d1117;
+    padding: 0.5rem;
+    border-radius: 4px;
+    border: 1px solid #21262d;
+    cursor: pointer;
+    position: relative;
+  }
+  .field .value:hover::after {
+    content: 'click to copy';
+    position: absolute;
+    right: 0.5rem;
+    top: 50%;
+    transform: translateY(-50%);
+    font-size: 0.65rem;
+    color: #58a6ff;
+  }
+  .balance-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.5rem 0;
+    border-bottom: 1px solid #21262d;
+  }
+  .balance-row:last-child { border-bottom: none; }
+  .balance-denom { color: #8b949e; font-size: 0.8rem; }
+  .balance-amount { color: #3fb950; font-size: 1.1rem; font-weight: bold; }
+  .balance-empty { color: #484f58; font-style: italic; font-size: 0.85rem; padding: 0.5rem 0; }
+  input, select {
+    width: 100%;
+    background: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 4px;
+    color: #c9d1d9;
+    padding: 0.5rem;
+    font-family: inherit;
+    font-size: 0.85rem;
+    margin-bottom: 0.5rem;
+  }
+  input:focus, select:focus {
+    outline: none;
+    border-color: #58a6ff;
+  }
+  button {
+    background: #238636;
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 0.6rem 1.2rem;
+    font-family: inherit;
+    font-size: 0.85rem;
+    cursor: pointer;
+    transition: background 0.2s;
+  }
+  button:hover { background: #2ea043; }
+  button:disabled { background: #21262d; color: #484f58; cursor: not-allowed; }
+  button.secondary {
+    background: #21262d;
+    border: 1px solid #30363d;
+  }
+  button.secondary:hover { background: #30363d; }
+  .btn-row { display: flex; gap: 0.5rem; margin-top: 0.5rem; }
+  .status-msg {
+    font-size: 0.8rem;
+    padding: 0.5rem;
+    border-radius: 4px;
+    margin-top: 0.5rem;
+    display: none;
+  }
+  .status-msg.success { display: block; background: #0d2818; color: #3fb950; border: 1px solid #238636; }
+  .status-msg.error { display: block; background: #2d1117; color: #f85149; border: 1px solid #da3633; }
+  .node-selector {
+    display: flex;
+    gap: 0.5rem;
+    margin-bottom: 1rem;
+    width: 100%;
+    max-width: 600px;
+  }
+  .node-selector input { margin-bottom: 0; flex: 1; }
+  .key-warning {
+    background: #2d1f00;
+    border: 1px solid #d29922;
+    color: #d29922;
+    font-size: 0.75rem;
+    padding: 0.5rem;
+    border-radius: 4px;
+    margin-top: 0.5rem;
+  }
+  .tx-history { max-height: 200px; overflow-y: auto; }
+  .tx-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 0.4rem 0;
+    border-bottom: 1px solid #21262d;
+    font-size: 0.8rem;
+  }
+  .tx-sent { color: #f85149; }
+  .tx-received { color: #3fb950; }
+</style>
+</head>
+<body>
+
+<nav style="position:fixed;top:0;left:0;right:0;display:flex;align-items:center;gap:12px;padding:10px 20px;background:rgba(13,17,23,0.95);border-bottom:1px solid rgba(255,255,255,0.06);z-index:100;backdrop-filter:blur(12px)">
+  <span style="font-weight:700;color:#58a6ff;font-size:14px">Persistia</span>
+  <span style="color:#d29922;font-size:12px;border:1px solid rgba(210,153,34,0.4);padding:2px 8px;border-radius:4px">Wallet</span>
+  <div style="margin-left:auto;display:flex;gap:8px">
+    <a href="/game" style="color:#6c5ce7;text-decoration:none;font-size:12px;padding:4px 12px;border:1px solid rgba(108,92,231,0.4);border-radius:6px;transition:all 0.15s" onmouseover="this.style.background='rgba(108,92,231,0.15)'" onmouseout="this.style.background='transparent'">Game World</a>
+    <a href="/dashboard" style="color:#6c5ce7;text-decoration:none;font-size:12px;padding:4px 12px;border:1px solid rgba(108,92,231,0.4);border-radius:6px;transition:all 0.15s" onmouseover="this.style.background='rgba(108,92,231,0.15)'" onmouseout="this.style.background='transparent'">Dashboard</a>
+    <a href="/verifier" style="color:#00d2a0;text-decoration:none;font-size:12px;padding:4px 12px;border:1px solid rgba(0,210,160,0.4);border-radius:6px;transition:all 0.15s" onmouseover="this.style.background='rgba(0,210,160,0.15)'" onmouseout="this.style.background='transparent'">Verifier</a>
+  </div>
+</nav>
+<div style="height:48px"></div>
+
+<h1>Persistia Wallet</h1>
+<p class="subtitle">Ed25519 key management + Bech32 addresses</p>
+
+<div class="node-selector">
+  <input type="text" id="nodeUrl" value="https://persistia.carnation-903.workers.dev/?shard=node-1" placeholder="Node URL">
+  <button class="secondary" onclick="connectNode()">Connect</button>
+</div>
+
+<!-- Identity Card -->
+<div class="card" id="identity-card">
+  <h2>Identity</h2>
+  <div class="field">
+    <label>Address</label>
+    <div class="value" id="address" onclick="copyField(this)">—</div>
+  </div>
+  <div class="field">
+    <label>Public Key (Ed25519, base64)</label>
+    <div class="value" id="pubkey" onclick="copyField(this)">—</div>
+  </div>
+  <div class="field">
+    <label>Key Type</label>
+    <div class="value" id="keyType">ed25519</div>
+  </div>
+  <div class="field">
+    <label>Nonce</label>
+    <div class="value" id="nonce">0</div>
+  </div>
+  <div class="btn-row">
+    <button class="secondary" onclick="exportKeys()">Export Keys</button>
+    <button class="secondary" onclick="importKeys()">Import Keys</button>
+    <button class="secondary" onclick="newWallet()">New Wallet</button>
+  </div>
+  <div class="key-warning">Keys are stored in localStorage. Export and back up your private key — losing it means losing access to your account.</div>
+</div>
+
+<!-- Balances Card -->
+<div class="card">
+  <h2>Balances</h2>
+  <div id="balances">
+    <div class="balance-empty">No balances yet. Use the faucet to get started.</div>
+  </div>
+  <div class="btn-row" style="margin-top: 1rem;">
+    <button class="secondary" onclick="requestFaucet()">Faucet (1000 PERSIST)</button>
+    <button class="secondary" onclick="refreshBalances()">Refresh</button>
+  </div>
+  <div class="status-msg" id="faucet-status"></div>
+</div>
+
+<!-- Transfer Card -->
+<div class="card">
+  <h2>Send Tokens</h2>
+  <div class="field">
+    <label>Recipient Address</label>
+    <input type="text" id="sendTo" placeholder="persistia1...">
+  </div>
+  <div class="field">
+    <label>Amount</label>
+    <input type="number" id="sendAmount" placeholder="100" min="1">
+  </div>
+  <div class="field">
+    <label>Denom</label>
+    <input type="text" id="sendDenom" value="PERSIST">
+  </div>
+  <button onclick="sendTransfer()" id="sendBtn">Sign & Send</button>
+  <div class="status-msg" id="send-status"></div>
+</div>
+
+<!-- Transaction History -->
+<div class="card">
+  <h2>Recent Transactions</h2>
+  <div class="tx-history" id="txHistory">
+    <div class="balance-empty">No transactions yet.</div>
+  </div>
+</div>
+
+<script>
+// ─── Bech32 (client-side, for address derivation) ─────────────────────────
+const CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+const GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+function polymod(v){let c=1;for(const x of v){const b=c>>25;c=((c&0x1ffffff)<<5)^x;for(let i=0;i<5;i++)if((b>>i)&1)c^=GEN[i]}return c}
+function hrpExpand(h){const r=[];for(let i=0;i<h.length;i++)r.push(h.charCodeAt(i)>>5);r.push(0);for(let i=0;i<h.length;i++)r.push(h.charCodeAt(i)&31);return r}
+function checksum(h,d){const v=[...hrpExpand(h),...d,0,0,0,0,0,0];const p=polymod(v)^1;const r=[];for(let i=0;i<6;i++)r.push((p>>(5*(5-i)))&31);return r}
+function bech32Encode(h,d){return h+"1"+[...d,...checksum(h,d)].map(x=>CHARSET[x]).join("")}
+function convertBits(data,from,to,pad){let a=0,b=0;const r=[],m=(1<<to)-1;for(const v of data){a=(a<<from)|v;b+=from;while(b>=to){b-=to;r.push((a>>b)&m)}}if(pad&&b>0)r.push((a<<(to-b))&m);return r}
+
+// ─── Key Management ───────────────────────────────────────────────────────
+let keyPair = null;
+let pubkeyB64 = "";
+let walletAddress = "";
+let nodeBase = "";
+
+function b64ToBytes(b){const s=atob(b);const a=new Uint8Array(s.length);for(let i=0;i<s.length;i++)a[i]=s.charCodeAt(i);return a}
+function bytesToB64(b){return btoa(String.fromCharCode(...b))}
+
+async function deriveAddress(pubBytes) {
+  const hash = await crypto.subtle.digest("SHA-256", pubBytes);
+  const trunc = new Uint8Array(hash).slice(0, 20);
+  const words = convertBits(trunc, 8, 5, true);
+  return bech32Encode("persistia", words);
+}
+
+async function loadOrCreateKeys() {
+  const stored = localStorage.getItem("persistia_wallet_keys");
+  if (stored) {
+    try {
+      const { pub, priv } = JSON.parse(stored);
+      const pubBytes = b64ToBytes(pub);
+      const privBytes = b64ToBytes(priv);
+      keyPair = {
+        publicKey: await crypto.subtle.importKey("raw", pubBytes, "Ed25519", true, ["verify"]),
+        privateKey: await crypto.subtle.importKey("pkcs8", privBytes, "Ed25519", true, ["sign"]),
+      };
+      pubkeyB64 = pub;
+      walletAddress = await deriveAddress(pubBytes);
+    } catch (e) {
+      console.warn("Stored keys invalid, regenerating:", e);
+      localStorage.removeItem("persistia_wallet_keys");
+      return loadOrCreateKeys();
+    }
+  } else {
+    keyPair = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]);
+    const pubRaw = await crypto.subtle.exportKey("raw", keyPair.publicKey);
+    const privPkcs8 = await crypto.subtle.exportKey("pkcs8", keyPair.privateKey);
+    pubkeyB64 = bytesToB64(new Uint8Array(pubRaw));
+    localStorage.setItem("persistia_wallet_keys", JSON.stringify({
+      pub: pubkeyB64,
+      priv: bytesToB64(new Uint8Array(privPkcs8)),
+    }));
+    walletAddress = await deriveAddress(new Uint8Array(pubRaw));
+  }
+  updateIdentityUI();
+}
+
+function updateIdentityUI() {
+  document.getElementById("address").textContent = walletAddress;
+  document.getElementById("pubkey").textContent = pubkeyB64;
+  document.getElementById("keyType").textContent = "ed25519";
+}
+
+async function newWallet() {
+  if (!confirm("This will generate a new keypair. Your current keys will be lost unless exported. Continue?")) return;
+  localStorage.removeItem("persistia_wallet_keys");
+  await loadOrCreateKeys();
+  showStatus("faucet-status", "New wallet created", "success");
+  refreshBalances();
+}
+
+function exportKeys() {
+  const stored = localStorage.getItem("persistia_wallet_keys");
+  if (!stored) { alert("No keys to export"); return; }
+  const blob = new Blob([stored], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `persistia-wallet-${walletAddress.slice(0, 16)}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+async function importKeys() {
+  const input = document.createElement("input");
+  input.type = "file";
+  input.accept = ".json";
+  input.onchange = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const text = await file.text();
+    try {
+      const { pub, priv } = JSON.parse(text);
+      if (!pub || !priv) throw new Error("Invalid key file");
+      localStorage.setItem("persistia_wallet_keys", text);
+      await loadOrCreateKeys();
+      showStatus("faucet-status", "Keys imported successfully", "success");
+      refreshBalances();
+    } catch (err) {
+      alert("Invalid key file: " + err.message);
+    }
+  };
+  input.click();
+}
+
+// ─── Signing ──────────────────────────────────────────────────────────────
+async function sign(data) {
+  const encoded = new TextEncoder().encode(JSON.stringify(data));
+  const sig = await crypto.subtle.sign("Ed25519", keyPair.privateKey, encoded);
+  return bytesToB64(new Uint8Array(sig));
+}
+
+// ─── Node Communication ──────────────────────────────────────────────────
+function buildUrl(path) {
+  try {
+    const u = new URL(nodeBase);
+    const existing = u.pathname.replace(/\/$/, "");
+    u.pathname = existing + path;
+    return u.toString();
+  } catch {
+    return nodeBase + path;
+  }
+}
+
+async function connectNode() {
+  const urlInput = document.getElementById("nodeUrl");
+  nodeBase = urlInput.value || localStorage.getItem("persistia_wallet_node") || "";
+  if (!nodeBase) { alert("Enter a node URL"); return; }
+  localStorage.setItem("persistia_wallet_node", nodeBase);
+  refreshBalances();
+}
+
+async function refreshBalances() {
+  if (!nodeBase || !pubkeyB64) return;
+  try {
+    const res = await fetch(buildUrl("/wallet/info") + (buildUrl("/wallet/info").includes("?") ? "&" : "?") + "pubkey=" + encodeURIComponent(pubkeyB64));
+    const data = await res.json();
+    if (data.account) {
+      document.getElementById("nonce").textContent = data.account.nonce;
+      renderBalances(data.balances || []);
+    } else {
+      renderBalances([]);
+    }
+  } catch (e) {
+    console.error("Failed to fetch wallet info:", e);
+  }
+}
+
+function renderBalances(balances) {
+  const el = document.getElementById("balances");
+  if (!balances || balances.length === 0) {
+    el.innerHTML = '<div class="balance-empty">No balances yet. Use the faucet to get started.</div>';
+    return;
+  }
+  el.innerHTML = balances.map(b => `
+    <div class="balance-row">
+      <span class="balance-denom">${b.denom}</span>
+      <span class="balance-amount">${BigInt(b.amount).toLocaleString()}</span>
+    </div>
+  `).join("");
+}
+
+async function requestFaucet() {
+  if (!nodeBase) { alert("Connect to a node first"); return; }
+  try {
+    const res = await fetch(buildUrl("/wallet/faucet"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pubkey: pubkeyB64, denom: "PERSIST", amount: 1000 }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      showStatus("faucet-status", `Received 1000 PERSIST at ${data.address}`, "success");
+      refreshBalances();
+    } else {
+      showStatus("faucet-status", data.error || "Faucet failed", "error");
+    }
+  } catch (e) {
+    showStatus("faucet-status", "Network error: " + e.message, "error");
+  }
+}
+
+async function sendTransfer() {
+  if (!nodeBase || !keyPair) { alert("Connect to a node and create a wallet first"); return; }
+  const to = document.getElementById("sendTo").value.trim();
+  const amount = document.getElementById("sendAmount").value;
+  const denom = document.getElementById("sendDenom").value || "PERSIST";
+  if (!to || !amount) { showStatus("send-status", "Fill in recipient and amount", "error"); return; }
+
+  const payload = { to, amount: amount.toString(), denom };
+  const timestamp = Date.now();
+  const dataToSign = { type: "token.transfer", payload, timestamp };
+  const signature = await sign(dataToSign);
+
+  try {
+    const res = await fetch(buildUrl("/event"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        type: "token.transfer",
+        payload,
+        pubkey: pubkeyB64,
+        signature,
+        timestamp,
+      }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      showStatus("send-status", `Sent ${amount} ${denom} to ${to.slice(0, 20)}...`, "success");
+      addTxToHistory({ to, amount, denom, type: "sent" });
+      refreshBalances();
+      document.getElementById("sendTo").value = "";
+      document.getElementById("sendAmount").value = "";
+    } else {
+      showStatus("send-status", data.error || "Transfer failed", "error");
+    }
+  } catch (e) {
+    showStatus("send-status", "Network error: " + e.message, "error");
+  }
+}
+
+function addTxToHistory(tx) {
+  const el = document.getElementById("txHistory");
+  if (el.querySelector(".balance-empty")) el.innerHTML = "";
+  const cls = tx.type === "sent" ? "tx-sent" : "tx-received";
+  const sign = tx.type === "sent" ? "-" : "+";
+  const addr = tx.type === "sent" ? tx.to : tx.from;
+  el.innerHTML = `<div class="tx-row">
+    <span>${addr ? addr.slice(0, 20) + "..." : "?"}</span>
+    <span class="${cls}">${sign}${tx.amount} ${tx.denom}</span>
+  </div>` + el.innerHTML;
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────
+function showStatus(id, msg, type) {
+  const el = document.getElementById(id);
+  el.textContent = msg;
+  el.className = "status-msg " + type;
+  setTimeout(() => { el.className = "status-msg"; }, 5000);
+}
+
+function copyField(el) {
+  navigator.clipboard.writeText(el.textContent).then(() => {
+    const orig = el.style.borderColor;
+    el.style.borderColor = "#58a6ff";
+    setTimeout(() => { el.style.borderColor = orig; }, 500);
+  });
+}
+
+// ─── Boot ─────────────────────────────────────────────────────────────────
+(async () => {
+  try {
+    await loadOrCreateKeys();
+    const saved = localStorage.getItem("persistia_wallet_node");
+    if (saved) {
+      document.getElementById("nodeUrl").value = saved;
+    }
+    // Auto-connect using saved value or the default in the input
+    nodeBase = document.getElementById("nodeUrl").value;
+    if (nodeBase) {
+      localStorage.setItem("persistia_wallet_node", nodeBase);
+      refreshBalances();
+    }
+  } catch (e) {
+    console.error("Wallet init failed:", e);
+    document.getElementById("address").textContent = "Crypto unavailable (needs HTTPS)";
+  }
+})();
+</script>
+</body>
+</html>
