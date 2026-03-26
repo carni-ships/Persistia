@@ -100,6 +100,7 @@ export interface CallResult {
   error?: string;
   oracle_requests?: OracleRequestEmit[];
   trigger_requests?: TriggerRequestEmit[];
+  deploy_requests?: DeployRequestEmit[];
   /** Contract state keys that were mutated (for incremental Merkle tracking) */
   flushed_keys?: { contract: string; key: string; deleted: boolean }[];
 }
@@ -122,6 +123,12 @@ export interface TriggerRequestEmit {
   contract: string; // which contract emitted this
 }
 
+export interface DeployRequestEmit {
+  wasm_bytes: Uint8Array;
+  deployer: string;   // the contract that initiated the deploy
+  contract: string;    // same as deployer (for consistency with other emits)
+}
+
 // ─── Execution Context (shared across cross-contract call chain) ──────────────
 
 const MAX_CALL_DEPTH = 10;
@@ -132,6 +139,7 @@ interface ExecutionContext {
   logs: string[];
   oracleRequests: OracleRequestEmit[];
   triggerRequests: TriggerRequestEmit[];
+  deployRequests: DeployRequestEmit[];
   callStack: string[];   // addresses currently executing (reentrancy detection)
   readOnly: boolean;
   rootCaller: string;    // original external caller (pubkey)
@@ -144,6 +152,7 @@ function createContext(rootCaller: string, readOnly: boolean): ExecutionContext 
     logs: [],
     oracleRequests: [],
     triggerRequests: [],
+    deployRequests: [],
     callStack: [],
     readOnly,
     rootCaller,
@@ -343,6 +352,7 @@ export class ContractExecutor {
       logs: ctx.logs,
       oracle_requests: ctx.oracleRequests.length > 0 ? ctx.oracleRequests : undefined,
       trigger_requests: ctx.triggerRequests.length > 0 ? ctx.triggerRequests : undefined,
+      deploy_requests: ctx.deployRequests.length > 0 ? ctx.deployRequests : undefined,
       flushed_keys: flushed && flushed.length > 0 ? flushed : undefined,
     };
   }
@@ -651,6 +661,42 @@ export class ContractExecutor {
           const data = JSON.parse(new TextDecoder().decode(dataBytes));
           ctx.triggerRequests.push({ action, ...data, contract: address });
         } catch { /* invalid JSON, ignore */ }
+      },
+
+      // ─── Programmatic contract deployment ──────────────────────────────
+      // Allows a contract to deploy a new contract from WASM bytes.
+      // wasm_reg: register containing raw WASM binary
+      // Returns: 1 on success (new contract address in register 0), 0 on failure (error in register 0)
+      deploy_contract: (wasmReg: number): number => {
+        if (!deductFuel(FUEL_COSTS.deploy_contract)) return 0;
+        if (ctx.readOnly) {
+          registers.set(0, new TextEncoder().encode("deploy not allowed in read-only mode"));
+          return 0;
+        }
+        const wasmBytes = registers.get(wasmReg);
+        if (!wasmBytes) {
+          registers.set(0, new TextEncoder().encode("missing wasm bytes in register"));
+          return 0;
+        }
+        // Validate synchronously — actual deploy is deferred to post-execution
+        const validation = validateWasm(wasmBytes);
+        if (!validation.ok) {
+          registers.set(0, new TextEncoder().encode(validation.error || "invalid wasm"));
+          return 0;
+        }
+        // Compute deterministic address: SHA256(deployer_contract + wasm_hash + deploy_count)
+        const wasmHash = sha256Sync(wasmBytes);
+        const deployIndex = ctx.deployRequests.length;
+        const childAddress = sha256Sync(`${address}:${wasmHash}:${deployIndex}`);
+        // Queue the deploy for post-execution processing
+        ctx.deployRequests.push({
+          wasm_bytes: new Uint8Array(wasmBytes),
+          deployer: address,
+          contract: address,
+        });
+        // Return the deterministic address to the caller
+        registers.set(0, new TextEncoder().encode(childAddress));
+        return 1;
       },
 
       gas_left: (): number => {
@@ -987,6 +1033,34 @@ export class ContractExecutor {
           const data = JSON.parse(new TextDecoder().decode(dataBytes));
           ctx.triggerRequests.push({ action: new TextDecoder().decode(actionBytes) as "create" | "remove", ...data, contract: address });
         } catch { }
+      },
+
+      deploy_contract: (wasmReg: number): number => {
+        if (!deductFuel(FUEL_COSTS.deploy_contract)) return 0;
+        if (ctx.readOnly) {
+          registers.set(0, new TextEncoder().encode("deploy not allowed in read-only mode"));
+          return 0;
+        }
+        const wasmBytes = registers.get(wasmReg);
+        if (!wasmBytes) {
+          registers.set(0, new TextEncoder().encode("missing wasm bytes in register"));
+          return 0;
+        }
+        const validation = validateWasm(wasmBytes);
+        if (!validation.ok) {
+          registers.set(0, new TextEncoder().encode(validation.error || "invalid wasm"));
+          return 0;
+        }
+        const wasmHash = sha256Sync(wasmBytes);
+        const deployIndex = ctx.deployRequests.length;
+        const childAddress = sha256Sync(`${address}:${wasmHash}:${deployIndex}`);
+        ctx.deployRequests.push({
+          wasm_bytes: new Uint8Array(wasmBytes),
+          deployer: address,
+          contract: address,
+        });
+        registers.set(0, new TextEncoder().encode(childAddress));
+        return 1;
       },
 
       gas_left: (): number => {

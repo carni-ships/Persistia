@@ -108,7 +108,7 @@
     /* ─── Stats Bar ──────────────────────────────────────── */
     .stats-bar {
       display: grid;
-      grid-template-columns: repeat(6, 1fr);
+      grid-template-columns: repeat(5, 1fr);
       gap: 1px;
       background: var(--border);
       border-bottom: 1px solid var(--border);
@@ -206,6 +206,8 @@
     }
 
     .event-item:hover { background: var(--surface-2); }
+    .event-item[data-round] { cursor: crosshair; }
+    .event-item[data-round]:hover { background: rgba(108,92,231,0.1); }
 
     .event-time {
       color: var(--text-dim);
@@ -429,14 +431,18 @@
       <div class="stat-sub">active validators</div>
     </div>
     <div class="stat-card">
-      <div class="stat-label">Contracts</div>
-      <div class="stat-value" id="s-contracts">--</div>
-      <div class="stat-sub">deployed</div>
-    </div>
-    <div class="stat-card">
       <div class="stat-label">ZK Proofs</div>
       <div class="stat-value" id="s-zk">--</div>
       <div class="stat-sub" id="s-zk-sub">chain length</div>
+      <div class="zk-bar" style="margin-top:6px">
+        <div class="zk-progress" style="height:4px">
+          <div class="zk-progress-fill" id="zk-fill" style="width:0%"></div>
+        </div>
+        <div class="zk-stats" style="font-size:9px;margin-top:2px">
+          <span id="zk-proven">0 / 0 blocks</span>
+          <span id="zk-gap"></span>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -465,64 +471,51 @@
 
     <div class="panel">
       <div class="panel-header">
+        <span class="panel-title">Finality Levels</span>
+      </div>
+      <div class="panel-body">
+        <div class="finality-levels" id="finality-levels">
+          <div class="finality-row">
+            <div class="finality-badge" style="background:rgba(72,191,227,0.2);color:#48bfe3">L0</div>
+            <div class="finality-name">Optimistic</div>
+            <div class="finality-value" style="color:#48bfe3" id="fin-l0">--</div>
+          </div>
+          <div class="finality-row">
+            <div class="finality-badge" style="background:rgba(108,92,231,0.2);color:#6c5ce7">L1</div>
+            <div class="finality-name">DAG Inclusion</div>
+            <div class="finality-value" style="color:#6c5ce7" id="fin-l1">--</div>
+          </div>
+          <div class="finality-row">
+            <div class="finality-badge" style="background:rgba(0,210,160,0.2);color:#00d2a0">L2</div>
+            <div class="finality-name">BFT Commit</div>
+            <div class="finality-value" style="color:#00d2a0" id="fin-l2">--</div>
+          </div>
+          <div class="finality-row">
+            <div class="finality-badge" style="background:rgba(255,107,107,0.2);color:#ff6b6b">L3</div>
+            <div class="finality-name">ZK Proven</div>
+            <div class="finality-value" style="color:#ff6b6b" id="fin-l3">--</div>
+          </div>
+          <div class="finality-row">
+            <div class="finality-badge" style="background:rgba(255,209,102,0.2);color:#ffd166">L4</div>
+            <div class="finality-name">DA Anchored</div>
+            <div class="finality-value" style="color:#ffd166" id="fin-l4">--</div>
+          </div>
+          <div class="finality-bar-track">
+            <div class="finality-bar-fill" id="fin-bar-l4" style="width:0%;background:#ffd166;opacity:0.4;z-index:1"></div>
+            <div class="finality-bar-fill" id="fin-bar-l3" style="width:0%;background:#ff6b6b;opacity:0.5;z-index:2"></div>
+            <div class="finality-bar-fill" id="fin-bar-l2" style="width:0%;background:#00d2a0;opacity:0.6;z-index:3"></div>
+            <div class="finality-bar-fill" id="fin-bar-l1" style="width:0%;background:#6c5ce7;opacity:0.7;z-index:4"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header">
         <span class="panel-title">Validators</span>
       </div>
       <div class="panel-body">
         <div class="node-list" id="node-list"></div>
-        <!-- Finality Levels -->
-        <div style="border-top:1px solid var(--border)">
-          <div class="panel-header">
-            <span class="panel-title">Finality Levels</span>
-          </div>
-          <div class="finality-levels" id="finality-levels">
-            <div class="finality-row">
-              <div class="finality-badge" style="background:rgba(72,191,227,0.2);color:#48bfe3">L0</div>
-              <div class="finality-name">Optimistic</div>
-              <div class="finality-value" style="color:#48bfe3" id="fin-l0">--</div>
-            </div>
-            <div class="finality-row">
-              <div class="finality-badge" style="background:rgba(108,92,231,0.2);color:#6c5ce7">L1</div>
-              <div class="finality-name">DAG Inclusion</div>
-              <div class="finality-value" style="color:#6c5ce7" id="fin-l1">--</div>
-            </div>
-            <div class="finality-row">
-              <div class="finality-badge" style="background:rgba(0,210,160,0.2);color:#00d2a0">L2</div>
-              <div class="finality-name">BFT Commit</div>
-              <div class="finality-value" style="color:#00d2a0" id="fin-l2">--</div>
-            </div>
-            <div class="finality-row">
-              <div class="finality-badge" style="background:rgba(255,107,107,0.2);color:#ff6b6b">L3</div>
-              <div class="finality-name">ZK Proven</div>
-              <div class="finality-value" style="color:#ff6b6b" id="fin-l3">--</div>
-            </div>
-            <div class="finality-row">
-              <div class="finality-badge" style="background:rgba(255,209,102,0.2);color:#ffd166">L4</div>
-              <div class="finality-name">DA Anchored</div>
-              <div class="finality-value" style="color:#ffd166" id="fin-l4">--</div>
-            </div>
-            <div class="finality-bar-track">
-              <div class="finality-bar-fill" id="fin-bar-l4" style="width:0%;background:#ffd166;opacity:0.4;z-index:1"></div>
-              <div class="finality-bar-fill" id="fin-bar-l3" style="width:0%;background:#ff6b6b;opacity:0.5;z-index:2"></div>
-              <div class="finality-bar-fill" id="fin-bar-l2" style="width:0%;background:#00d2a0;opacity:0.6;z-index:3"></div>
-              <div class="finality-bar-fill" id="fin-bar-l1" style="width:0%;background:#6c5ce7;opacity:0.7;z-index:4"></div>
-            </div>
-          </div>
-        </div>
-        <!-- ZK Progress -->
-        <div style="border-top:1px solid var(--border)">
-          <div class="panel-header">
-            <span class="panel-title">ZK Proof Coverage</span>
-          </div>
-          <div class="zk-bar">
-            <div class="zk-progress">
-              <div class="zk-progress-fill" id="zk-fill" style="width:0%"></div>
-            </div>
-            <div class="zk-stats">
-              <span id="zk-proven">0 blocks proven</span>
-              <span id="zk-gap">gap: --</span>
-            </div>
-          </div>
-        </div>
       </div>
     </div>
   </div>
@@ -538,6 +531,7 @@ let connected = false;
 let dagData = { vertices: [], commits: new Set() };
 let events = [];
 let nodeColors = {};
+let highlightedRound = null;
 const COLORS = [
   '#6c5ce7','#00d2a0','#48bfe3','#ffd166','#ff6b6b',
   '#a29bfe','#55efc4','#74b9ff','#fdcb6e','#fab1a0',
@@ -602,13 +596,6 @@ async function poll() {
     document.getElementById('s-events').textContent = status.finalized_seq;
     document.getElementById('s-nodes').textContent = status.active_nodes;
 
-    // Count contracts (from a separate endpoint)
-    try {
-      const root = await api('/');
-      if (root.contracts !== undefined) {
-        document.getElementById('s-contracts').textContent = root.contracts;
-      }
-    } catch {}
 
     // Process DAG sync data
     if (sync.vertices && sync.vertices.length > 0) {
@@ -623,7 +610,7 @@ async function poll() {
         });
 
         // Add to event log
-        addEvent('vertex', `Round ${v.round}`, shortKey(v.author), nodeColor(v.author));
+        addEvent('vertex', `Round ${v.round}`, shortKey(v.author), nodeColor(v.author), null, v.round);
       }
 
       lastSyncRound = Math.max(lastSyncRound, ...sync.vertices.map(v => v.round));
@@ -632,7 +619,7 @@ async function poll() {
     if (sync.commits) {
       for (const c of sync.commits) {
         dagData.commits.add(c.anchor_hash);
-        addEvent('commit', `Round ${c.round} finalized`, shortKey(c.anchor_hash), null);
+        addEvent('commit', `Round ${c.round} finalized`, shortKey(c.anchor_hash), null, null, c.round);
       }
     }
 
@@ -678,7 +665,12 @@ async function poll() {
     // Update nodes panel
     try {
       const peers = await api('/admin/peers');
-      renderNodes(peers.peers || []);
+      const allPeers = peers.peers || [];
+      renderNodes(allPeers);
+      // Count nodes with vertices in last 20 rounds (matches DAG chart filter)
+      const currentRound = status.current_round || 0;
+      const activePeers = allPeers.filter(p => p.last_vertex_round > currentRound - 20);
+      document.getElementById('s-nodes').textContent = activePeers.length;
     } catch {}
 
     // Render DAG
@@ -694,8 +686,8 @@ async function poll() {
 }
 
 // ─── Event Log ───────────────────────────────────────────────────────────────
-function addEvent(type, detail, extra, color, serverTime) {
-  events.unshift({ type, detail, extra, color, time: serverTime || Date.now() });
+function addEvent(type, detail, extra, color, serverTime, round) {
+  events.unshift({ type, detail, extra, color, time: serverTime || Date.now(), round: round || null });
   if (events.length > 200) events.length = 200;
   renderEvents();
 }
@@ -711,12 +703,24 @@ function renderEvents() {
   };
 
   list.innerHTML = events.slice(0, 50).map(e => `
-    <li class="event-item">
+    <li class="event-item" ${e.round ? `data-round="${e.round}"` : ''}>
       <span class="event-time">${timeAgo(e.time)}</span>
       <span class="event-badge ${badgeClass[e.type] || 'badge-event'}">${e.type}</span>
       <span class="event-detail">${e.detail}${e.extra ? ` <span class="mono">${e.extra}</span>` : ''}</span>
     </li>
   `).join('');
+
+  // Hover handlers for DAG highlight
+  for (const li of list.querySelectorAll('li[data-round]')) {
+    li.addEventListener('mouseenter', () => {
+      highlightedRound = parseInt(li.dataset.round);
+      renderDAG();
+    });
+    li.addEventListener('mouseleave', () => {
+      highlightedRound = null;
+      renderDAG();
+    });
+  }
 
   document.getElementById('event-count').textContent = events.length;
 }
@@ -925,14 +929,38 @@ function drawDAGFrame() {
     }
   }
 
+  // ─── Hover highlight column ──────────────────────────────────────────
+  if (highlightedRound !== null) {
+    const hi = visibleRounds.indexOf(highlightedRound);
+    if (hi >= 0) {
+      const hx = PAD_L + hi * COL_W + COL_W/2;
+      const colH = authors.length * ROW_H + 20;
+      ctx.fillStyle = 'rgba(108,92,231,0.15)';
+      ctx.fillRect(hx - COL_W/2, PAD_T - 10, COL_W, colH);
+      // Bright border lines
+      ctx.strokeStyle = 'rgba(108,92,231,0.5)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(hx - COL_W/2, PAD_T - 10);
+      ctx.lineTo(hx - COL_W/2, PAD_T - 10 + colH);
+      ctx.moveTo(hx + COL_W/2, PAD_T - 10);
+      ctx.lineTo(hx + COL_W/2, PAD_T - 10 + colH);
+      ctx.stroke();
+    }
+  }
+
   // ─── Round labels ─────────────────────────────────────────────────────
   ctx.font = '10px JetBrains Mono';
   ctx.textAlign = 'center';
   for (let i = 0; i < visibleRounds.length; i++) {
     const x = PAD_L + i * COL_W + COL_W/2;
-    ctx.fillStyle = visibleRounds[i] % 2 === 0 ? 'rgba(0,210,160,0.5)' : '#4a4a5e';
+    const isHighlighted = visibleRounds[i] === highlightedRound;
+    ctx.fillStyle = isHighlighted ? '#e0e0e8'
+      : visibleRounds[i] % 2 === 0 ? 'rgba(0,210,160,0.5)' : '#4a4a5e';
+    ctx.font = isHighlighted ? 'bold 10px JetBrains Mono' : '10px JetBrains Mono';
     ctx.fillText('R' + visibleRounds[i], x, 16);
   }
+  ctx.font = '10px JetBrains Mono';
 
   // ─── Author labels ────────────────────────────────────────────────────
   ctx.textAlign = 'right';
@@ -1287,7 +1315,7 @@ function connectWS() {
               signature: v.signature,
             });
             if (dagAnim.initialSyncDone) {
-              addEvent('vertex', `Round ${v.round}`, shortKey(v.author), nodeColor(v.author), v.received_at || v.timestamp);
+              addEvent('vertex', `Round ${v.round}`, shortKey(v.author), nodeColor(v.author), v.received_at || v.timestamp, v.round);
             }
           }
           lastSyncRound = Math.max(lastSyncRound, ...msg.vertices.map(v => v.round));
@@ -1296,7 +1324,7 @@ function connectWS() {
           for (const c of msg.commits) {
             dagData.commits.add(c.anchor_hash);
             if (dagAnim.initialSyncDone) {
-              addEvent('commit', `Round ${c.round} finalized`, shortKey(c.anchor_hash), null, c.committed_at);
+              addEvent('commit', `Round ${c.round} finalized`, shortKey(c.anchor_hash), null, c.committed_at, c.round);
             }
           }
         }
@@ -1308,10 +1336,10 @@ function connectWS() {
           // Build combined list sorted by time, oldest first
           const seed = [];
           for (const v of recentVertices) {
-            seed.push({ type: 'vertex', detail: `Round ${v.round}`, extra: shortKey(v.author), color: nodeColor(v.author), time: v.received_at || v.timestamp || 0 });
+            seed.push({ type: 'vertex', detail: `Round ${v.round}`, extra: shortKey(v.author), color: nodeColor(v.author), time: v.received_at || v.timestamp || 0, round: v.round });
           }
           for (const c of recentCommits) {
-            seed.push({ type: 'commit', detail: `Round ${c.round} finalized`, extra: shortKey(c.anchor_hash), color: null, time: c.committed_at || 0 });
+            seed.push({ type: 'commit', detail: `Round ${c.round} finalized`, extra: shortKey(c.anchor_hash), color: null, time: c.committed_at || 0, round: c.round });
           }
           seed.sort((a, b) => b.time - a.time); // newest first
           events.push(...seed);
@@ -1326,15 +1354,15 @@ function connectWS() {
 
       // Live push events — use server timestamps so "time ago" reflects when events happened on-chain
       if (msg.type === 'vertex.new') {
-        addEvent('vertex', `Round ${msg.round}`, shortKey(msg.author), nodeColor(msg.author), msg.timestamp);
+        addEvent('vertex', `Round ${msg.round}`, shortKey(msg.author), nodeColor(msg.author), msg.timestamp, msg.round);
       } else if (msg.type === 'commit') {
-        addEvent('commit', `Round ${msg.round} finalized`, '', null, msg.timestamp);
+        addEvent('commit', `Round ${msg.round} finalized`, '', null, msg.timestamp, msg.round);
       } else if (msg.type === 'event.finalized' || msg.type === 'event.pending') {
         const et = msg.event?.type || 'unknown';
         const badge = et.startsWith('contract.') ? 'contract' : 'event';
-        addEvent(badge, et, shortKey(msg.event?.pubkey), null, msg.event?.timestamp);
+        addEvent(badge, et, shortKey(msg.event?.pubkey), null, msg.event?.timestamp, msg.round);
       } else if (msg.type === 'zk.proof_submitted') {
-        addEvent('zk', `Block ${msg.block_number} proved`, '', null, msg.timestamp);
+        addEvent('zk', `Block ${msg.block_number} proved`, '', null, msg.timestamp, msg.block_number);
         // Auto-refresh verifier if tab is active
         if (verifierAutoRan && document.getElementById('tab-verifier').classList.contains('active')) {
           setTimeout(runVerification, 1000);

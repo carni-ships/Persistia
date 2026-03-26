@@ -34,6 +34,8 @@ extern "C" {
     fn oracle_request(url_reg: u32, callback_reg: u32, aggregation_reg: u32, json_path_reg: u32);
     // Trigger: manage cron-like scheduled calls
     fn trigger_manage(action_reg: u32, data_reg: u32);
+    // Deploy: programmatically deploy a new contract from WASM bytes
+    fn deploy_contract(wasm_reg: u32) -> u32;
 }
 
 // ─── Register Helpers ────────────────────────────────────────────────────────
@@ -203,6 +205,27 @@ pub fn remove_trigger(trigger_id: &str) {
     let json = format!(r#"{{"trigger_id":"{}"}}"#, trigger_id);
     write_reg(REG_SCRATCH_2, json.as_bytes());
     unsafe { trigger_manage(REG_SCRATCH_1, REG_SCRATCH_2) };
+}
+
+// ─── Deploy API ─────────────────────────────────────────────────────────────
+
+/// Deploy a new contract from raw WASM bytes. Returns `Ok(address)` with the
+/// deterministic address of the newly deployed contract, or `Err(error)` if
+/// validation failed.
+///
+/// The deploy is queued and executed after the current call succeeds — the child
+/// contract is immediately callable in subsequent transactions.
+///
+/// Use case: factory contracts, LLM-generated contracts, agent swarms.
+pub fn deploy_child_contract(wasm_bytes: &[u8]) -> Result<String, String> {
+    write_reg(REG_SCRATCH_1, wasm_bytes);
+    let ok = unsafe { deploy_contract(REG_SCRATCH_1) };
+    let result = read_reg(REG_INPUT); // address or error in register 0
+    if ok == 1 {
+        Ok(String::from_utf8(result).unwrap_or_default())
+    } else {
+        Err(String::from_utf8(result).unwrap_or_default())
+    }
 }
 
 // ─── Global Allocator ────────────────────────────────────────────────────────

@@ -38,6 +38,7 @@ export const FUEL_COSTS = {
   oracle_request: 1000,
   trigger_manage: 1000,
   gas_left: 10,
+  deploy_contract: 50000,  // expensive — validates, compiles, and stores a new contract
 
   // Memory operations (per page growth)
   memory_grow: 50000,

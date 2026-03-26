@@ -12,7 +12,7 @@ import {
   loadOrCreateNodeIdentity, signVertex, verifyVertexSignature, verifyNodeSignature,
   type NodeIdentity,
 } from "./node-identity";
-import { ContractExecutor, type OracleRequestEmit, type TriggerRequestEmit } from "./contract-executor";
+import { ContractExecutor, type OracleRequestEmit, type TriggerRequestEmit, type DeployRequestEmit } from "./contract-executor";
 import {
   aggregate, extractJsonPath, fetchWithTimeout, computeRequestId,
   type OracleRequest, type NodeFetchResult, type AggregationStrategy,
@@ -891,15 +891,11 @@ export class PersistiaWorldV4 implements DurableObject {
         );
       }
 
-      // 7b. Prune old events (keep last 1000 for sync, rest recoverable from anchors)
+      // 7b. Track last anchored seq for event pruning in 7o
       const lastAnchorRows = [...sql.exec(
         "SELECT MAX(finalized_seq) as max_seq FROM anchors WHERE status IN ('submitted','confirmed')"
       )];
       const lastAnchoredSeq = (lastAnchorRows[0]?.max_seq ?? 0) as number;
-      if (lastAnchoredSeq > 1000) {
-        const pruneSeq = lastAnchoredSeq - 1000;
-        sql.exec("DELETE FROM events WHERE seq < ? LIMIT 200", pruneSeq);
-      }
 
       // 7c. Prune delivered oracle requests older than 1 hour
       const oneHourAgo = Date.now() - 3_600_000;
@@ -958,6 +954,31 @@ export class PersistiaWorldV4 implements DurableObject {
       // 7l. Prune expired proof_claims (completed or expired older than 1 day)
       const oneDayAgo = Date.now() - 86_400_000;
       sql.exec("DELETE FROM proof_claims WHERE status IN ('completed', 'expired') AND claimed_at < ? LIMIT 50", oneDayAgo);
+
+      // 7m. Prune dag_commits older than latest ZK-proven block (proof subsumes them)
+      const latestProvenRows = [...sql.exec("SELECT MAX(block_number) as b FROM zk_proofs")];
+      const latestProven = (latestProvenRows[0]?.b ?? 0) as number;
+      if (latestProven > 100) {
+        sql.exec("DELETE FROM dag_commits WHERE round < ? LIMIT 200", latestProven - 50);
+      }
+
+      // 7n. Prune old Merkle roots — keep last 2000 for proof generation, prune the rest
+      const maxRootSeq = [...sql.exec("SELECT MAX(seq) as s FROM roots")];
+      const latestRootSeq = (maxRootSeq[0]?.s ?? 0) as number;
+      if (latestRootSeq > 2500) {
+        sql.exec("DELETE FROM roots WHERE seq < ? LIMIT 200", latestRootSeq - 2000);
+      }
+
+      // 7o. Prune finalized events — even without anchoring, keep only last 5000 for sync
+      const maxEvtSeq = [...sql.exec("SELECT MAX(seq) as s FROM events")];
+      const latestEvtSeq = (maxEvtSeq[0]?.s ?? 0) as number;
+      if (latestEvtSeq > 6000) {
+        const evtPruneSeq = Math.min(
+          latestEvtSeq - 5000,
+          lastAnchoredSeq > 0 ? lastAnchoredSeq - 1000 : latestEvtSeq - 5000,
+        );
+        sql.exec("DELETE FROM events WHERE seq < ? LIMIT 200", evtPruneSeq);
+      }
 
       // 8. Periodically reprobe failed peers (every ~5 min)
       if (CONSENSUS_ENABLED && this.currentRound % 10 === 0) {
@@ -1280,6 +1301,44 @@ export class PersistiaWorldV4 implements DurableObject {
           if (!result.rowsWritten) break;
         }
         return this.json({ ok: true, pruned_below_round: pruneBelow, rows_deleted: totalDeleted });
+      }
+
+      case "/admin/storage": {
+        const sql = this.state.storage.sql;
+        const tables = [
+          "events", "pending_events", "dag_vertices", "dag_commits", "consensus_events",
+          "blocks", "contracts", "contract_state", "roots", "zk_proofs", "block_headers",
+          "anchors", "notes", "nullifiers", "accounts", "token_balances", "validators",
+          "oracle_requests", "oracle_responses", "triggers", "gossip_peers", "active_nodes",
+          "xshard_outbox", "xshard_inbox", "equivocation_evidence", "governance_votes",
+          "proof_claims", "mpp_challenges", "mpp_receipts", "covenants", "private_state",
+          "rate_limit_log",
+        ];
+        const sizes: Record<string, number> = {};
+        let totalRows = 0;
+        for (const t of tables) {
+          try {
+            const rows = [...sql.exec(`SELECT COUNT(*) as c FROM ${t}`)];
+            const count = (rows[0]?.c ?? 0) as number;
+            sizes[t] = count;
+            totalRows += count;
+          } catch { sizes[t] = -1; }
+        }
+        // SQLite page-level stats (PRAGMA may not be supported on CF DO SQLite)
+        let dbSizeBytes = 0;
+        try {
+          const pageCount = [...sql.exec("PRAGMA page_count")][0]?.page_count as number ?? 0;
+          const pageSize = [...sql.exec("PRAGMA page_size")][0]?.page_size as number ?? 4096;
+          dbSizeBytes = pageCount * pageSize;
+        } catch { /* PRAGMA not available */ }
+        return this.json({
+          total_rows: totalRows,
+          db_size_bytes: dbSizeBytes,
+          db_size_mb: Math.round(dbSizeBytes / 1_048_576 * 100) / 100,
+          limit_mb: 1024,
+          usage_pct: Math.round(dbSizeBytes / (1024 * 1_048_576) * 10000) / 100,
+          tables: sizes,
+        });
       }
 
       default:
@@ -2598,9 +2657,10 @@ export class PersistiaWorldV4 implements DurableObject {
 
   private async createAndBroadcastVertex() {
     if (!this.nodeIdentity) return;
+    const sql = this.state.storage.sql;
 
     // Gather pending events
-    const pendingRows = [...this.state.storage.sql.exec(
+    const pendingRows = [...sql.exec(
       "SELECT hash, type, payload, pubkey, signature, timestamp FROM pending_events ORDER BY timestamp ASC LIMIT 500",
     )];
 
@@ -2633,7 +2693,7 @@ export class PersistiaWorldV4 implements DurableObject {
     this.storeVertex(vHash, vertex);
 
     // Update self in active_nodes (receiveVertex does this for peer vertices, but not for self-created ones)
-    this.state.storage.sql.exec(
+    sql.exec(
       `INSERT INTO active_nodes (pubkey, url, last_vertex_round, last_seen, is_self)
        VALUES (?, ?, ?, ?, 1)
        ON CONFLICT(pubkey) DO UPDATE SET last_vertex_round = MAX(last_vertex_round, ?), last_seen = ?`,
@@ -2641,10 +2701,11 @@ export class PersistiaWorldV4 implements DurableObject {
     );
     this.invalidateActiveCache();
 
-    // Clear pending events that were included
-    if (eventHashes.length > 0) {
-      const placeholders = eventHashes.map(() => "?").join(",");
-      sql.exec(`DELETE FROM pending_events WHERE hash IN (${placeholders})`, ...eventHashes);
+    // Clear pending events that were included (batch to avoid SQLite parameter limits)
+    for (let i = 0; i < eventHashes.length; i += 100) {
+      const batch = eventHashes.slice(i, i + 100);
+      const placeholders = batch.map(() => "?").join(",");
+      sql.exec(`DELETE FROM pending_events WHERE hash IN (${placeholders})`, ...batch);
     }
 
     // Try round advancement + commits
@@ -3420,12 +3481,15 @@ export class PersistiaWorldV4 implements DurableObject {
             this.stateTree.markDirty(stateKey, fk.deleted ? null : stateKey);
           }
         }
-        // Process any oracle/trigger requests emitted by the contract
+        // Process any oracle/trigger/deploy requests emitted by the contract
         if (result.oracle_requests) {
           await this.processOracleEmits(payload.contract, result.oracle_requests);
         }
         if (result.trigger_requests) {
           await this.processTriggerEmits(payload.contract, pubkey, result.trigger_requests);
+        }
+        if (result.deploy_requests) {
+          await this.processDeployEmits(result.deploy_requests);
         }
         break;
       }
@@ -3464,6 +3528,9 @@ export class PersistiaWorldV4 implements DurableObject {
         }
         if (callResult.trigger_requests) {
           await this.processTriggerEmits(contract, "oracle:system", callResult.trigger_requests);
+        }
+        if (callResult.deploy_requests) {
+          await this.processDeployEmits(callResult.deploy_requests);
         }
         break;
       }
@@ -3521,6 +3588,26 @@ export class PersistiaWorldV4 implements DurableObject {
       }
     }
     this.scheduleAlarm();
+  }
+
+  /**
+   * Process contract deploy requests emitted by a contract during execution.
+   * Each deploy is compiled, stored, and cached — the child contract is immediately callable.
+   */
+  private async processDeployEmits(requests: DeployRequestEmit[]) {
+    for (let i = 0; i < requests.length; i++) {
+      const req = requests[i];
+      try {
+        const address = await this.contractExecutor.deploy(
+          req.wasm_bytes, req.deployer, this.latestSeq * 1000 + i,
+        );
+        this.stateTree.markDirty(`deployed:${address}`, `${req.deployer}:${address}`);
+        this.broadcast({ type: "contract.deployed", address, deployer: req.deployer, parent: req.contract });
+        console.log(`Contract-initiated deploy: ${req.deployer.slice(0, 8)}... deployed child ${address.slice(0, 8)}...`);
+      } catch (e: any) {
+        console.warn(`Contract-initiated deploy failed: ${e.message}`);
+      }
+    }
   }
 
   /**
@@ -3650,6 +3737,9 @@ export class PersistiaWorldV4 implements DurableObject {
           }
           if (result.trigger_requests) {
             await this.processTriggerEmits(trigger.contract, trigger.creator, result.trigger_requests);
+          }
+          if (result.deploy_requests) {
+            await this.processDeployEmits(result.deploy_requests);
           }
         }
 
