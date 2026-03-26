@@ -4705,7 +4705,11 @@ export class PersistiaWorldV4 implements DurableObject {
   }
 
   private blockTypeToItem(blockType: number): string {
-    return { 1: "dirt", 2: "stone", 3: "wood", 4: "grass" }[blockType] || "unknown";
+    return { 1: "dirt", 2: "stone", 3: "wood", 4: "grass", 5: "house", 6: "wall", 7: "bridge" }[blockType] || "unknown";
+  }
+
+  private itemToBlockType(item: string): number {
+    return { dirt: 1, stone: 2, wood: 3, grass: 4, house: 5, wall: 6, bridge: 7 }[item] || 0;
   }
 
   // ─── Broadcast ──────────────────────────────────────────────────────────
