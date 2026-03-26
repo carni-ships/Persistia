@@ -280,7 +280,7 @@ export class ContractExecutor {
   /** Touch a cache entry (move to end for LRU), evict oldest if over limit */
   private cacheSet(address: string, module: WebAssembly.Module) {
     if (this.moduleCache.has(address)) this.moduleCache.delete(address);
-    this.cacheSet(address, module);
+    this.moduleCache.set(address, module);
     if (this.moduleCache.size > MODULE_CACHE_MAX) {
       // Evict the least recently used (first key in Map)
       const oldest = this.moduleCache.keys().next().value!;
@@ -332,7 +332,7 @@ export class ContractExecutor {
       this.sql.exec(
         `INSERT INTO contracts (address, deployer, wasm_hash, wasm_bytes, created_at, deploy_seq)
          VALUES (?, ?, ?, ?, ?, ?)`,
-        address, deployer, wasmHash, wasmBytes, Date.now(), seq,
+        address, deployer, wasmHash, meteredBytes, Date.now(), seq,
       );
     }
 

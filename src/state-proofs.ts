@@ -383,7 +383,7 @@ export class IncrementalStateTree {
 
 // ─── Collect state entries from DB ──────────────────────────────────────────
 
-function collectStateEntries(sql: any): { key: string; value: string }[] {
+export function collectStateEntries(sql: any): { key: string; value: string }[] {
   const entries: { key: string; value: string }[] = [];
 
   const contractRows = [...sql.exec("SELECT contract_address, key, value FROM contract_state ORDER BY contract_address, key")];

@@ -36,6 +36,8 @@ const CACHEABLE_ENDPOINTS: Record<string, number> = {
   "/governance/config": CACHE_TTL_GOV_CONFIG,
   "/validator/list": CACHE_TTL_VALIDATOR,
   "/network": CACHE_TTL_STATUS,
+  "/snapshot/latest": CACHE_TTL_GOV_CONFIG,  // changes per anchor (~5 min)
+  "/snapshot/list": CACHE_TTL_GOV_CONFIG,
 };
 
 // Static HTML routes served from Workers Static Assets
@@ -232,6 +234,8 @@ export default {
           add_node: "/addNode",
           anchor_latest: "/anchor/latest",
           anchor_bootstrap: "/anchor/bootstrap",
+          snapshot_latest: "/snapshot/latest",
+          snapshot_download: "/snapshot/download",
         },
       }));
     }

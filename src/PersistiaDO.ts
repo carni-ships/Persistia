@@ -26,6 +26,7 @@ import { ValidatorRegistry, verifyPoW } from "./validator-registry";
 import { AccountManager, pubkeyB64ToAddress, validateAddress } from "./wallet";
 import { MPPHandler, type MPPConfig } from "./mpp";
 import { computeAdaptiveInterval, SMOOTHING_WINDOW, type AdaptiveSignals } from "./adaptive-params";
+import { SnapshotManager, type SnapshotMeta } from "./snapshot";
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -53,6 +54,7 @@ export class PersistiaWorldV4 implements DurableObject {
   triggerManager!: TriggerManager;
   gossipManager!: GossipManager;
   anchorManager!: AnchorManager;
+  snapshotManager!: SnapshotManager;
   validatorRegistry!: ValidatorRegistry;
   accountManager!: AccountManager;
   mppHandler!: MPPHandler;
@@ -343,6 +345,7 @@ export class PersistiaWorldV4 implements DurableObject {
       };
     }
     this.anchorManager = new AnchorManager(sql, anchorConfig);
+    this.snapshotManager = new SnapshotManager(sql, this.env.BLOB_STORE);
 
     // Node identity
     if (CONSENSUS_ENABLED) {
@@ -354,7 +357,7 @@ export class PersistiaWorldV4 implements DurableObject {
         const seeds = (this.env.SEED_NODES as string).split(",").map(s => s.trim()).filter(Boolean);
         if (seeds.length > 0) {
           this.gossipManager.bootstrapFromSeeds(seeds)
-            .then(n => {
+            .then(async (n) => {
               if (n > 0) {
                 console.log(`Bootstrapped ${n} peers from seeds`);
                 // Register seed peers in active_nodes to prevent bootstrap deadlock
@@ -369,6 +372,11 @@ export class PersistiaWorldV4 implements DurableObject {
                   }
                 }
                 this.invalidateActiveCache();
+
+                // If this is a fresh node, try snapshot bootstrap instead of full replay
+                if (this.finalizedSeq === 0 && this.currentRound === 0) {
+                  await this.bootstrapFromSnapshot(seeds);
+                }
               }
             })
             .catch(e => console.warn(`Seed bootstrap failed: ${e.message}`));
@@ -399,6 +407,70 @@ export class PersistiaWorldV4 implements DurableObject {
     if (CONSENSUS_ENABLED) {
       this.scheduleAlarm();
     }
+  }
+
+  // ─── Snapshot Bootstrap (fast catchup for new nodes) ──────────────────
+
+  private async bootstrapFromSnapshot(seedUrls: string[]): Promise<boolean> {
+    for (const seedUrl of seedUrls) {
+      try {
+        // Check if peer has a snapshot
+        const metaRes = await fetch(`${seedUrl.replace(/\/$/, "")}/snapshot/latest`, {
+          headers: { "Accept": "application/json" },
+        });
+        if (!metaRes.ok) continue;
+
+        const snapInfo = await metaRes.json() as any;
+        if (!snapInfo.anchor_id || !snapInfo.snapshot_hash) continue;
+        if (snapInfo.finalized_seq <= 0) continue;
+
+        console.log(
+          `Snapshot found on ${seedUrl}: seq=${snapInfo.finalized_seq} ` +
+          `round=${snapInfo.last_committed_round} hash=${snapInfo.snapshot_hash.slice(0, 12)}`,
+        );
+
+        // Download and apply
+        const meta = await this.snapshotManager.applySnapshot(
+          seedUrl, snapInfo.anchor_id, snapInfo.snapshot_hash,
+        );
+        if (!meta) {
+          console.warn(`Snapshot from ${seedUrl} failed verification, trying next peer`);
+          continue;
+        }
+
+        // Update consensus state from snapshot
+        this.finalizedSeq = meta.finalized_seq;
+        this.finalizedRoot = meta.finalized_root;
+        this.lastCommittedRound = meta.last_committed_round;
+        this.currentRound = meta.last_committed_round;
+        this.setKV("finalized_seq", String(meta.finalized_seq));
+        this.setKV("finalized_root", meta.finalized_root);
+        this.setKV("last_committed_round", String(meta.last_committed_round));
+        this.setKV("current_round", String(meta.last_committed_round));
+
+        // Reload latestSeq from events table (snapshot includes events)
+        const seqRows = [...this.state.storage.sql.exec("SELECT seq FROM events ORDER BY seq DESC LIMIT 1")];
+        this.latestSeq = seqRows[0]?.seq ?? 0;
+        const rootRows = [...this.state.storage.sql.exec("SELECT root FROM roots ORDER BY id DESC LIMIT 1")];
+        this.currentRoot = rootRows[0]?.root ?? this.finalizedRoot;
+
+        // Invalidate state tree — it needs to rebuild from the snapshot's state
+        this.stateTree.invalidate();
+        this.invalidateActiveCache();
+
+        console.log(
+          `Snapshot bootstrap complete: seq=${this.finalizedSeq} round=${this.currentRound} ` +
+          `— gossip sync will catch up from here`,
+        );
+
+        return true;
+      } catch (e: any) {
+        console.warn(`Snapshot bootstrap from ${seedUrl} failed: ${e.message}`);
+      }
+    }
+
+    console.log("No snapshot available from peers — falling back to full event replay");
+    return false;
   }
 
   // ─── KV helpers for consensus_state ─────────────────────────────────────
@@ -625,6 +697,9 @@ export class PersistiaWorldV4 implements DurableObject {
       }
       if (url.pathname.startsWith("/anchor/")) {
         return this.handleAnchorRoute(req, url);
+      }
+      if (url.pathname.startsWith("/snapshot/")) {
+        return this.handleSnapshotRoute(req, url);
       }
       if (url.pathname.startsWith("/mpp/")) {
         return this.handleMPPRoute(req, url);
@@ -2634,6 +2709,9 @@ export class PersistiaWorldV4 implements DurableObject {
           proven_blocks: r.proven_blocks, proof_type: r.proof_type, genesis_root: r.genesis_root,
         }));
 
+        // Include snapshot availability for new nodes
+        const syncSnap = this.snapshotManager.getLatestSnapshot();
+
         return this.json({
           vertices,
           commits,
@@ -2643,6 +2721,11 @@ export class PersistiaWorldV4 implements DurableObject {
             round_interval_ms: this.getNetworkParam("round_interval_ms", ROUND_INTERVAL_MS),
             max_events_per_vertex: this.getNetworkParam("max_events_per_vertex", MAX_EVENTS_PER_VERTEX),
           },
+          snapshot: syncSnap ? {
+            anchor_id: syncSnap.anchor_id,
+            finalized_seq: syncSnap.finalized_seq,
+            snapshot_hash: syncSnap.snapshot_hash,
+          } : undefined,
         } as SyncResponsePayload);
       }
 
@@ -2710,6 +2793,41 @@ export class PersistiaWorldV4 implements DurableObject {
     }
   }
 
+  // ─── Snapshot Routes ───────────────────────────────────────────────────
+
+  private async handleSnapshotRoute(req: Request, url: URL): Promise<Response> {
+    switch (url.pathname) {
+      case "/snapshot/latest": {
+        const snap = this.snapshotManager.getLatestSnapshot();
+        if (!snap) return this.json({ error: "No snapshot available" }, 404);
+        return this.json(snap);
+      }
+
+      case "/snapshot/list": {
+        const limit = parseInt(url.searchParams.get("limit") || "10");
+        return this.json(this.snapshotManager.listSnapshots(limit));
+      }
+
+      case "/snapshot/download": {
+        const anchorId = url.searchParams.get("anchor_id");
+        if (!anchorId) {
+          // Default to latest
+          const latest = this.snapshotManager.getLatestSnapshot();
+          if (!latest) return this.json({ error: "No snapshot available" }, 404);
+          const res = await this.snapshotManager.streamSnapshot(latest.anchor_id);
+          if (!res) return this.json({ error: "Snapshot not found in R2" }, 404);
+          return res;
+        }
+        const res = await this.snapshotManager.streamSnapshot(anchorId);
+        if (!res) return this.json({ error: "Snapshot not found" }, 404);
+        return res;
+      }
+
+      default:
+        return this.json({ error: "Unknown snapshot endpoint" }, 404);
+    }
+  }
+
   // ─── Anchor Routes ─────────────────────────────────────────────────────
 
   private async handleAnchorRoute(req: Request, url: URL): Promise<Response> {
@@ -2747,10 +2865,19 @@ export class PersistiaWorldV4 implements DurableObject {
         // Bootstrap from the latest anchor (for new nodes)
         const latestForBootstrap = this.anchorManager.getLatestAnchor();
         if (!latestForBootstrap) return this.json({ error: "No anchor found" }, 404);
+        const latestSnap = this.snapshotManager.getLatestSnapshot();
         return this.json({
           bundle: latestForBootstrap.bundle,
           berachain_tx: latestForBootstrap.berachain_tx,
-          instructions: "Use /dag/snapshot to get the full state after syncing to this anchor's round",
+          snapshot: latestSnap ? {
+            anchor_id: latestSnap.anchor_id,
+            finalized_seq: latestSnap.finalized_seq,
+            snapshot_hash: latestSnap.snapshot_hash,
+            byte_size: latestSnap.byte_size,
+          } : null,
+          instructions: latestSnap
+            ? "Download snapshot via /snapshot/download for fast bootstrap, then sync remaining events via /gossip/sync"
+            : "No snapshot available — sync all events via /gossip/sync",
         });
       }
 
@@ -2880,6 +3007,16 @@ export class PersistiaWorldV4 implements DurableObject {
       zkProvenBlock,
     });
 
+    // Create state snapshot at this anchor point (for fast node bootstrap)
+    const snapshot = await this.snapshotManager.createSnapshot({
+      anchorId: record.id,
+      stateRoot: effectiveRoot,
+      finalizedSeq: effectiveSeq,
+      finalizedRoot: this.finalizedRoot || effectiveRoot,
+      lastCommittedRound: this.lastCommittedRound,
+      shardName: this.shardName,
+    });
+
     // Broadcast anchor event
     this.broadcastToChannel("status", {
       type: "anchor.submitted",
@@ -2888,6 +3025,7 @@ export class PersistiaWorldV4 implements DurableObject {
       berachain_block: record.berachain_block,
       state_root: effectiveRoot,
       finalized_seq: effectiveSeq,
+      snapshot_available: !!snapshot,
     });
 
     return record;

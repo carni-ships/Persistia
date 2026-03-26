@@ -51,6 +51,11 @@ export interface SyncResponsePayload {
     round_interval_ms: number;
     max_events_per_vertex: number;
   };
+  snapshot?: {
+    anchor_id: string;
+    finalized_seq: number;
+    snapshot_hash: string;
+  };
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
