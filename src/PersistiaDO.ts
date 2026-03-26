@@ -25,6 +25,7 @@ import { AnchorManager, type AnchorConfig, type AnchorRecord } from "./anchoring
 import { ValidatorRegistry, verifyPoW } from "./validator-registry";
 import { AccountManager, pubkeyB64ToAddress, validateAddress } from "./wallet";
 import { MPPHandler, type MPPConfig } from "./mpp";
+import { computeAdaptiveInterval, type AdaptiveSignals } from "./adaptive-params";
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -60,6 +61,10 @@ export class PersistiaWorldV4 implements DurableObject {
   finalizedRoot: string = "";
   lastCommittedRound: number = -2;
   nodeUrl: string = "";
+
+  // ─── Adaptive parameters (EIP-1559 style) ───────────────────────────
+  private _consecutiveEmptyRounds: number = 0;
+  private _adaptiveEnabled: boolean = true;
 
   // ─── Incremental state commitment ──────────────────────────────────
   stateTree: IncrementalStateTree = new IncrementalStateTree();
@@ -411,7 +416,7 @@ export class PersistiaWorldV4 implements DurableObject {
   // ─── Network Config ─────────────────────────────────────────────────────
 
   private static GOVERNABLE_PARAMS: Record<string, { min: number; max: number }> = {
-    round_interval_ms: { min: 5_000, max: 600_000 },
+    round_interval_ms: { min: 1_000, max: 180_000 },
     max_events_per_vertex: { min: 5, max: 500 },
     pending_event_ttl_ms: { min: 30_000, max: 3_600_000 },
     min_nodes_for_consensus: { min: 1, max: 100 },
@@ -437,6 +442,60 @@ export class PersistiaWorldV4 implements DurableObject {
       "INSERT INTO network_config_history (param_key, old_value, new_value, changed_by, proposal_id, round, changed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
       key, oldValue, value, changedBy, proposalId || null, this.lastCommittedRound, Date.now(),
     );
+  }
+
+  // ─── Adaptive Parameter Adjustment (EIP-1559 style) ─────────────────────
+
+  /**
+   * Called after each round commit. Adjusts round_interval_ms based on:
+   *  - Vertex utilization (events included vs capacity)
+   *  - Pending event queue pressure
+   *  - ZK prover lag (proven block vs committed round)
+   *  - Consecutive empty rounds (idle network)
+   *
+   * Like EIP-1559: interval moves ±12.5% per round toward equilibrium.
+   */
+  private adjustAdaptiveParams(round: number, eventsInRound: number) {
+    if (!this._adaptiveEnabled) return;
+
+    const sql = this.state.storage.sql;
+
+    // Track consecutive empty rounds
+    if (eventsInRound === 0) {
+      this._consecutiveEmptyRounds++;
+    } else {
+      this._consecutiveEmptyRounds = 0;
+    }
+
+    const currentInterval = this.getNetworkParam("round_interval_ms", ROUND_INTERVAL_MS);
+    const maxEvents = this.getNetworkParam("max_events_per_vertex", MAX_EVENTS_PER_VERTEX);
+    const pendingEvents = this.getPendingEventCount();
+
+    // Get latest ZK-proven block
+    let latestProvenBlock = 0;
+    try {
+      const rows = [...sql.exec("SELECT MAX(block_number) as b FROM zk_proofs")];
+      latestProvenBlock = (rows[0]?.b ?? 0) as number;
+    } catch {}
+
+    const signals: AdaptiveSignals = {
+      pendingEvents,
+      maxEventsPerVertex: maxEvents,
+      eventsInLastVertex: eventsInRound,
+      currentRound: this.currentRound,
+      latestProvenBlock,
+      lastCommittedRound: this.lastCommittedRound,
+      consecutiveEmptyRounds: this._consecutiveEmptyRounds,
+    };
+
+    const bounds = PersistiaWorldV4.GOVERNABLE_PARAMS["round_interval_ms"];
+    const result = computeAdaptiveInterval(currentInterval, signals, bounds);
+
+    // Only write if actually changed (avoid spamming config history)
+    if (result.newIntervalMs !== currentInterval) {
+      this.setNetworkParam("round_interval_ms", result.newIntervalMs.toString(), "adaptive");
+      console.log(`Adaptive: round_interval_ms ${currentInterval}→${result.newIntervalMs}ms (${result.reason})`);
+    }
   }
 
   // ─── Shard-aware peer discovery ──────────────────────────────────────────
@@ -943,6 +1002,11 @@ export class PersistiaWorldV4 implements DurableObject {
           const gossipPeerCount = this.gossipManager.getHealthyPeers().length;
           const latestAnchor = this.anchorManager.getLatestAnchor();
           const validatorCount = this.validatorRegistry.getActiveCount();
+          let latestProvenStatus = 0;
+          try {
+            const rows = [...this.state.storage.sql.exec("SELECT MAX(block_number) as b FROM zk_proofs")];
+            latestProvenStatus = (rows[0]?.b ?? 0) as number;
+          } catch {}
           return this.json({
             name: "Persistia Ledger Node",
             version: "0.7.0",
@@ -959,6 +1023,12 @@ export class PersistiaWorldV4 implements DurableObject {
             quorum_threshold: this.validatorRegistry.getQuorumThreshold(),
             pow_difficulty: this.validatorRegistry.getDifficulty(),
             contracts: contractCount[0]?.c || 0,
+            round_interval_ms: this.getNetworkParam("round_interval_ms", ROUND_INTERVAL_MS),
+            adaptive: {
+              enabled: this._adaptiveEnabled,
+              prover_lag: latestProvenStatus > 0 ? this.lastCommittedRound - latestProvenStatus : null,
+              consecutive_empty_rounds: this._consecutiveEmptyRounds,
+            },
             latest_anchor: latestAnchor ? {
               id: latestAnchor.id,
               berachain_tx: latestAnchor.berachain_tx,
@@ -1509,6 +1579,30 @@ export class PersistiaWorldV4 implements DurableObject {
         return this.json({ ok: true, key, value: numValue });
       }
 
+      case "/admin/adaptive": {
+        // GET: return adaptive state. POST: enable/disable adaptive mode
+        if (req.method === "POST") {
+          const { enabled } = await req.json() as any;
+          this._adaptiveEnabled = !!enabled;
+          return this.json({ ok: true, adaptive_enabled: this._adaptiveEnabled });
+        }
+        let latestProven = 0;
+        try {
+          const rows = [...sql.exec("SELECT MAX(block_number) as b FROM zk_proofs")];
+          latestProven = (rows[0]?.b ?? 0) as number;
+        } catch {}
+        return this.json({
+          adaptive_enabled: this._adaptiveEnabled,
+          current_interval_ms: this.getNetworkParam("round_interval_ms", ROUND_INTERVAL_MS),
+          consecutive_empty_rounds: this._consecutiveEmptyRounds,
+          pending_events: this.getPendingEventCount(),
+          prover_lag: latestProven > 0 ? this.lastCommittedRound - latestProven : null,
+          latest_proven_block: latestProven || null,
+          last_committed_round: this.lastCommittedRound,
+          bounds: PersistiaWorldV4.GOVERNABLE_PARAMS["round_interval_ms"],
+        });
+      }
+
       case "/admin/config/history": {
         const sql = this.state.storage.sql;
         const history = [...sql.exec(
@@ -1545,7 +1639,23 @@ export class PersistiaWorldV4 implements DurableObject {
     switch (url.pathname) {
       case "/governance/config": {
         const params = [...sql.exec("SELECT key, value, updated_at, updated_by FROM network_config ORDER BY key")] as any[];
-        return this.json({ params: params.reduce((acc: any, r: any) => { acc[r.key] = r.value; return acc; }, {}) });
+        let latestProven = 0;
+        try {
+          const rows = [...sql.exec("SELECT MAX(block_number) as b FROM zk_proofs")];
+          latestProven = (rows[0]?.b ?? 0) as number;
+        } catch {}
+        return this.json({
+          params: params.reduce((acc: any, r: any) => { acc[r.key] = r.value; return acc; }, {}),
+          adaptive: {
+            enabled: this._adaptiveEnabled,
+            consecutive_empty_rounds: this._consecutiveEmptyRounds,
+            pending_events: this.getPendingEventCount(),
+            prover_lag: latestProven > 0 ? this.lastCommittedRound - latestProven : null,
+            latest_proven_block: latestProven || null,
+            last_committed_round: this.lastCommittedRound,
+            bounds: PersistiaWorldV4.GOVERNABLE_PARAMS["round_interval_ms"],
+          },
+        });
       }
       case "/governance/proposals": {
         const status = url.searchParams.get("status"); // null = all
@@ -3524,6 +3634,9 @@ export class PersistiaWorldV4 implements DurableObject {
       "SELECT DISTINCT author FROM dag_vertices WHERE round = ?", round,
     )].map((r: any) => r.author as string);
     this.validatorRegistry.rewardCommitParticipation(commitParticipants);
+
+    // ── Adaptive parameter adjustment (EIP-1559 style) ───────────────────
+    this.adjustAdaptiveParams(round, finalizedBroadcasts.length);
 
     console.log(`Committed round=${round} anchor=${anchorHash.slice(0, 12)} seq=${this.finalizedSeq}`);
   }
