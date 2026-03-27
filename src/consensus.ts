@@ -173,6 +173,16 @@ export function checkCommit(
     return { committed: true, anchorHash: anchor.hash, reason: `Quorum met: ${supporters.size}/${quorum}` };
   }
 
+  // Single-author fallback: if the same author created vertices in both rounds
+  // and references their own anchor, allow self-commit (solo node operation).
+  // This handles the case where sibling DOs exist but don't cross-reference.
+  if (nextRoundVertices.length > 0) {
+    const selfRef = nextRoundVertices.find(v => v.author === leaderPubkey && v.refs.includes(anchor.hash));
+    if (selfRef) {
+      return { committed: true, anchorHash: anchor.hash, reason: `Self-commit: leader authored both rounds` };
+    }
+  }
+
   return {
     committed: false,
     anchorHash: anchor.hash,

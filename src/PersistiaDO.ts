@@ -544,7 +544,7 @@ export class PersistiaWorldV4 implements DurableObject {
   private static IMMUTABLE_PARAMS = new Set(["state_hash_function"]);
 
   private setNetworkParam(key: string, value: string, changedBy: string, proposalId?: string) {
-    if (PersistiaDO.IMMUTABLE_PARAMS.has(key)) {
+    if (PersistiaWorldV4.IMMUTABLE_PARAMS.has(key)) {
       const existing = [...this.state.storage.sql.exec("SELECT value FROM network_config WHERE key = ?", key)];
       if (existing.length > 0) throw new Error(`Parameter '${key}' is immutable after genesis`);
     }
@@ -1239,6 +1239,7 @@ export class PersistiaWorldV4 implements DurableObject {
       }
 
       // 7b. Track last anchored seq for event pruning in 7o
+      const sql = this.state.storage.sql;
       const lastAnchorRows = [...sql.exec(
         "SELECT MAX(finalized_seq) as max_seq FROM anchors WHERE status IN ('submitted','confirmed')"
       )];
@@ -3999,6 +4000,7 @@ export class PersistiaWorldV4 implements DurableObject {
     // ── Persist per-block state mutations for ZK prover ─────────────────────
     // Capture dirty entries from the state tree before computeCommitment clears them.
     const blockMutations = this.stateTree.getDirtyMutations();
+    console.log(`[ZK] Round ${round}: ${blockMutations.length} mutations, ${newlyFinalizedHashes.length} events finalized`);
     if (blockMutations.length > 0) {
       const mutPlaceholders = blockMutations.map(() => "(?, ?, ?, ?)").join(", ");
       sql.exec(
