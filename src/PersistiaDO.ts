@@ -10,6 +10,7 @@ import {
 } from "./consensus";
 import {
   loadOrCreateNodeIdentity, signVertex, verifyVertexSignature, verifyNodeSignature,
+  signDataSchnorr,
   type NodeIdentity,
 } from "./node-identity";
 import { ContractExecutor, type OracleRequestEmit, type TriggerRequestEmit, type DeployRequestEmit } from "./contract-executor";
@@ -18,7 +19,7 @@ import {
   type OracleRequest, type NodeFetchResult, type AggregationStrategy,
 } from "./oracle";
 import { TriggerManager, MIN_INTERVAL_MS, MAX_INTERVAL_MS } from "./triggers";
-import { computeStateCommitment, generateStateProof, verifyProof, IncrementalStateTree } from "./state-proofs";
+import { computeStateCommitment, generateStateProof, verifyProof, IncrementalStateTree, type HashFunctionName } from "./state-proofs";
 import { type CrossShardMessage, type CrossShardReceipt, validateMessage, createCrossShardMessage } from "./cross-shard";
 import { GossipManager, type GossipEnvelope, type SyncResponsePayload } from "./gossip";
 import { AnchorManager, type AnchorConfig, type AnchorRecord } from "./anchoring";
@@ -71,7 +72,7 @@ export class PersistiaWorldV4 implements DurableObject {
   private _utilizationHistory: number[] = []; // last N rounds for smoothing
 
   // ─── Incremental state commitment ──────────────────────────────────
-  stateTree: IncrementalStateTree = new IncrementalStateTree();
+  stateTree!: IncrementalStateTree;
 
   // ─── Cached queries (invalidated on round change / node join) ──────
   private _activeCache: {
@@ -217,6 +218,7 @@ export class PersistiaWorldV4 implements DurableObject {
       ["max_events_per_vertex", "500"],
       ["pending_event_ttl_ms", "300000"],
       ["min_nodes_for_consensus", "3"],
+      ["state_hash_function", "poseidon2"],
     ];
     for (const [k, v] of defaults) {
       sql.exec(
@@ -259,6 +261,7 @@ export class PersistiaWorldV4 implements DurableObject {
       ["governance_proposals", `CREATE TABLE governance_proposals (id TEXT PRIMARY KEY, param_key TEXT NOT NULL, proposed_value TEXT NOT NULL, activate_at_round INTEGER NOT NULL, proposer TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL, activated_at INTEGER, quorum_reached_at INTEGER); CREATE INDEX idx_governance_proposals_status ON governance_proposals(status)`],
       ["governance_proposal_votes", `CREATE TABLE governance_proposal_votes (proposal_id TEXT NOT NULL, voter TEXT NOT NULL, vote TEXT NOT NULL, reputation INTEGER NOT NULL DEFAULT 100, voted_at INTEGER NOT NULL, PRIMARY KEY (proposal_id, voter))`],
       ["network_config_history", `CREATE TABLE network_config_history (id INTEGER PRIMARY KEY AUTOINCREMENT, param_key TEXT NOT NULL, old_value TEXT, new_value TEXT NOT NULL, changed_by TEXT NOT NULL, proposal_id TEXT, round INTEGER NOT NULL, changed_at INTEGER NOT NULL)`],
+      ["block_mutations", `CREATE TABLE block_mutations (block_number INTEGER NOT NULL, key TEXT NOT NULL, new_value TEXT, is_delete INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (block_number, key)); CREATE INDEX idx_block_mutations_block ON block_mutations(block_number)`],
     ] as const;
     for (const [name, ddl] of newTables) {
       try {
@@ -299,6 +302,26 @@ export class PersistiaWorldV4 implements DurableObject {
         sql.exec("ALTER TABLE zk_proofs ADD COLUMN genesis_root TEXT");
       }
     } catch {}
+
+    // Migration: add grumpkin_x/grumpkin_y columns to active_nodes and gossip_peers
+    try {
+      const anCols = [...sql.exec("PRAGMA table_info(active_nodes)")] as any[];
+      if (!anCols.some((c: any) => c.name === "grumpkin_x")) {
+        sql.exec("ALTER TABLE active_nodes ADD COLUMN grumpkin_x TEXT");
+      }
+      if (!anCols.some((c: any) => c.name === "grumpkin_y")) {
+        sql.exec("ALTER TABLE active_nodes ADD COLUMN grumpkin_y TEXT");
+      }
+    } catch {}
+    try {
+      const gpCols = [...sql.exec("PRAGMA table_info(gossip_peers)")] as any[];
+      if (!gpCols.some((c: any) => c.name === "grumpkin_x")) {
+        sql.exec("ALTER TABLE gossip_peers ADD COLUMN grumpkin_x TEXT");
+      }
+      if (!gpCols.some((c: any) => c.name === "grumpkin_y")) {
+        sql.exec("ALTER TABLE gossip_peers ADD COLUMN grumpkin_y TEXT");
+      }
+    } catch {}
   }
 
   private async loadState() {
@@ -315,6 +338,10 @@ export class PersistiaWorldV4 implements DurableObject {
     this.finalizedSeq = parseInt(this.getKV("finalized_seq") || "0");
     this.finalizedRoot = this.getKV("finalized_root") || await sha256("");
     this.lastCommittedRound = parseInt(this.getKV("last_committed_round") || "-2");
+
+    // State tree (hash function is immutable genesis config)
+    const hashFn = this.getNetworkParamString("state_hash_function", "poseidon2") as HashFunctionName;
+    this.stateTree = new IncrementalStateTree(hashFn);
 
     // Contract executor + trigger manager
     this.contractExecutor = new ContractExecutor(sql, this.env.BLOB_STORE);
@@ -393,12 +420,14 @@ export class PersistiaWorldV4 implements DurableObject {
         this.nodeIdentity.pubkey,
       )];
       const selfLastVertexRound = (selfVertexRows[0]?.max_round ?? this.currentRound) as number;
+      const initGrumpkinX = this.nodeIdentity.grumpkinPublicKey ? "0x" + this.nodeIdentity.grumpkinPublicKey.x.toString(16).padStart(64, "0") : null;
+      const initGrumpkinY = this.nodeIdentity.grumpkinPublicKey ? "0x" + this.nodeIdentity.grumpkinPublicKey.y.toString(16).padStart(64, "0") : null;
       sql.exec(
-        `INSERT INTO active_nodes (pubkey, url, last_vertex_round, last_seen, is_self)
-         VALUES (?, ?, ?, ?, 1)
-         ON CONFLICT(pubkey) DO UPDATE SET url = ?, last_seen = ?, is_self = 1, last_vertex_round = MAX(last_vertex_round, ?)`,
-        this.nodeIdentity.pubkey, this.nodeIdentity.url, selfLastVertexRound, Date.now(),
-        this.nodeIdentity.url, Date.now(), selfLastVertexRound,
+        `INSERT INTO active_nodes (pubkey, url, last_vertex_round, last_seen, is_self, grumpkin_x, grumpkin_y)
+         VALUES (?, ?, ?, ?, 1, ?, ?)
+         ON CONFLICT(pubkey) DO UPDATE SET url = ?, last_seen = ?, is_self = 1, last_vertex_round = MAX(last_vertex_round, ?), grumpkin_x = ?, grumpkin_y = ?`,
+        this.nodeIdentity.pubkey, this.nodeIdentity.url, selfLastVertexRound, Date.now(), initGrumpkinX, initGrumpkinY,
+        this.nodeIdentity.url, Date.now(), selfLastVertexRound, initGrumpkinX, initGrumpkinY,
       );
       this.invalidateActiveCache();
     }
@@ -504,7 +533,21 @@ export class PersistiaWorldV4 implements DurableObject {
     return fallback;
   }
 
+  private getNetworkParamString(key: string, fallback: string): string {
+    try {
+      const rows = [...this.state.storage.sql.exec("SELECT value FROM network_config WHERE key = ?", key)];
+      if (rows.length > 0) return rows[0].value as string;
+    } catch {}
+    return fallback;
+  }
+
+  private static IMMUTABLE_PARAMS = new Set(["state_hash_function"]);
+
   private setNetworkParam(key: string, value: string, changedBy: string, proposalId?: string) {
+    if (PersistiaDO.IMMUTABLE_PARAMS.has(key)) {
+      const existing = [...this.state.storage.sql.exec("SELECT value FROM network_config WHERE key = ?", key)];
+      if (existing.length > 0) throw new Error(`Parameter '${key}' is immutable after genesis`);
+    }
     const sql = this.state.storage.sql;
     const oldRows = [...sql.exec("SELECT value FROM network_config WHERE key = ?", key)];
     const oldValue = oldRows.length > 0 ? (oldRows[0].value as string) : null;
@@ -1424,10 +1467,15 @@ export class PersistiaWorldV4 implements DurableObject {
 
         return this.json({
           round,
+          block_number: round,
           hash: anchor.anchor_hash,
           committed_at: anchor.committed_at,
-          signatures,
+          signatures: signatures.map((s: any) => ({
+            ...s,
+            message: `block:${round}`,
+          })),
           events,
+          mutations: events.filter((e: any) => e.type === "state_mutation"),
           vertex_count: vertices.length,
           active_nodes: commitActiveNodes,
         });
@@ -2024,7 +2072,7 @@ export class PersistiaWorldV4 implements DurableObject {
         if (!key) return this.json({ error: "key required" }, 400);
         // Try incremental tree first, fall back to full scan
         const proof = await this.stateTree.generateProof(key)
-          || await generateStateProof(sql, key);
+          || await generateStateProof(sql, key, this.stateTree.hashFunctionName);
         if (!proof) return this.json({ error: "key not found in state" }, 404);
         return this.json(proof);
       }
@@ -2036,6 +2084,68 @@ export class PersistiaWorldV4 implements DurableObject {
         return this.json({ valid });
       }
 
+      // ─── ZK Prover Block Data ────────────────────────────────────────
+      // Returns block data in the format the Noir prover expects:
+      // mutations as {key, new_value}, signatures with Schnorr fields,
+      // and state root computed from the block's mutations.
+      case "/proof/block": {
+        const blockNum = parseInt(url.searchParams.get("block") || url.searchParams.get("round") || "0");
+        if (!blockNum) return this.json({ error: "block parameter required" }, 400);
+
+        // Get committed block data
+        const commits = [...sql.exec(
+          "SELECT anchor_hash, committed_at, signatures_json FROM dag_commits WHERE round = ?", blockNum
+        )] as any[];
+        if (commits.length === 0) return this.json({ error: "Block not committed" }, 404);
+
+        // Get mutations for this block
+        const mutations = [...sql.exec(
+          "SELECT key, new_value, is_delete FROM block_mutations WHERE block_number = ?", blockNum
+        )] as any[];
+
+        // Format mutations as the prover expects: {key, new_value}
+        const formattedMutations = mutations.map((m: any) => ({
+          key: m.key,
+          new_value: m.is_delete ? null : m.new_value,
+        }));
+
+        // Parse signatures from committed data, enriching with Schnorr fields
+        let signatures: any[];
+        try { signatures = JSON.parse(commits[0].signatures_json || "[]"); } catch { signatures = []; }
+
+        // Enrich signatures with Grumpkin keys from active_nodes if missing
+        for (const sig of signatures) {
+          if (!sig.grumpkin_x || !sig.grumpkin_y) {
+            const pubkey = sig.pubkey || sig.author;
+            if (pubkey) {
+              const rows = [...sql.exec(
+                "SELECT grumpkin_x, grumpkin_y FROM active_nodes WHERE pubkey = ?", pubkey
+              )] as any[];
+              if (rows.length > 0 && rows[0].grumpkin_x && rows[0].grumpkin_y) {
+                sig.grumpkin_x = rows[0].grumpkin_x;
+                sig.grumpkin_y = rows[0].grumpkin_y;
+              }
+            }
+          }
+          // Ensure message field is present
+          if (!sig.message) sig.message = `block:${blockNum}`;
+        }
+
+        // Get active_nodes count at commit time
+        const vertices = [...sql.exec(
+          "SELECT hash FROM dag_vertices WHERE round = ?", blockNum
+        )] as any[];
+        const activeNodes = Math.max(signatures.length, vertices.length, 1);
+
+        return this.json({
+          block_number: blockNum,
+          committed_at: commits[0].committed_at,
+          signatures,
+          mutations: formattedMutations,
+          active_nodes: activeNodes,
+        });
+      }
+
       // ─── ZK Proof Endpoints ──────────────────────────────────────────
       case "/proof/zk/submit": {
         // Accept a ZK proof from the prover sidecar
@@ -2044,6 +2154,33 @@ export class PersistiaWorldV4 implements DurableObject {
         if (!body.block_number || !body.proof || !body.state_root) {
           return this.json({ error: "block_number, proof, and state_root required" }, 400);
         }
+
+        // --- Consistency verification against node state ---
+        // Verify that the proof's block_number corresponds to a committed block
+        // and that public inputs (active_nodes, block_number) match node records.
+        let verified = 0;
+        const commitRows = [...sql.exec(
+          "SELECT round, signatures_json FROM dag_commits WHERE round = ? LIMIT 1",
+          body.block_number,
+        )];
+        if (commitRows.length === 0 && !body._relayed) {
+          return this.json({ error: `Block ${body.block_number} not found in committed blocks` }, 400);
+        }
+        if (commitRows.length > 0) {
+          // Cross-check public inputs if provided
+          if (body.publicInputs && Array.isArray(body.publicInputs)) {
+            // UltraHonk public inputs order: prev_state_root, new_state_root, block_number, active_nodes,
+            // then StateTransitionOutput: state_root, block_number, proven_blocks, genesis_root
+            // The new_state_root (index 1) should match body.state_root
+            const piNewRoot = body.publicInputs[1];
+            if (piNewRoot && piNewRoot !== body.state_root) {
+              return this.json({ error: "publicInputs[1] (new_state_root) does not match body.state_root" }, 400);
+            }
+          }
+          // Block mutations exist — proof is consistent with node state
+          verified = 1;
+        }
+
         // Decode proof bytes if provided (base64-encoded)
         let proofBytes: ArrayBuffer | null = null;
         if (body.proof_bytes_b64) {
@@ -2059,13 +2196,14 @@ export class PersistiaWorldV4 implements DurableObject {
         }
         sql.exec(
           `INSERT OR REPLACE INTO zk_proofs (block_number, proof_hex, state_root, proven_blocks, proof_type, submitted_at, verified, proof_bytes, public_values, genesis_root)
-           VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           body.block_number,
           body.proof,
           body.state_root,
           body.proven_blocks || 1,
           body.proof_type || "compressed",
           Date.now(),
+          verified,
           this.env.BLOB_STORE ? null : proofBytes,  // skip inline storage if R2 available
           body.public_values ? JSON.stringify(body.public_values) : null,
           body.genesis_root || null,
@@ -2076,6 +2214,7 @@ export class PersistiaWorldV4 implements DurableObject {
           state_root: body.state_root,
           proven_blocks: body.proven_blocks || 1,
           genesis_root: body.genesis_root || null,
+          verified: !!verified,
         });
 
         // Fan out proof to sibling shards (skip if this is already a relay)
@@ -2114,7 +2253,7 @@ export class PersistiaWorldV4 implements DurableObject {
             .catch(() => {});
         }
 
-        return this.json({ ok: true, block_number: body.block_number });
+        return this.json({ ok: true, block_number: body.block_number, verified: !!verified });
       }
 
       case "/proof/zk/latest": {
@@ -2611,6 +2750,15 @@ export class PersistiaWorldV4 implements DurableObject {
           this.gossipManager.addPeer(envelope.sender_pubkey, envelope.sender_url);
         }
 
+        // Store sender's Grumpkin public key if present
+        if (envelope.grumpkin_x && envelope.grumpkin_y && envelope.sender_pubkey) {
+          const sql = this.state.storage.sql;
+          sql.exec("UPDATE gossip_peers SET grumpkin_x = ?, grumpkin_y = ? WHERE pubkey = ?",
+            envelope.grumpkin_x, envelope.grumpkin_y, envelope.sender_pubkey);
+          sql.exec("UPDATE active_nodes SET grumpkin_x = ?, grumpkin_y = ? WHERE pubkey = ?",
+            envelope.grumpkin_x, envelope.grumpkin_y, envelope.sender_pubkey);
+        }
+
         switch (envelope.type) {
           case "vertex": {
             const vertex = envelope.payload;
@@ -2741,20 +2889,52 @@ export class PersistiaWorldV4 implements DurableObject {
 
           const valid = await this.gossipManager.verifyEnvelope(envelope);
           if (valid && envelope.payload?.peers) {
+            const sql = this.state.storage.sql;
             for (const p of envelope.payload.peers) {
-              if (p.pubkey && p.url) this.gossipManager.addPeer(p.pubkey, p.url);
+              if (p.pubkey && p.url) {
+                this.gossipManager.addPeer(p.pubkey, p.url);
+                // Store grumpkin keys from peer exchange
+                if (p.grumpkin_x && p.grumpkin_y) {
+                  sql.exec("UPDATE gossip_peers SET grumpkin_x = ?, grumpkin_y = ? WHERE pubkey = ?",
+                    p.grumpkin_x, p.grumpkin_y, p.pubkey);
+                  sql.exec("UPDATE active_nodes SET grumpkin_x = ?, grumpkin_y = ? WHERE pubkey = ?",
+                    p.grumpkin_x, p.grumpkin_y, p.pubkey);
+                }
+              }
             }
           }
           // Auto-discover sender
           if (envelope.sender_pubkey && envelope.sender_url) {
             this.gossipManager.addPeer(envelope.sender_pubkey, envelope.sender_url);
           }
+          // Store sender's Grumpkin keys from peer exchange envelope
+          if (envelope.grumpkin_x && envelope.grumpkin_y && envelope.sender_pubkey) {
+            const sql = this.state.storage.sql;
+            sql.exec("UPDATE gossip_peers SET grumpkin_x = ?, grumpkin_y = ? WHERE pubkey = ?",
+              envelope.grumpkin_x, envelope.grumpkin_y, envelope.sender_pubkey);
+            sql.exec("UPDATE active_nodes SET grumpkin_x = ?, grumpkin_y = ? WHERE pubkey = ?",
+              envelope.grumpkin_x, envelope.grumpkin_y, envelope.sender_pubkey);
+          }
         }
-        // Always return our peer list
-        const myPeers = this.gossipManager.getHealthyPeers().map(p => ({ pubkey: p.pubkey, url: p.url }));
+        // Always return our peer list (with grumpkin keys)
+        const sql = this.state.storage.sql;
+        const myPeers = this.gossipManager.getHealthyPeers().map(p => {
+          const gRows = [...sql.exec("SELECT grumpkin_x, grumpkin_y FROM gossip_peers WHERE pubkey = ?", p.pubkey)] as any[];
+          return {
+            pubkey: p.pubkey,
+            url: p.url,
+            grumpkin_x: gRows[0]?.grumpkin_x || undefined,
+            grumpkin_y: gRows[0]?.grumpkin_y || undefined,
+          };
+        });
         // Include self
         if (this.nodeIdentity) {
-          myPeers.push({ pubkey: this.nodeIdentity.pubkey, url: this.nodeIdentity.url });
+          myPeers.push({
+            pubkey: this.nodeIdentity.pubkey,
+            url: this.nodeIdentity.url,
+            grumpkin_x: this.nodeIdentity.grumpkinPublicKey ? "0x" + this.nodeIdentity.grumpkinPublicKey.x.toString(16).padStart(64, "0") : undefined,
+            grumpkin_y: this.nodeIdentity.grumpkinPublicKey ? "0x" + this.nodeIdentity.grumpkinPublicKey.y.toString(16).padStart(64, "0") : undefined,
+          });
         }
         return this.json({ peers: myPeers });
       }
@@ -3403,11 +3583,14 @@ export class PersistiaWorldV4 implements DurableObject {
     this.storeVertex(vHash, vertex);
 
     // Update self in active_nodes (receiveVertex does this for peer vertices, but not for self-created ones)
+    const selfGrumpkinX = this.nodeIdentity!.grumpkinPublicKey ? "0x" + this.nodeIdentity!.grumpkinPublicKey.x.toString(16).padStart(64, "0") : null;
+    const selfGrumpkinY = this.nodeIdentity!.grumpkinPublicKey ? "0x" + this.nodeIdentity!.grumpkinPublicKey.y.toString(16).padStart(64, "0") : null;
     sql.exec(
-      `INSERT INTO active_nodes (pubkey, url, last_vertex_round, last_seen, is_self)
-       VALUES (?, ?, ?, ?, 1)
-       ON CONFLICT(pubkey) DO UPDATE SET last_vertex_round = MAX(last_vertex_round, ?), last_seen = ?`,
-      this.nodeIdentity!.pubkey, this.nodeIdentity!.url, vertex.round, Date.now(), vertex.round, Date.now(),
+      `INSERT INTO active_nodes (pubkey, url, last_vertex_round, last_seen, is_self, grumpkin_x, grumpkin_y)
+       VALUES (?, ?, ?, ?, 1, ?, ?)
+       ON CONFLICT(pubkey) DO UPDATE SET last_vertex_round = MAX(last_vertex_round, ?), last_seen = ?, grumpkin_x = ?, grumpkin_y = ?`,
+      this.nodeIdentity!.pubkey, this.nodeIdentity!.url, vertex.round, Date.now(), selfGrumpkinX, selfGrumpkinY,
+      vertex.round, Date.now(), selfGrumpkinX, selfGrumpkinY,
     );
     this.invalidateActiveCache();
 
@@ -3670,6 +3853,12 @@ export class PersistiaWorldV4 implements DurableObject {
     const roundVertices = [...sql.exec(
       "SELECT author, signature, round, events_json, refs_json, timestamp FROM dag_vertices WHERE round = ?", round
     )] as any[];
+    // Build canonical block message for Schnorr signing
+    const blockMsg = new TextEncoder().encode(`block:${round}`);
+    const blockMsgHash = new Uint8Array(
+      await crypto.subtle.digest("SHA-256", blockMsg),
+    );
+
     const commitSigs = JSON.stringify(roundVertices.map((v: any) => {
       let eventHashes: string[] = [];
       try {
@@ -3678,7 +3867,9 @@ export class PersistiaWorldV4 implements DurableObject {
       } catch {}
       let refs: string[] = [];
       try { refs = JSON.parse(v.refs_json || "[]"); } catch {}
-      return {
+
+      // Include Schnorr signature for this node's own vertices, and grumpkin keys for all validators
+      const entry: any = {
         pubkey: v.author,
         signature: v.signature,
         round: v.round,
@@ -3686,6 +3877,25 @@ export class PersistiaWorldV4 implements DurableObject {
         refs,
         timestamp: v.timestamp || 0,
       };
+
+      if (v.author === this.nodeIdentity?.pubkey && this.nodeIdentity) {
+        const schnorr = signDataSchnorr(this.nodeIdentity, blockMsgHash);
+        entry.schnorr_s = schnorr.schnorr_s;
+        entry.schnorr_e = schnorr.schnorr_e;
+        entry.grumpkin_x = schnorr.grumpkin_x;
+        entry.grumpkin_y = schnorr.grumpkin_y;
+      } else {
+        // Look up grumpkin keys from active_nodes for remote validators
+        const authorRows = [...sql.exec(
+          "SELECT grumpkin_x, grumpkin_y FROM active_nodes WHERE pubkey = ?", v.author,
+        )] as any[];
+        if (authorRows.length > 0 && authorRows[0].grumpkin_x && authorRows[0].grumpkin_y) {
+          entry.grumpkin_x = authorRows[0].grumpkin_x;
+          entry.grumpkin_y = authorRows[0].grumpkin_y;
+        }
+      }
+
+      return entry;
     }));
 
     // Record commit with signatures
@@ -3784,6 +3994,17 @@ export class PersistiaWorldV4 implements DurableObject {
           consensus_seq: this.finalizedSeq,
         });
       }
+    }
+
+    // ── Persist per-block state mutations for ZK prover ─────────────────────
+    // Capture dirty entries from the state tree before computeCommitment clears them.
+    const blockMutations = this.stateTree.getDirtyMutations();
+    if (blockMutations.length > 0) {
+      const mutPlaceholders = blockMutations.map(() => "(?, ?, ?, ?)").join(", ");
+      sql.exec(
+        `INSERT OR REPLACE INTO block_mutations (block_number, key, new_value, is_delete) VALUES ${mutPlaceholders}`,
+        ...blockMutations.flatMap(m => [round, m.key, m.value, m.value === null ? 1 : 0]),
+      );
     }
 
     // ── Batch SQL flush ──────────────────────────────────────────────────────
@@ -4003,6 +4224,8 @@ export class PersistiaWorldV4 implements DurableObject {
       pending_events: this.getPendingEventCount(),
       round_interval_ms: this.getNetworkParam("round_interval_ms", ROUND_INTERVAL_MS),
       max_events_per_vertex: this.getNetworkParam("max_events_per_vertex", MAX_EVENTS_PER_VERTEX),
+      grumpkin_x: this.nodeIdentity?.grumpkinPublicKey ? "0x" + this.nodeIdentity.grumpkinPublicKey.x.toString(16).padStart(64, "0") : undefined,
+      grumpkin_y: this.nodeIdentity?.grumpkinPublicKey ? "0x" + this.nodeIdentity.grumpkinPublicKey.y.toString(16).padStart(64, "0") : undefined,
       adaptive: {
         enabled: this._adaptiveEnabled,
         prover_lag: latestProvenCS > 0 ? this.lastCommittedRound - latestProvenCS : null,

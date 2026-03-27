@@ -3,61 +3,56 @@
 // Transforms Persistia node API responses into the fixed-size witness
 // format that the Noir circuit expects. All arrays are padded to their
 // compile-time maximums with disabled sentinel entries.
+//
+// Schnorr signatures on Grumpkin curve via @aztec/bb.js.
+// Poseidon2 Merkle tree with Field-typed keys/values.
 
 import { createHash } from "crypto";
+import { Barretenberg } from "@aztec/bb.js";
 
-const MAX_VALIDATORS = 16;
-const MAX_MUTATIONS = 128;
-const MAX_BATCH_SIZE = 8;
-const MAX_MSG_LEN = 512;
+const MAX_VALIDATORS = 4;
+const MAX_MUTATIONS = 32;
+const VK_SIZE = 115;
+const PROOF_SIZE = 449;
+const PUBLIC_INPUTS_SIZE = 8;
 
-// ─── Types matching the Noir circuit structs ─────────────────────────────────
+// --- Types matching the Noir circuit structs ---
 
 interface NodeSignatureWitness {
-  pubkey: number[];       // [u8; 32]
-  signature: number[];    // [u8; 64]
-  message: number[];      // [u8; MAX_MSG_LEN]
-  msg_len: number;
+  pubkey_x: string;      // Field as hex string
+  pubkey_y: string;      // Field as hex string
+  signature: number[];   // [u8; 64] -- [s(32) || e(32)]
+  msg: number[];         // [u8; 32] -- SHA-256 hash of block data
   enabled: boolean;
 }
 
 interface StateMutationWitness {
-  key: number[];          // [u8; 32] — SHA-256 of logical key
-  new_value: number[];    // [u8; 32] — SHA-256 of value
+  key: string;           // Field as hex/decimal string
+  new_value: string;     // Field as hex/decimal string
   is_delete: boolean;
   enabled: boolean;
 }
 
-interface BlockEvidenceWitness {
-  block_number: number;
-  new_state_root: number[];
-  mutations: StateMutationWitness[];
-  mutation_count: number;
-  signatures: NodeSignatureWitness[];
-  sig_count: number;
-  active_nodes: number;
-  enabled: boolean;
-}
-
 export interface CircuitWitness {
-  // Private inputs
   mutations: StateMutationWitness[];
   mutation_count: number;
   signatures: NodeSignatureWitness[];
   sig_count: number;
-  batch_blocks: BlockEvidenceWitness[];
-  batch_count: number;
-  recursive: boolean;
   prev_proven_blocks: number;
-  prev_genesis_root: number[];
+  prev_genesis_root: string;
+  // Recursive proof inputs (zeroed when ENABLE_RECURSIVE=false in circuit)
+  prev_proof: string[];
+  prev_vk: string[];
+  prev_key_hash: string;
+  prev_public_inputs: string[];
   // Public inputs
-  prev_state_root: number[];
-  new_state_root: number[];
+  prev_state_root: string;
+  new_state_root: string;
   block_number: number;
   active_nodes: number;
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// --- Helpers ---
 
 function hexToBytes(hex: string): number[] {
   const bytes: number[] = [];
@@ -66,6 +61,10 @@ function hexToBytes(hex: string): number[] {
     bytes.push(parseInt(clean.substring(i, i + 2), 16));
   }
   return bytes;
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+  return "0x" + Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
 function sha256Hash(data: Buffer | Uint8Array): number[] {
@@ -78,175 +77,316 @@ function padArray(arr: number[], targetLen: number): number[] {
   return result.slice(0, targetLen);
 }
 
-function emptySignature(): NodeSignatureWitness {
-  return {
-    pubkey: new Array(32).fill(0),
-    signature: new Array(64).fill(0),
-    message: new Array(MAX_MSG_LEN).fill(0),
-    msg_len: 0,
-    enabled: false,
-  };
+// --- Poseidon2 Merkle Root (matches Noir circuit) ---
+
+function fieldToBytes(field: string | bigint): Uint8Array {
+  const n = typeof field === "string" ? BigInt(field) : field;
+  const hex = n.toString(16).padStart(64, "0");
+  const bytes = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) {
+    bytes[i] = parseInt(hex.substring(i * 2, i * 2 + 2), 16);
+  }
+  return bytes;
 }
 
-function emptyMutation(): StateMutationWitness {
+async function poseidon2Hash(inputs: (string | bigint)[]): Promise<string> {
+  const bb = await getBb();
+  const fieldInputs = inputs.map(fieldToBytes);
+  const { hash } = await bb.poseidon2Hash({ inputs: fieldInputs });
+  return bytesToHex(hash);
+}
+
+async function poseidon2LeafHash(key: string, value: string): Promise<string> {
+  return poseidon2Hash(["1", key, value]);
+}
+
+async function poseidon2NodeHash(left: string, right: string): Promise<string> {
+  return poseidon2Hash(["2", left, right]);
+}
+
+/** Compute Poseidon2 Merkle root matching the Noir circuit's compute_merkle_root(). */
+export async function computePoseidon2MerkleRoot(
+  mutations: StateMutationWitness[],
+): Promise<string> {
+  const hashes: string[] = [];
+
+  for (const mut of mutations) {
+    if (mut.enabled && !mut.is_delete) {
+      hashes.push(await poseidon2LeafHash(mut.key, mut.new_value));
+    }
+  }
+
+  if (hashes.length === 0) {
+    return poseidon2Hash(["0"]);
+  }
+  if (hashes.length === 1) {
+    return hashes[0];
+  }
+
+  // Pad to next power of 2 with last hash (matches Noir circuit)
+  let p2 = 1;
+  while (p2 < hashes.length) p2 *= 2;
+  const lastHash = hashes[hashes.length - 1];
+  while (hashes.length < p2) hashes.push(lastHash);
+
+  // Binary tree reduction
+  let sz = p2;
+  while (sz > 1) {
+    const half = sz / 2;
+    for (let j = 0; j < half; j++) {
+      hashes[j] = await poseidon2NodeHash(hashes[j * 2], hashes[j * 2 + 1]);
+    }
+    sz = half;
+  }
+
+  return hashes[0];
+}
+
+// --- Schnorr Signing ---
+
+let _bb: Barretenberg | null = null;
+
+async function getBb(): Promise<Barretenberg> {
+  if (!_bb) {
+    _bb = await Barretenberg.new();
+  }
+  return _bb;
+}
+
+// Noir evaluates all branches at the circuit level. Disabled signature slots
+// still run through schnorr::verify_signature, so we need valid dummy sigs.
+let _dummySig: NodeSignatureWitness | null = null;
+
+async function getDummySignature(): Promise<NodeSignatureWitness> {
+  if (_dummySig) return _dummySig;
+  const bb = await getBb();
+  const dummyKey = new Uint8Array(32);
+  dummyKey[31] = 0xff;
+  const dummyMsg = new Uint8Array(32);
+  const { publicKey } = await bb.schnorrComputePublicKey({ privateKey: dummyKey });
+  const { s, e } = await bb.schnorrConstructSignature({ message: dummyMsg, privateKey: dummyKey });
+  _dummySig = {
+    pubkey_x: bytesToHex(publicKey.x),
+    pubkey_y: bytesToHex(publicKey.y),
+    signature: [...Array.from(s), ...Array.from(e)],
+    msg: Array.from(dummyMsg),
+    enabled: false,
+  };
+  return _dummySig;
+}
+
+export function emptyMutation(): StateMutationWitness {
   return {
-    key: new Array(32).fill(0),
-    new_value: new Array(32).fill(0),
+    key: "0",
+    new_value: "0",
     is_delete: false,
     enabled: false,
   };
 }
 
-function emptyBlockEvidence(): BlockEvidenceWitness {
-  return {
-    block_number: 0,
-    new_state_root: new Array(32).fill(0),
-    mutations: Array.from({ length: MAX_MUTATIONS }, emptyMutation),
-    mutation_count: 0,
-    signatures: Array.from({ length: MAX_VALIDATORS }, emptySignature),
-    sig_count: 0,
-    active_nodes: 0,
-    enabled: false,
-  };
+/** Sign a message with a Grumpkin private key using Barretenberg's Schnorr. */
+export async function schnorrSign(
+  privateKey: Uint8Array,
+  message: Uint8Array,
+): Promise<{ s: Uint8Array; e: Uint8Array; pubkey: { x: Uint8Array; y: Uint8Array } }> {
+  const bb = await getBb();
+  const { publicKey } = await bb.schnorrComputePublicKey({ privateKey });
+  const { s, e } = await bb.schnorrConstructSignature({ message, privateKey });
+  return { s, e, pubkey: publicKey };
 }
 
-// ─── API Types (from Persistia node) ─────────────────────────────────────────
+// --- API Types (from Persistia node) ---
 
 interface ApiSignature {
-  pubkey: string;      // hex
-  signature: string;   // hex or base64
-  message: string;     // JSON string
+  pubkey: string;
+  signature: string;
+  message: string;
+  schnorr_s?: string;
+  schnorr_e?: string;
+  grumpkin_x?: string;
+  grumpkin_y?: string;
 }
 
 interface ApiMutation {
-  key: string;         // logical key string
+  key: string;
   old_value?: string;
   new_value?: string;
 }
 
 interface ApiBlock {
   block_number: number;
-  state_root: string;
+  state_root?: string;
   mutations: ApiMutation[];
   signatures: ApiSignature[];
   active_nodes: number;
 }
 
-// ─── Witness Builders ────────────────────────────────────────────────────────
+// --- Witness Builders ---
 
-function buildSignatureWitness(sig: ApiSignature): NodeSignatureWitness {
-  const pubkey = hexToBytes(sig.pubkey);
-  const sigBytes = sig.signature.length === 128
-    ? hexToBytes(sig.signature)  // hex-encoded
-    : Array.from(Buffer.from(sig.signature, "base64")); // base64
+async function buildSignatureWitness(sig: ApiSignature): Promise<NodeSignatureWitness> {
+  const msgBytes = Buffer.from(sig.message, "utf-8");
+  const msgHash = sha256Hash(msgBytes);
 
-  const msgBytes = Array.from(Buffer.from(sig.message, "utf-8"));
+  if (sig.grumpkin_x && sig.grumpkin_y && sig.schnorr_s && sig.schnorr_e) {
+    const s = hexToBytes(sig.schnorr_s);
+    const e = hexToBytes(sig.schnorr_e);
+    return {
+      pubkey_x: sig.grumpkin_x,
+      pubkey_y: sig.grumpkin_y,
+      signature: [...padArray(s, 32), ...padArray(e, 32)],
+      msg: msgHash,
+      enabled: true,
+    };
+  }
 
-  return {
-    pubkey: padArray(pubkey, 32),
-    signature: padArray(sigBytes, 64),
-    message: padArray(msgBytes, MAX_MSG_LEN),
-    msg_len: msgBytes.length,
-    enabled: true,
-  };
+  throw new Error(
+    "Node must provide Schnorr signature fields (grumpkin_x, grumpkin_y, schnorr_s, schnorr_e). " +
+    "Use buildTestWitness() for testing with generated keys."
+  );
 }
 
-function buildMutationWitness(mut: ApiMutation): StateMutationWitness {
-  const keyHash = sha256Hash(Buffer.from(mut.key, "utf-8"));
+export function buildMutationWitness(mut: ApiMutation): StateMutationWitness {
+  // Convert string key/value to Field by hashing with SHA-256 and interpreting
+  // the first 31 bytes as a BN254 field element (to stay within field range)
+  const keyHash = createHash("sha256").update(mut.key).digest();
+  const keyField = "0x00" + keyHash.subarray(0, 31).toString("hex");
+
   const isDelete = mut.new_value == null;
-  const valueHash = isDelete
-    ? new Array(32).fill(0)
-    : sha256Hash(Buffer.from(mut.new_value!, "utf-8"));
+  const valueField = isDelete
+    ? "0"
+    : "0x00" + createHash("sha256").update(mut.new_value!).digest().subarray(0, 31).toString("hex");
 
   return {
-    key: keyHash,
-    new_value: valueHash,
+    key: keyField,
+    new_value: valueField,
     is_delete: isDelete,
     enabled: true,
   };
 }
 
 /** Build witness for a single-block proof. */
-export function buildSingleBlockWitness(
+export async function buildSingleBlockWitness(
   block: ApiBlock,
   prevStateRoot: string,
-  opts?: { recursive?: boolean; prevProvenBlocks?: number; prevGenesisRoot?: string },
-): CircuitWitness {
-  const sigs = block.signatures.map(buildSignatureWitness);
-  while (sigs.length < MAX_VALIDATORS) sigs.push(emptySignature());
+  opts?: {
+    prevProvenBlocks?: number;
+    prevGenesisRoot?: string;
+    prevProof?: string[];
+    prevVk?: string[];
+    prevKeyHash?: string;
+    prevPublicInputs?: string[];
+  },
+): Promise<CircuitWitness> {
+  const sigs: NodeSignatureWitness[] = [];
+  for (const sig of block.signatures) {
+    sigs.push(await buildSignatureWitness(sig));
+  }
+  const dummy = await getDummySignature();
+  while (sigs.length < MAX_VALIDATORS) sigs.push({ ...dummy });
 
   const muts = block.mutations.map(buildMutationWitness);
   while (muts.length < MAX_MUTATIONS) muts.push(emptyMutation());
 
+  const mutSlice = muts.slice(0, MAX_MUTATIONS);
+
+  // Compute Poseidon2 Merkle root to match circuit's computed root
+  const computedRoot = await computePoseidon2MerkleRoot(mutSlice);
+
   return {
-    mutations: muts.slice(0, MAX_MUTATIONS),
+    mutations: mutSlice,
     mutation_count: block.mutations.length,
     signatures: sigs.slice(0, MAX_VALIDATORS),
     sig_count: block.signatures.length,
-    batch_blocks: Array.from({ length: MAX_BATCH_SIZE }, emptyBlockEvidence),
-    batch_count: 0,
-    recursive: opts?.recursive ?? false,
     prev_proven_blocks: opts?.prevProvenBlocks ?? 0,
-    prev_genesis_root: opts?.prevGenesisRoot
-      ? hexToBytes(opts.prevGenesisRoot)
-      : new Array(32).fill(0),
-    prev_state_root: hexToBytes(prevStateRoot),
-    new_state_root: hexToBytes(block.state_root),
+    prev_genesis_root: opts?.prevGenesisRoot ?? "0",
+    prev_proof: opts?.prevProof ?? new Array(PROOF_SIZE).fill("0"),
+    prev_vk: opts?.prevVk ?? new Array(VK_SIZE).fill("0"),
+    prev_key_hash: opts?.prevKeyHash ?? "0",
+    prev_public_inputs: opts?.prevPublicInputs ?? new Array(PUBLIC_INPUTS_SIZE).fill("0"),
+    prev_state_root: prevStateRoot,
+    new_state_root: computedRoot,
     block_number: block.block_number,
     active_nodes: block.active_nodes,
   };
 }
 
-/** Build witness for a batch proof (multiple blocks in one proof). */
-export function buildBatchWitness(
-  blocks: ApiBlock[],
-  prevStateRoot: string,
-  opts?: { recursive?: boolean; prevProvenBlocks?: number; prevGenesisRoot?: string },
-): CircuitWitness {
-  if (blocks.length > MAX_BATCH_SIZE) {
-    throw new Error(`Batch too large: ${blocks.length} > ${MAX_BATCH_SIZE}`);
-  }
+/**
+ * Build a test witness with generated Schnorr signatures.
+ * Uses random Grumpkin keys -- for benchmarking and testing only.
+ */
+export async function buildTestWitness(opts?: {
+  numValidators?: number;
+  numMutations?: number;
+  blockNumber?: number;
+}): Promise<CircuitWitness> {
+  const bb = await getBb();
+  const numValidators = opts?.numValidators ?? 1;
+  const numMutations = opts?.numMutations ?? 1;
+  const blockNumber = opts?.blockNumber ?? 1;
 
-  const batchBlocks: BlockEvidenceWitness[] = blocks.map((block) => {
-    const sigs = block.signatures.map(buildSignatureWitness);
-    while (sigs.length < MAX_VALIDATORS) sigs.push(emptySignature());
+  const sigs: NodeSignatureWitness[] = [];
+  const blockMsg = Buffer.from(`block:${blockNumber}`, "utf-8");
+  const msgHash = sha256Hash(blockMsg);
 
-    const muts = block.mutations.map(buildMutationWitness);
-    while (muts.length < MAX_MUTATIONS) muts.push(emptyMutation());
+  for (let i = 0; i < numValidators; i++) {
+    const privateKey = new Uint8Array(32);
+    privateKey[31] = i + 1;
 
-    return {
-      block_number: block.block_number,
-      new_state_root: hexToBytes(block.state_root),
-      mutations: muts.slice(0, MAX_MUTATIONS),
-      mutation_count: block.mutations.length,
-      signatures: sigs.slice(0, MAX_VALIDATORS),
-      sig_count: block.signatures.length,
-      active_nodes: block.active_nodes,
+    const { publicKey } = await bb.schnorrComputePublicKey({ privateKey });
+    const { s, e } = await bb.schnorrConstructSignature({
+      message: new Uint8Array(msgHash),
+      privateKey,
+    });
+
+    sigs.push({
+      pubkey_x: bytesToHex(publicKey.x),
+      pubkey_y: bytesToHex(publicKey.y),
+      signature: [...Array.from(s), ...Array.from(e)],
+      msg: msgHash,
       enabled: true,
-    };
-  });
-
-  while (batchBlocks.length < MAX_BATCH_SIZE) {
-    batchBlocks.push(emptyBlockEvidence());
+    });
   }
+  const dummy = await getDummySignature();
+  while (sigs.length < MAX_VALIDATORS) sigs.push({ ...dummy });
 
-  const lastBlock = blocks[blocks.length - 1];
+  const muts: StateMutationWitness[] = [];
+  for (let i = 0; i < numMutations; i++) {
+    muts.push({
+      key: `${i + 1}`,
+      new_value: `${(i + 1) * 100}`,
+      is_delete: false,
+      enabled: true,
+    });
+  }
+  while (muts.length < MAX_MUTATIONS) muts.push(emptyMutation());
+
+  const mutSlice = muts.slice(0, MAX_MUTATIONS);
+
+  // Compute Poseidon2 Merkle root to match circuit's computed root
+  const computedRoot = await computePoseidon2MerkleRoot(mutSlice);
 
   return {
-    mutations: Array.from({ length: MAX_MUTATIONS }, emptyMutation),
-    mutation_count: 0,
-    signatures: Array.from({ length: MAX_VALIDATORS }, emptySignature),
-    sig_count: 0,
-    batch_blocks: batchBlocks.slice(0, MAX_BATCH_SIZE),
-    batch_count: blocks.length,
-    recursive: opts?.recursive ?? false,
-    prev_proven_blocks: opts?.prevProvenBlocks ?? 0,
-    prev_genesis_root: opts?.prevGenesisRoot
-      ? hexToBytes(opts.prevGenesisRoot)
-      : new Array(32).fill(0),
-    prev_state_root: hexToBytes(prevStateRoot),
-    new_state_root: hexToBytes(lastBlock.state_root),
-    block_number: lastBlock.block_number,
-    active_nodes: lastBlock.active_nodes,
+    mutations: mutSlice,
+    mutation_count: numMutations,
+    signatures: sigs.slice(0, MAX_VALIDATORS),
+    sig_count: numValidators,
+    prev_proven_blocks: 0,
+    prev_genesis_root: "0",
+    prev_proof: new Array(PROOF_SIZE).fill("0"),
+    prev_vk: new Array(VK_SIZE).fill("0"),
+    prev_key_hash: "0",
+    prev_public_inputs: new Array(PUBLIC_INPUTS_SIZE).fill("0"),
+    prev_state_root: "0xaa",
+    new_state_root: computedRoot,
+    block_number: blockNumber,
+    active_nodes: numValidators,
   };
+}
+
+/** Clean up Barretenberg instance. */
+export async function destroyBb(): Promise<void> {
+  if (_bb) {
+    await _bb.destroy();
+    _bb = null;
+  }
 }

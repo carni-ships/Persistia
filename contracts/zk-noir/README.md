@@ -1,42 +1,47 @@
-# Persistia ZK Proofs — Noir Circuit
+# Persistia ZK Proofs -- Noir Circuit
 
-Alternative ZK proof system using [Noir](https://noir-lang.org/) + Barretenberg backend.
+Alternative ZK proof system using [Noir](https://noir-lang.org/) + Barretenberg UltraHonk backend.
 Drop-in replacement for the SP1 prover at `../zk/`.
 
-## Why Noir over SP1?
+## Performance
 
-| | SP1 (current) | Noir (this) |
-|---|---|---|
-| **Proving time** | ~60-90s/block (local) | Target: 2-10s/block |
-| **Proof size** | ~200KB (STARK) | ~few hundred bytes (SNARK) |
-| **On-chain verify** | Requires Groth16 wrap | Native Solidity verifier |
-| **Recursion** | IVC via RISC-V zkVM | Native `verify_proof` |
-| **Flexibility** | Any Rust program | Fixed circuit (sufficient for us) |
+| Metric | SP1 (current) | Noir (this) |
+|--------|---------------|-------------|
+| **Proving time** | ~60-90s/block | **0.84s** native, 5.3s WASM |
+| **Proof size** | ~200KB (STARK) | **16 KB** (UltraHonk) |
+| **Verification** | Requires Groth16 wrap | native verify built-in, 1.6s WASM |
+| **On-chain verify** | Complex | Native Solidity verifier (2.4K LOC) |
+| **Signatures** | Ed25519 | Schnorr on Grumpkin (~150 gates/sig) |
+| **Merkle hash** | SHA-256 | Poseidon2 (~20 gates/hash) |
+| **Circuit size** | N/A | 6,951 ACIR opcodes, 769K gates (with recursion) |
+| **Speedup** | 1x | **~85x faster** (native) |
 
 ## Structure
 
 ```
 zk-noir/
-├── Nargo.toml           # Noir project config
-├── src/
-│   └── main.nr          # The circuit (state transition proof)
-├── prover/
-│   ├── package.json
-│   └── src/
-│       ├── prover.ts    # CLI prover (replaces SP1 prover binary)
-│       ├── witness.ts   # Witness generation from node API
-│       └── gen-verifier.ts  # Solidity verifier codegen
-└── README.md
++-- Nargo.toml               # Noir project config
++-- src/
+|   +-- main.nr               # The circuit (state transition proof)
++-- prover/
+|   +-- package.json
+|   +-- gen_test_witness.mjs   # Generate Prover.toml with Schnorr test sigs
+|   +-- src/
+|       +-- bench.mjs          # Benchmark script
+|       +-- witness.ts         # Witness generation (Schnorr via @aztec/bb.js)
+|       +-- prover.ts          # CLI prover
++-- target/
+|   +-- PersistiaVerifier.sol  # Generated Solidity verifier
++-- README.md
 ```
 
 ## Prerequisites
 
 ```bash
-# Install Noir toolchain
+# Install Noir toolchain (>= 1.0.0-beta.19)
 curl -L https://raw.githubusercontent.com/noir-lang/noirup/refs/heads/main/install | bash
 noirup
 
-# Verify
 nargo --version
 ```
 
@@ -47,89 +52,80 @@ nargo --version
 cd contracts/zk-noir
 nargo compile
 
-# 2. Run tests
+# 2. Run tests (6 tests: quorum, Poseidon2 Merkle, Schnorr verification)
 nargo test
 
 # 3. Install prover dependencies
 cd prover && npm install
 
-# 4. Execute without proof (test witness generation)
-npm run execute -- --node https://persistia.YOUR_DOMAIN --block 100
+# 4. Generate test witness with Schnorr signatures
+node gen_test_witness.mjs && mv Prover.toml ../Prover.toml
 
-# 5. Generate a real proof
-npm run prove -- --node https://persistia.YOUR_DOMAIN --block 100
+# 5. Execute (witness solve, no proof)
+cd .. && nargo execute
 
-# 6. Verify it
-npm run verify -- --proof proof.json
+# 6. Prove with native bb CLI (bundled in @aztec/bb.js)
+BB=prover/node_modules/@aztec/bb.js/build/arm64-macos/bb
+$BB write_vk -b target/persistia_state_proof.json -o target/vk
+$BB prove -b target/persistia_state_proof.json \
+  -w target/persistia_state_proof.gz \
+  -o target/proof -k target/vk/vk --verify
 
-# 7. Benchmark against SP1
-npm run bench -- --node https://persistia.YOUR_DOMAIN --block 100
-```
-
-## Watch Mode (Continuous Proving)
-
-```bash
-# Single-block proofs, 10s poll interval
-npm run watch -- --node https://persistia.YOUR_DOMAIN
-
-# Batch 4 blocks per proof, 30s interval
-npm run watch -- --node https://persistia.YOUR_DOMAIN --batch 4 --interval 30
-```
-
-## Solidity Verifier (On-Chain Anchoring)
-
-```bash
-# Generate the verifier contract
-tsx prover/src/gen-verifier.ts --output contracts/PersistiaVerifier.sol
-
-# Deploy to Berachain and call:
-#   verifier.verify(proof, [prev_state_root, new_state_root, block_number, active_nodes])
+# 7. Benchmark (WASM)
+cd prover && node src/bench.mjs
 ```
 
 ## Circuit Details
 
-The Noir circuit proves the same things as the SP1 guest program:
+### What it proves
 
-1. **BFT Quorum** — Verifies Ed25519 signatures from ≥2f+1 validators
-2. **State Merkle** — SHA-256 Merkle tree over state mutations matches declared root
-3. **Recursion** — Previous proof in the IVC chain is valid (when enabled)
+1. **BFT Quorum** -- Schnorr signatures on Grumpkin from >= 2f+1 validators
+2. **State Merkle** -- Poseidon2 Merkle tree over state mutations (root verified against public input)
+3. **Recursion** -- Previous proof in the IVC chain is valid via `std::verify_proof_with_type`
+
+### Cryptographic primitives
+
+| Primitive | Implementation | Cost |
+|-----------|---------------|------|
+| Signatures | Schnorr on Grumpkin (BN254 embedded) | ~150 gates/sig |
+| Merkle hash | Poseidon2 sponge | ~20 gates/hash |
+| Challenge derivation | Pedersen + BLAKE2s | native to Barretenberg |
 
 ### Fixed-Size Bounds
 
-Noir circuits are fixed-size at compile time. Current bounds:
+| Parameter | Value |
+|-----------|-------|
+| `MAX_VALIDATORS` | 4 |
+| `MAX_MUTATIONS` | 32 |
 
-| Parameter | Value | Notes |
-|-----------|-------|-------|
-| `MAX_VALIDATORS` | 16 | Validator signatures per block |
-| `MAX_MUTATIONS` | 128 | State mutations per block |
-| `MAX_BATCH_SIZE` | 8 | Blocks per batch proof |
-| `MAX_MSG_LEN` | 512 | Ed25519 message length |
+Unused signature slots are padded with valid dummy Schnorr signatures (required
+because Noir evaluates all circuit branches regardless of conditional logic).
 
-Unused slots are padded with `enabled: false` sentinels and skipped in-circuit.
+## Solidity Verifier
 
-## Recursive Proofs
+```bash
+# Generate EVM-targeted verifier
+BB=prover/node_modules/@aztec/bb.js/build/arm64-macos/bb
+$BB write_vk -b target/persistia_state_proof.json -o target/vk_evm -t evm
+$BB write_solidity_verifier -k target/vk_evm/vk -o target/PersistiaVerifier.sol -t evm
 
-Noir supports native recursive verification via `std::verify_proof()`. The recursive
-path in `main.nr` is scaffolded but commented out — it requires the circuit's
-verification key, which is only available after first compilation.
+# Deploy and call:
+#   verifier.verify(proof, publicInputs)
+```
 
-To enable recursion:
+## Optimization History
 
-1. Compile: `nargo compile`
-2. Extract the verification key from the compiled artifact
-3. Uncomment the `std::verify_proof()` call in `main.nr`
-4. Pass `prev_verification_key` and `prev_proof` as witness inputs
-5. Recompile
+| Phase | Change | Opcodes | Gates | Prove Time |
+|-------|--------|---------|-------|------------|
+| Initial | ECDSA secp256k1 + SHA-256 (16 sigs, 64 muts) | 3.8M | N/A | OOM |
+| Phase 0 | Right-size (4 sigs, 32 muts, no batch) | 288K | 2M | 8.6s |
+| Phase 1 | Schnorr on Grumpkin (replaces ECDSA) | 288K | 2M | 8.6s |
+| Phase 4a | Poseidon2 Merkle (replaces SHA-256) | **4,262** | **46K** | **0.45s** |
+| Phase 3 | Recursive proof verification (IVC chain) | **6,951** | **769K** | **0.84s** native |
 
-## Migration from SP1
+## Future Work
 
-The prover CLI mirrors the SP1 prover's interface:
-
-| SP1 Command | Noir Equivalent |
-|-------------|-----------------|
-| `persistia-prover execute --block N` | `npm run execute -- --block N` |
-| `persistia-prover prove --block N` | `npm run prove -- --block N` |
-| `persistia-prover verify --proof X` | `npm run verify -- --proof X` |
-| `persistia-prover watch` | `npm run watch` |
-
-The node API endpoints (`/proof/block/N`, `/proof/zk/submit`) are unchanged.
+- **Batch mode**: Re-add batch proving with recursive sub-batch verification
+- **Rolling Merkle**: Path-based updates instead of full tree recomputation
+- **Node migration**: Update Persistia node to produce Schnorr/Grumpkin signatures
+- **GPU/Metal acceleration**: Investigate Barretenberg Metal support for MSM on Apple Silicon

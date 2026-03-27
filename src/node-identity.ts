@@ -3,6 +3,14 @@
 // Used to sign DAG vertices and authenticate with peers.
 
 import { sha256 } from "./consensus";
+import {
+  generateGrumpkinKeyPair,
+  getPublicKey as getGrumpkinPublicKey,
+  schnorrSign,
+  fieldToBytes,
+  bytesToField,
+  type SchnorrSignature,
+} from "./grumpkin-schnorr";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -24,6 +32,9 @@ export interface NodeIdentity {
   privateKey: CryptoKey;
   publicKey: CryptoKey;
   url: string;
+  // Grumpkin/Schnorr keys for ZK circuit compatibility
+  grumpkinPrivateKey: Uint8Array;
+  grumpkinPublicKey: { x: bigint; y: bigint };
 }
 
 // ─── Key Management ───────────────────────────────────────────────────────────
@@ -35,7 +46,15 @@ export async function loadOrCreateNodeIdentity(
   sql: any,
   nodeUrl: string,
 ): Promise<NodeIdentity> {
-  const rows = [...sql.exec("SELECT pubkey, privkey_encrypted, node_url FROM node_identity LIMIT 1")];
+  // Migration: add grumpkin_privkey column if missing
+  try {
+    const cols = [...sql.exec("PRAGMA table_info(node_identity)")] as any[];
+    if (!cols.some((c: any) => c.name === "grumpkin_privkey")) {
+      sql.exec("ALTER TABLE node_identity ADD COLUMN grumpkin_privkey TEXT");
+    }
+  } catch {}
+
+  const rows = [...sql.exec("SELECT pubkey, privkey_encrypted, node_url, grumpkin_privkey FROM node_identity LIMIT 1")];
 
   if (rows.length > 0) {
     const row = rows[0] as any;
@@ -50,10 +69,24 @@ export async function loadOrCreateNodeIdentity(
       sql.exec("UPDATE node_identity SET node_url = ?", nodeUrl);
     }
 
-    return { pubkey: row.pubkey, privateKey, publicKey, url: nodeUrl || row.node_url };
+    // Load or generate Grumpkin keypair
+    let grumpkinPrivateKey: Uint8Array;
+    let grumpkinPublicKey: { x: bigint; y: bigint };
+
+    if (row.grumpkin_privkey) {
+      grumpkinPrivateKey = b64ToBytes(row.grumpkin_privkey);
+      grumpkinPublicKey = getGrumpkinPublicKey(grumpkinPrivateKey);
+    } else {
+      const kp = generateGrumpkinKeyPair();
+      grumpkinPrivateKey = kp.privateKey;
+      grumpkinPublicKey = kp.publicKey;
+      sql.exec("UPDATE node_identity SET grumpkin_privkey = ?", bytesToB64(grumpkinPrivateKey));
+    }
+
+    return { pubkey: row.pubkey, privateKey, publicKey, url: nodeUrl || row.node_url, grumpkinPrivateKey, grumpkinPublicKey };
   }
 
-  // Generate new keypair
+  // Generate new keypairs (Ed25519 + Grumpkin)
   const keyPair = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]);
   const pubRaw = await crypto.subtle.exportKey("raw", keyPair.publicKey);
   const privPkcs8 = await crypto.subtle.exportKey("pkcs8", keyPair.privateKey);
@@ -61,9 +94,11 @@ export async function loadOrCreateNodeIdentity(
   const pubkeyB64 = bytesToB64(new Uint8Array(pubRaw));
   const privB64 = bytesToB64(new Uint8Array(privPkcs8));
 
+  const grumpkinKp = generateGrumpkinKeyPair();
+
   sql.exec(
-    "INSERT INTO node_identity (pubkey, privkey_encrypted, node_url, created_at) VALUES (?, ?, ?, ?)",
-    pubkeyB64, privB64, nodeUrl, Date.now(),
+    "INSERT INTO node_identity (pubkey, privkey_encrypted, node_url, grumpkin_privkey, created_at) VALUES (?, ?, ?, ?, ?)",
+    pubkeyB64, privB64, nodeUrl, bytesToB64(grumpkinKp.privateKey), Date.now(),
   );
 
   return {
@@ -71,6 +106,8 @@ export async function loadOrCreateNodeIdentity(
     privateKey: keyPair.privateKey,
     publicKey: keyPair.publicKey,
     url: nodeUrl,
+    grumpkinPrivateKey: grumpkinKp.privateKey,
+    grumpkinPublicKey: grumpkinKp.publicKey,
   };
 }
 
@@ -100,6 +137,40 @@ export async function signVertex(
     timestamp: vertex.timestamp,
   });
   return signData(identity, canonical);
+}
+
+// ─── Schnorr Signing (for ZK proofs) ─────────────────────────────────────────
+
+/**
+ * Sign data with the node's Grumpkin key using Schnorr.
+ * Returns the signature components needed by the Noir circuit.
+ */
+export function signDataSchnorr(
+  identity: NodeIdentity,
+  data: Uint8Array,
+): {
+  schnorr_s: string;
+  schnorr_e: string;
+  grumpkin_x: string;
+  grumpkin_y: string;
+} {
+  const sig = schnorrSign(identity.grumpkinPrivateKey, data);
+  return {
+    schnorr_s:
+      "0x" +
+      Array.from(sig.s)
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join(""),
+    schnorr_e:
+      "0x" +
+      Array.from(sig.e)
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join(""),
+    grumpkin_x:
+      "0x" + identity.grumpkinPublicKey.x.toString(16).padStart(64, "0"),
+    grumpkin_y:
+      "0x" + identity.grumpkinPublicKey.y.toString(16).padStart(64, "0"),
+  };
 }
 
 // ─── Verification ─────────────────────────────────────────────────────────────

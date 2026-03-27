@@ -31,10 +31,12 @@ export interface GossipEnvelope {
   payload: any;
   timestamp: number;
   nonce: string;             // dedup
+  grumpkin_x?: string;       // sender's Grumpkin public key x-coordinate
+  grumpkin_y?: string;       // sender's Grumpkin public key y-coordinate
 }
 
 export interface PeerExchangePayload {
-  peers: { pubkey: string; url: string }[];
+  peers: { pubkey: string; url: string; grumpkin_x?: string; grumpkin_y?: string }[];
 }
 
 export interface SyncRequestPayload {
@@ -233,6 +235,8 @@ export class GossipManager {
       payload,
       timestamp,
       nonce,
+      grumpkin_x: this.identity.grumpkinPublicKey ? "0x" + this.identity.grumpkinPublicKey.x.toString(16).padStart(64, "0") : undefined,
+      grumpkin_y: this.identity.grumpkinPublicKey ? "0x" + this.identity.grumpkinPublicKey.y.toString(16).padStart(64, "0") : undefined,
     };
   }
 
@@ -416,7 +420,19 @@ export class GossipManager {
    * Exchange peer lists with known peers to discover new nodes.
    */
   async exchangePeers(): Promise<number> {
-    const myPeers = this.getHealthyPeers().map(p => ({ pubkey: p.pubkey, url: p.url }));
+    // Include grumpkin keys from gossip_peers table
+    const healthyPeers = this.getHealthyPeers();
+    const myPeers = healthyPeers.map(p => {
+      const grumpkinRows = [...this.sql.exec(
+        "SELECT grumpkin_x, grumpkin_y FROM gossip_peers WHERE pubkey = ?", p.pubkey,
+      )] as any[];
+      return {
+        pubkey: p.pubkey,
+        url: p.url,
+        grumpkin_x: grumpkinRows[0]?.grumpkin_x || undefined,
+        grumpkin_y: grumpkinRows[0]?.grumpkin_y || undefined,
+      };
+    });
     const envelope = await this.createEnvelope("peer_exchange", { peers: myPeers } as PeerExchangePayload);
     if (!envelope) return 0;
 

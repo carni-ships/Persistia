@@ -11,8 +11,16 @@
 //   - Incremental: only recomputes paths from mutated leaf to root
 
 import { sha256 } from "./consensus";
+import { poseidon2Hash, poseidon2BranchHash, bigIntToHex, hexToBigInt } from "./poseidon2";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
+
+export type HashFunctionName = "sha256" | "poseidon2";
+
+interface HashStrategy {
+  hashLeaf(keyHash: string, value: string): Promise<string>;
+  hashBranch(left: string, right: string): Promise<string>;
+}
 
 export interface MerkleProof {
   key: string;
@@ -26,6 +34,7 @@ export interface MerkleProof {
   closest_key?: string;       // for non-inclusion: the key at the divergence point
   closest_value?: string;
   diverge_depth?: number;     // bit depth where the paths diverge
+  hash_function?: HashFunctionName; // which hash was used (for light client verification)
 }
 
 export interface StateCommitment {
@@ -56,15 +65,41 @@ type SMTNode = SMTLeaf | SMTBranch;
 const EMPTY_HASH = "0000000000000000000000000000000000000000000000000000000000000000";
 const TREE_DEPTH = 256; // SHA-256 key space
 
-// ─── Hash Helpers ────────────────────────────────────────────────────────────
+// ─── Hash Strategies ─────────────────────────────────────────────────────────
+// The hash function is a genesis-time choice: Poseidon2 for Noir circuits,
+// SHA-256 for SP1 circuits. Key paths always use SHA-256 for trie traversal.
 
-async function hashLeaf(keyHash: string, value: string): Promise<string> {
-  return sha256(`leaf:${keyHash}:${value}`);
+/** Convert an arbitrary string to a BN254 field element via SHA-256 truncation. */
+async function stringToField(s: string): Promise<bigint> {
+  const hash = await sha256(s);
+  // Take first 31 bytes (62 hex chars) → 248 bits, guaranteed < BN254 Fr
+  return BigInt("0x00" + hash.slice(0, 62));
 }
 
-async function hashBranch(left: string, right: string): Promise<string> {
-  if (left === EMPTY_HASH && right === EMPTY_HASH) return EMPTY_HASH;
-  return sha256(left + right);
+const poseidon2Strategy: HashStrategy = {
+  async hashLeaf(keyHash: string, value: string): Promise<string> {
+    const keyField = BigInt("0x00" + keyHash.slice(0, 62));
+    const valueField = await stringToField(value);
+    return bigIntToHex(poseidon2Hash([1n, keyField, valueField]));
+  },
+  async hashBranch(left: string, right: string): Promise<string> {
+    if (left === EMPTY_HASH && right === EMPTY_HASH) return EMPTY_HASH;
+    return bigIntToHex(poseidon2BranchHash(hexToBigInt(left), hexToBigInt(right)));
+  },
+};
+
+const sha256Strategy: HashStrategy = {
+  async hashLeaf(keyHash: string, value: string): Promise<string> {
+    return sha256(`leaf:${keyHash}:${value}`);
+  },
+  async hashBranch(left: string, right: string): Promise<string> {
+    if (left === EMPTY_HASH && right === EMPTY_HASH) return EMPTY_HASH;
+    return sha256(left + right);
+  },
+};
+
+function getStrategy(name: HashFunctionName): HashStrategy {
+  return name === "sha256" ? sha256Strategy : poseidon2Strategy;
 }
 
 function getBit(hexHash: string, depth: number): number {
@@ -89,6 +124,13 @@ export class IncrementalStateTree {
   private dirtyKeys: Set<string> = new Set();
   private valueMap: Map<string, string> = new Map();
   private initialized = false;
+  private hashStrategy: HashStrategy;
+  public readonly hashFunctionName: HashFunctionName;
+
+  constructor(hashFn: HashFunctionName = "poseidon2") {
+    this.hashFunctionName = hashFn;
+    this.hashStrategy = getStrategy(hashFn);
+  }
 
   /**
    * Mark keys as dirty after a state mutation.
@@ -100,6 +142,17 @@ export class IncrementalStateTree {
     } else {
       this.valueMap.set(key, value);
     }
+  }
+
+  /**
+   * Return the current set of dirty mutations (key → value, null = delete).
+   * Useful for capturing per-block state changes before computeCommitment clears them.
+   */
+  getDirtyMutations(): Array<{ key: string; value: string | null }> {
+    return Array.from(this.dirtyKeys).map(key => ({
+      key,
+      value: this.valueMap.get(key) ?? null,
+    }));
   }
 
   /**
@@ -146,7 +199,7 @@ export class IncrementalStateTree {
 
   private async insert(key: string, value: string): Promise<void> {
     const keyHash = await sha256(key);
-    const leafHash = await hashLeaf(keyHash, value);
+    const leafHash = await this.hashStrategy.hashLeaf(keyHash, value);
     const leaf: SMTLeaf = { type: "leaf", key_hash: keyHash, key, value, hash: leafHash };
     this.nodes.set(leafHash, leaf);
 
@@ -189,12 +242,12 @@ export class IncrementalStateTree {
     const bit = getBit(leaf.key_hash, depth);
     if (bit === 0) {
       const newLeft = await this.insertAt(node.left, leaf, depth + 1);
-      const newHash = await hashBranch(newLeft, node.right);
+      const newHash = await this.hashStrategy.hashBranch(newLeft, node.right);
       this.nodes.set(newHash, { type: "branch", left: newLeft, right: node.right, hash: newHash });
       return newHash;
     } else {
       const newRight = await this.insertAt(node.right, leaf, depth + 1);
-      const newHash = await hashBranch(node.left, newRight);
+      const newHash = await this.hashStrategy.hashBranch(node.left, newRight);
       this.nodes.set(newHash, { type: "branch", left: node.left, right: newRight, hash: newHash });
       return newHash;
     }
@@ -211,14 +264,14 @@ export class IncrementalStateTree {
       const child = await this.splitLeaves(existing, incoming, depth + 1);
       const left = existingBit === 0 ? child : EMPTY_HASH;
       const right = existingBit === 1 ? child : EMPTY_HASH;
-      const hash = await hashBranch(left, right);
+      const hash = await this.hashStrategy.hashBranch(left, right);
       this.nodes.set(hash, { type: "branch", left, right, hash });
       return hash;
     } else {
       // Divergence — place leaves on opposite sides
       const left = existingBit === 0 ? existing.hash : incoming.hash;
       const right = existingBit === 1 ? existing.hash : incoming.hash;
-      const hash = await hashBranch(left, right);
+      const hash = await this.hashStrategy.hashBranch(left, right);
       this.nodes.set(hash, { type: "branch", left, right, hash });
       return hash;
     }
@@ -251,7 +304,7 @@ export class IncrementalStateTree {
         const rightNode = this.nodes.get(node.right);
         if (rightNode && rightNode.type === "leaf") return { newRoot: node.right, removed: true };
       }
-      const newHash = await hashBranch(result.newRoot, node.right);
+      const newHash = await this.hashStrategy.hashBranch(result.newRoot, node.right);
       this.nodes.set(newHash, { type: "branch", left: result.newRoot, right: node.right, hash: newHash });
       return { newRoot: newHash, removed: true };
     } else {
@@ -261,7 +314,7 @@ export class IncrementalStateTree {
         const leftNode = this.nodes.get(node.left);
         if (leftNode && leftNode.type === "leaf") return { newRoot: node.left, removed: true };
       }
-      const newHash = await hashBranch(node.left, result.newRoot);
+      const newHash = await this.hashStrategy.hashBranch(node.left, result.newRoot);
       this.nodes.set(newHash, { type: "branch", left: node.left, right: result.newRoot, hash: newHash });
       return { newRoot: newHash, removed: true };
     }
@@ -326,6 +379,7 @@ export class IncrementalStateTree {
         directions,
         root: this.root,
         inclusion: true,
+        hash_function: this.hashFunctionName,
       };
     }
 
@@ -341,6 +395,7 @@ export class IncrementalStateTree {
       closest_key: closestLeaf?.key,
       closest_value: closestLeaf?.value,
       diverge_depth: divergeDepth,
+      hash_function: this.hashFunctionName,
     };
   }
 
@@ -426,19 +481,21 @@ export function collectStateEntries(sql: any): { key: string; value: string }[] 
  * This runs client-side — no access to full state needed.
  */
 export async function verifyProof(proof: MerkleProof): Promise<boolean> {
+  const strategy = getStrategy(proof.hash_function ?? "poseidon2");
+
   if (proof.inclusion) {
     // Inclusion proof: recompute leaf hash and walk siblings to root
     const keyHash = await sha256(proof.key);
-    const leafHash = await hashLeaf(keyHash, proof.value);
+    const leafHash = await strategy.hashLeaf(keyHash, proof.value);
     if (leafHash !== proof.leaf_hash) return false;
 
     let current = leafHash;
     for (let i = 0; i < proof.siblings.length; i++) {
       const sibling = proof.siblings[i];
       if (proof.directions[i] === 0) {
-        current = await hashBranch(current, sibling);
+        current = await strategy.hashBranch(current, sibling);
       } else {
-        current = await hashBranch(sibling, current);
+        current = await strategy.hashBranch(sibling, current);
       }
     }
     return current === proof.root;
@@ -459,9 +516,9 @@ export async function verifyProof(proof: MerkleProof): Promise<boolean> {
     for (let i = proof.siblings.length - 1; i >= 0; i--) {
       const sibling = proof.siblings[i];
       if (proof.directions[i] === 0) {
-        current = await hashBranch(current, sibling);
+        current = await strategy.hashBranch(current, sibling);
       } else {
-        current = await hashBranch(sibling, current);
+        current = await strategy.hashBranch(sibling, current);
       }
     }
     return current === proof.root;
@@ -470,12 +527,19 @@ export async function verifyProof(proof: MerkleProof): Promise<boolean> {
 
 // ─── Legacy API (backwards compatible) ──────────────────────────────────────
 
-export async function computeLeafHash(key: string, value: string): Promise<string> {
-  return sha256(`leaf:${key}:${value}`);
+export async function computeLeafHash(key: string, value: string, hashFn: HashFunctionName = "poseidon2"): Promise<string> {
+  const strategy = getStrategy(hashFn);
+  const keyHash = await sha256(key);
+  return strategy.hashLeaf(keyHash, value);
 }
 
-export async function computeMerkleRoot(leafHashes: string[]): Promise<string> {
-  if (leafHashes.length === 0) return sha256("empty");
+export async function computeMerkleRoot(leafHashes: string[], hashFn: HashFunctionName = "poseidon2"): Promise<string> {
+  const strategy = getStrategy(hashFn);
+  if (leafHashes.length === 0) {
+    return hashFn === "poseidon2"
+      ? bigIntToHex(poseidon2Hash([0n]))
+      : sha256("empty");
+  }
   if (leafHashes.length === 1) return leafHashes[0];
 
   let level = [...leafHashes];
@@ -488,25 +552,25 @@ export async function computeMerkleRoot(leafHashes: string[]): Promise<string> {
     for (let i = 0; i < level.length; i += 2) {
       const left = level[i];
       const right = level[i + 1] || left;
-      next.push(await sha256(left + right));
+      next.push(await strategy.hashBranch(left, right));
     }
     level = next;
   }
   return level[0];
 }
 
-export async function computeStateCommitment(sql: any): Promise<StateCommitment> {
+export async function computeStateCommitment(sql: any, hashFn: HashFunctionName = "poseidon2"): Promise<StateCommitment> {
   const entries = collectStateEntries(sql);
   const leafHashes: string[] = [];
   for (const e of entries) {
-    leafHashes.push(await computeLeafHash(e.key, e.value));
+    leafHashes.push(await computeLeafHash(e.key, e.value, hashFn));
   }
-  const root = await computeMerkleRoot(leafHashes);
+  const root = await computeMerkleRoot(leafHashes, hashFn);
   return { root, entry_count: entries.length, computed_at: Date.now() };
 }
 
-export async function generateStateProof(sql: any, stateKey: string): Promise<MerkleProof | null> {
-  const tree = new IncrementalStateTree();
+export async function generateStateProof(sql: any, stateKey: string, hashFn: HashFunctionName = "poseidon2"): Promise<MerkleProof | null> {
+  const tree = new IncrementalStateTree(hashFn);
   await tree.computeCommitment(sql);
   return tree.generateProof(stateKey);
 }
