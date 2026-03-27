@@ -679,6 +679,18 @@
                 <span id="zk-proven">0 / 0 blocks</span>
                 <span id="zk-gap"></span>
               </div>
+              <div id="zk-latest-proof" style="margin-top:8px;padding:6px 8px;background:rgba(0,0,0,0.2);border-radius:6px;font-size:10px;display:none">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+                  <span style="color:var(--text-dim)">Latest Proof</span>
+                  <span id="zk-prover-badge" style="padding:1px 6px;border-radius:8px;font-size:9px;font-weight:600;letter-spacing:0.5px"></span>
+                </div>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:2px 12px">
+                  <div><span style="color:var(--text-dim)">Block </span><span id="zk-latest-block">--</span></div>
+                  <div><span style="color:var(--text-dim)">Verified </span><span id="zk-latest-verified">--</span></div>
+                  <div><span style="color:var(--text-dim)">Root </span><span id="zk-latest-root" style="font-family:monospace;font-size:9px">--</span></div>
+                  <div><span style="color:var(--text-dim)">Age </span><span id="zk-latest-age">--</span></div>
+                </div>
+              </div>
               <div id="zk-lineages" style="margin-top:6px;font-size:9px;color:var(--text-dim)"></div>
             </div>
           </div>
@@ -794,11 +806,12 @@ let lastSyncSeq = 0;
 
 async function poll() {
   try {
-    const [status, sync, zkStatus, anchorStatus] = await Promise.all([
+    const [status, sync, zkStatus, anchorStatus, zkLatest] = await Promise.all([
       api('/dag/status'),
       api(`/dag/sync?after_round=${lastSyncRound}&after_seq=${lastSyncSeq}&limit=200`),
       api('/proof/zk/status').catch(() => null),
       api('/anchor/latest').catch(() => null),
+      api('/proof/zk/latest').catch(() => null),
     ]);
 
     if (!connected) {
@@ -893,6 +906,43 @@ async function poll() {
       } else {
         lineageEl.innerHTML = '';
       }
+    }
+
+    // Latest proof details
+    const latestProofEl = document.getElementById('zk-latest-proof');
+    if (zkLatest && !zkLatest.error) {
+      latestProofEl.style.display = 'block';
+      document.getElementById('zk-latest-block').textContent = 'R' + zkLatest.block_number;
+      const rootStr = zkLatest.state_root || '--';
+      document.getElementById('zk-latest-root').textContent = rootStr.length > 16 ? rootStr.slice(0, 8) + '...' + rootStr.slice(-6) : rootStr;
+      document.getElementById('zk-latest-age').textContent = zkLatest.submitted_at ? timeAgo(zkLatest.submitted_at) : '--';
+
+      const verifiedEl = document.getElementById('zk-latest-verified');
+      if (zkLatest.verified) {
+        verifiedEl.textContent = 'Yes';
+        verifiedEl.style.color = 'var(--green)';
+      } else {
+        verifiedEl.textContent = 'No';
+        verifiedEl.style.color = 'var(--text-dim)';
+      }
+
+      const badge = document.getElementById('zk-prover-badge');
+      const pt = (zkLatest.proof_type || '').toLowerCase();
+      if (pt.includes('noir') || pt.includes('ultrahonk')) {
+        badge.textContent = 'NOIR';
+        badge.style.background = 'rgba(108,92,231,0.3)';
+        badge.style.color = '#a29bfe';
+      } else if (pt.includes('sp1')) {
+        badge.textContent = 'SP1';
+        badge.style.background = 'rgba(0,210,160,0.3)';
+        badge.style.color = '#00d2a0';
+      } else {
+        badge.textContent = pt || 'ZK';
+        badge.style.background = 'rgba(255,255,255,0.1)';
+        badge.style.color = 'var(--text-dim)';
+      }
+    } else {
+      latestProofEl.style.display = 'none';
     }
 
     updateFinality(status, zkStatus, anchorStatus && !anchorStatus.error ? anchorStatus : null);

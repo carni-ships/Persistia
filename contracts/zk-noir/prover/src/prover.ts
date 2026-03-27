@@ -179,7 +179,7 @@ async function fetchLatestBlock(nodeBase: string): Promise<number> {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Failed to fetch ZK status: ${res.status}`);
   const data = await res.json() as any;
-  return data.latest_block ?? data.latestBlock ?? 0;
+  return data.last_committed_round ?? data.latest_block ?? data.latestBlock ?? 0;
 }
 
 async function submitProof(nodeBase: string, proofData: any) {
@@ -384,11 +384,13 @@ async function cmdWatch(
   proofDir: string,
   intervalSec: number,
   useNative = false,
+  startBlock?: number,
 ) {
-  console.log(`Watching ${nodeBase} (interval=${intervalSec}s)`);
   if (!existsSync(proofDir)) mkdirSync(proofDir, { recursive: true });
 
-  let lastProvenBlock = 0;
+  // Default: start from current committed round (skip historical blocks without mutations)
+  let lastProvenBlock = startBlock ?? (await fetchLatestBlock(nodeBase));
+  console.log(`Watching ${nodeBase} (interval=${intervalSec}s, starting after block ${lastProvenBlock})`);
   let prevProofPath: string | undefined;
 
   while (true) {
@@ -398,18 +400,27 @@ async function cmdWatch(
       if (latestBlock > lastProvenBlock) {
         const blockNum = lastProvenBlock + 1;
         const outPath = join(proofDir, `block_${blockNum}.json`);
-        await cmdProve(nodeBase, blockNum, outPath, prevProofPath, useNative);
-        lastProvenBlock = blockNum;
-        prevProofPath = outPath;
-
-        // Submit to node
         try {
-          const proofData = JSON.parse(readFileSync(outPath, "utf-8"));
-          await submitProof(nodeBase, proofData);
-          console.log("Proof submitted to node");
+          await cmdProve(nodeBase, blockNum, outPath, prevProofPath, useNative);
+          prevProofPath = outPath;
+
+          // Submit to node
+          try {
+            const proofData = JSON.parse(readFileSync(outPath, "utf-8"));
+            await submitProof(nodeBase, proofData);
+            console.log("Proof submitted to node");
+          } catch (e: any) {
+            console.warn(`Submit failed (non-fatal): ${e.message}`);
+          }
         } catch (e: any) {
-          console.warn(`Submit failed (non-fatal): ${e.message}`);
+          // Skip blocks that don't exist (pre-deploy blocks without mutations)
+          if (e.message?.includes("404") || e.message?.includes("not found") || e.message?.includes("not committed")) {
+            console.log(`Block ${blockNum} not available, skipping`);
+          } else {
+            throw e;
+          }
         }
+        lastProvenBlock = blockNum;
       }
     } catch (e: any) {
       console.error(`Error: ${e.message}`);
@@ -1105,6 +1116,7 @@ switch (command) {
       getArg("proof-dir", "./proofs"),
       parseInt(getArg("interval", "10")),
       useNative,
+      args.includes("--start") ? parseInt(getArg("start")) : undefined,
     );
     break;
   case "bench":
