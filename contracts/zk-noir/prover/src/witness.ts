@@ -11,7 +11,7 @@ import { createHash } from "crypto";
 import { Barretenberg } from "@aztec/bb.js";
 
 const MAX_VALIDATORS = 4;
-const MAX_MUTATIONS = 1024;
+const MAX_MUTATIONS = 512;
 const VK_SIZE = 115;
 const PROOF_SIZE = 449;
 const PUBLIC_INPUTS_SIZE = 8;
@@ -264,6 +264,30 @@ export function buildMutationWitness(mut: ApiMutation): StateMutationWitness {
   };
 }
 
+/**
+ * Build a mutation witness for the incremental circuit.
+ * Key is truncated to TREE_DEPTH bits (20) so it fits as a valid tree index.
+ * Value remains a full field element.
+ */
+export function buildIncrementalMutationWitness(mut: ApiMutation): StateMutationWitness {
+  // Hash key to 20 bits: take first 3 bytes of SHA-256 and mask to 20 bits
+  const keyHash = createHash("sha256").update(mut.key).digest();
+  const keyVal = ((keyHash[0] << 12) | (keyHash[1] << 4) | (keyHash[2] >> 4)) & 0xFFFFF;
+  const keyField = "0x" + keyVal.toString(16);
+
+  const isDelete = mut.new_value == null;
+  const valueField = isDelete
+    ? "0"
+    : "0x00" + createHash("sha256").update(mut.new_value!).digest().subarray(0, 31).toString("hex");
+
+  return {
+    key: keyField,
+    new_value: valueField,
+    is_delete: isDelete,
+    enabled: true,
+  };
+}
+
 /** Build witness for a single-block proof. */
 export async function buildSingleBlockWitness(
   block: ApiBlock,
@@ -383,6 +407,107 @@ export async function buildTestWitness(opts?: {
     new_state_root: computedRoot,
     block_number: blockNumber,
     active_nodes: numValidators,
+  };
+}
+
+// =============================================================================
+// Incremental Circuit Witness (sparse Merkle tree with sibling paths)
+// =============================================================================
+
+const INCREMENTAL_MAX_MUTATIONS = 64;
+const TREE_DEPTH = 20;
+
+interface MerkleUpdateWitness {
+  key: string;
+  old_value: string;
+  new_value: string;
+  siblings: string[];   // [Field; TREE_DEPTH]
+  is_delete: boolean;
+  enabled: boolean;
+}
+
+export interface IncrementalCircuitWitness {
+  updates: MerkleUpdateWitness[];
+  mutation_count: number;
+  signatures: NodeSignatureWitness[];
+  sig_count: number;
+  prev_proven_blocks: number;
+  prev_genesis_root: string;
+  prev_proof: string[];
+  prev_vk: string[];
+  prev_key_hash: string;
+  prev_public_inputs: string[];
+  prev_state_root: string;
+  new_state_root: string;
+  block_number: number;
+  active_nodes: number;
+}
+
+export function emptyMerkleUpdate(): MerkleUpdateWitness {
+  return {
+    key: "0",
+    old_value: "0",
+    new_value: "0",
+    siblings: new Array(TREE_DEPTH).fill("0"),
+    is_delete: false,
+    enabled: false,
+  };
+}
+
+/**
+ * Build witness for the incremental circuit.
+ * Requires pre-computed Merkle updates with sibling paths from a SparseMerkleTree.
+ */
+export async function buildIncrementalWitness(
+  block: ApiBlock,
+  merkleUpdates: { key: string; oldValue: string; newValue: string; siblings: string[]; isDelete: boolean }[],
+  prevRoot: string,
+  newRoot: string,
+  opts?: {
+    prevProvenBlocks?: number;
+    prevGenesisRoot?: string;
+    prevProof?: string[];
+    prevVk?: string[];
+    prevKeyHash?: string;
+    prevPublicInputs?: string[];
+  },
+): Promise<IncrementalCircuitWitness> {
+  // Build signature witnesses (same as full-tree)
+  const sigs: NodeSignatureWitness[] = [];
+  for (const sig of block.signatures) {
+    if (sig.grumpkin_x && sig.grumpkin_y && sig.schnorr_s && sig.schnorr_e) {
+      sigs.push(await buildSignatureWitness(sig));
+    }
+  }
+  const dummy = await getDummySignature();
+  while (sigs.length < MAX_VALIDATORS) sigs.push({ ...dummy });
+
+  // Build Merkle update witnesses
+  const updates: MerkleUpdateWitness[] = merkleUpdates.map(u => ({
+    key: u.key,
+    old_value: u.oldValue,
+    new_value: u.newValue,
+    siblings: u.siblings,
+    is_delete: u.isDelete,
+    enabled: true,
+  }));
+  while (updates.length < INCREMENTAL_MAX_MUTATIONS) updates.push(emptyMerkleUpdate());
+
+  return {
+    updates: updates.slice(0, INCREMENTAL_MAX_MUTATIONS),
+    mutation_count: merkleUpdates.length,
+    signatures: sigs.slice(0, MAX_VALIDATORS),
+    sig_count: sigs.filter(s => s.enabled).length,
+    prev_proven_blocks: opts?.prevProvenBlocks ?? 0,
+    prev_genesis_root: opts?.prevGenesisRoot ?? "0",
+    prev_proof: opts?.prevProof ?? new Array(PROOF_SIZE).fill("0"),
+    prev_vk: opts?.prevVk ?? new Array(VK_SIZE).fill("0"),
+    prev_key_hash: opts?.prevKeyHash ?? "0",
+    prev_public_inputs: opts?.prevPublicInputs ?? new Array(PUBLIC_INPUTS_SIZE).fill("0"),
+    prev_state_root: prevRoot,
+    new_state_root: newRoot,
+    block_number: block.block_number,
+    active_nodes: block.active_nodes,
   };
 }
 

@@ -178,7 +178,7 @@ export function computeAdaptiveInterval(
   // ── 7. Adjust max_events_per_vertex ───────────────────────────────────
   // More conservative: only adjust when sustained high/low utilization.
   // Mutation-aware ceiling: never exceed what the ZK circuit can prove.
-  const circuitSlots = signals.circuitMutationSlots ?? 1024;
+  const circuitSlots = signals.circuitMutationSlots ?? 512;
   const mutsPerEvent = signals.avgMutationsPerEvent ?? 5;
   const verticesPerBlock = signals.verticesPerBlock ?? 2;
   const mutationCeiling = Math.floor(circuitSlots / (mutsPerEvent * verticesPerBlock));

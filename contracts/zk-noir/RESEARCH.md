@@ -21,7 +21,7 @@ This document captures performance findings, bottlenecks discovered, and archite
 | Backend | Barretenberg UltraHonk (native ARM64) |
 | Circuit size | ~42K gates (non-recursive) / ~769K gates (recursive IVC) |
 | Proof size | 16,000 bytes |
-| Max mutations per proof | 1024 (circuit compile-time constant) |
+| Max mutations per proof | 512 (circuit compile-time constant) |
 | Max validators per proof | 4 (circuit compile-time constant) |
 
 ### Sustained Throughput
@@ -29,14 +29,14 @@ This document captures performance findings, bottlenecks discovered, and archite
 | Configuration | Proof Rate | Block Rate | Prover Keeps Up? |
 |---------------|-----------|------------|-----------------|
 | 12s blocks, 22 events/vertex, alarm-only | ~10 proofs/min | ~5 even blocks/min | **Yes** (2x headroom) |
-| 12s blocks, 80 events/vertex | ~10 proofs/min | ~5 even blocks/min | Yes, mutations within 1024 limit |
+| 12s blocks, 80 events/vertex | ~10 proofs/min | ~5 even blocks/min | Yes, mutations within 512 limit |
 | 10s reactive alarm | ~10 proofs/min | ~78 blocks/min | **No** (gap grows ~100/90s) |
 | 5s reactive alarm | ~12 proofs/min | ~97 blocks/min | **No** (gap grows ~128/90s) |
 | 100ms reactive alarm (runaway) | ~10 proofs/min | ~1080 blocks/min | **No** (catastrophically behind) |
 
 ### Key Finding: Proof Time is Constant
 
-The prover takes ~6-8s per block **regardless of mutation count** (1-1024). The Noir circuit uses fixed-size arrays padded with disabled entries. This means:
+The prover takes ~6-8s per block **regardless of mutation count** (1-512). The Noir circuit uses fixed-size arrays padded with disabled entries. This means:
 
 > **Optimal throughput comes from packing more events per block, not producing more blocks.**
 
@@ -74,7 +74,7 @@ Each game event type produces a different number of state mutations:
 
 With 2 vertices per commit cycle and variable mutations per event, the safe limit is:
 
-> **22 events/vertex x 2 vertices/block x ~5 mutations/event = ~220 mutations/block** (under 256 limit)
+> **51 events/vertex x 2 vertices/block x ~5 mutations/event = ~510 mutations/block** (under 512 limit)
 
 ### 4. Event-Triggered Vertex Creation
 
@@ -106,7 +106,7 @@ With 2 vertices per commit cycle and variable mutations per event, the safe limi
 
 **Solution:** Single-row INSERT in a loop. Performance impact is negligible since the loop runs synchronously within the DO's single-threaded runtime.
 
-**Impact:** Blocks with any number of mutations (up to 256) can be persisted without SQL errors.
+**Impact:** Blocks with any number of mutations (up to 512) can be persisted without SQL errors.
 
 ---
 
@@ -116,7 +116,7 @@ Based on stress testing with 50 concurrent event agents:
 
 ```
 round_interval_ms = 12000        # 12-second block time
-max_events_per_vertex = 22       # ~200 mutations/block (under 256 limit)
+max_events_per_vertex = 51       # ~510 mutations/block (under 512 limit)
 reactive_alarm_delay_ms = 30000  # Effectively disabled (alarm-only vertices)
 min_nodes_for_consensus = 1      # Allow single-node operation
 ```
@@ -133,15 +133,15 @@ min_nodes_for_consensus = 1      # Allow single-node operation
 
 ### Short-term: Increase Circuit Mutation Capacity
 
-The Noir circuit's mutation array is a compile-time constant. Increasing from 256 to 512 or 1024 would allow more events per block:
+The Noir circuit's mutation array is a compile-time constant. Currently set to 512 (upgraded from 256).
 
-| Mutation Slots | Events/Block | Finalized Events/s | Gate Count Impact |
-|---------------|-------------|--------------------|--------------------|
-| 256 (current) | ~44 | ~3.7 | ~42K gates |
-| 512 | ~100 | ~8.3 | ~50K gates (est.) |
-| 1024 | ~200 | ~16.7 | ~65K gates (est.) |
+| Mutation Slots | Events/Block | Proof Time | ACIR Opcodes |
+|---------------|-------------|------------|--------------|
+| 256 | ~44 | ~6s | ~546K |
+| 512 (current) | ~100 | ~15-20s (est.) | ~1.1M (est.) |
+| 1024 | ~200 | ~68s | ~2.1M |
 
-The proof time increase is sublinear — doubling mutations does not double proof time because the Poseidon2 tree hashing is O(n log n) but dominates less than Schnorr verification.
+**Important:** Noir circuit scaling is super-linear (O(n²)) because fixed-size loop unrolling means ALL iterations generate constraints — `if` guards prevent execution but not gate creation. The Merkle tree reduction has `log(n)` levels × `n/2` inner iterations, giving O(n log n) hashing gates on top of O(n) leaf iteration gates. At 1024 mutations, the prover cannot keep up with 12s block intervals.
 
 ### Medium-term: Parallel Proving
 

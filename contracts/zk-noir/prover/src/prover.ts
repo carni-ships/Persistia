@@ -18,7 +18,8 @@ import { join, resolve } from "path";
 import { exec, execSync, spawn, fork, type ChildProcess } from "child_process";
 import { gunzipSync } from "zlib";
 import { Encoder, Decoder } from "msgpackr";
-import { buildSingleBlockWitness, buildTestWitness, destroyBb, buildMutationWitness, emptyMutation, computePoseidon2MerkleRoot, type CircuitWitness } from "./witness.js";
+import { buildSingleBlockWitness, buildTestWitness, destroyBb, buildMutationWitness, buildIncrementalMutationWitness, emptyMutation, computePoseidon2MerkleRoot, buildIncrementalWitness, type CircuitWitness } from "./witness.js";
+import { SparseMerkleTree } from "./sparse-merkle-tree.js";
 
 // --- Proof Field Conversion ---
 // UltraHonk proofs are serialized as concatenated 32-byte big-endian field elements.
@@ -40,6 +41,7 @@ function proofToFields(proofBytes: Uint8Array): string[] {
 // --- Circuit Loading ---
 
 const CIRCUIT_PATH = resolve(import.meta.dirname ?? ".", "../../target/persistia_state_proof.json");
+const INCREMENTAL_CIRCUIT_PATH = resolve(import.meta.dirname ?? ".", "../../target/persistia_incremental_proof.json");
 
 function loadCircuit() {
   if (!existsSync(CIRCUIT_PATH)) {
@@ -157,6 +159,9 @@ function nativeBbVerify(proof: Uint8Array, publicInputs: string[], vk: Uint8Arra
 
 // --- Node API ---
 
+// Global shard parameter — set from CLI --shard flag.
+let _globalShard: string | null = null;
+
 function nodeUrl(base: string, path: string): string {
   try {
     const u = new URL(base);
@@ -169,6 +174,7 @@ function nodeUrl(base: string, path: string): string {
         u.searchParams.set(k, v ?? "");
       }
     }
+    if (_globalShard) u.searchParams.set("shard", _globalShard);
     return u.toString();
   } catch {
     return `${base}${path}`;
@@ -1095,6 +1101,168 @@ function cmdBbUpgrade() {
   }
 }
 
+// --- Incremental Circuit Prover ---
+// Uses the sparse Merkle tree circuit (428K gates vs 9.1M) for much faster proving.
+// Maintains a persistent Poseidon2 sparse Merkle tree locally.
+
+function createIncrementalProver() {
+  if (!existsSync(INCREMENTAL_CIRCUIT_PATH)) {
+    console.error(`Incremental circuit not found at ${INCREMENTAL_CIRCUIT_PATH}`);
+    console.error("Run 'nargo compile --package persistia_incremental_proof' first.");
+    process.exit(1);
+  }
+  const circuit = JSON.parse(readFileSync(INCREMENTAL_CIRCUIT_PATH, "utf-8"));
+  return circuit;
+}
+
+const INCREMENTAL_VK_CACHE = resolve(import.meta.dirname ?? ".", "../../target/bb_vk_incremental");
+
+function ensureIncrementalVkCached(): string | null {
+  const cacheFile = join(INCREMENTAL_VK_CACHE, "vk");
+  if (existsSync(cacheFile)) return cacheFile;
+  try {
+    mkdirSync(INCREMENTAL_VK_CACHE, { recursive: true });
+    execSync(
+      `${BB_PATH} write_vk -b ${INCREMENTAL_CIRCUIT_PATH} -o ${INCREMENTAL_VK_CACHE} -t noir-recursive-no-zk`,
+      { stdio: "pipe" },
+    );
+    if (existsSync(cacheFile)) return cacheFile;
+  } catch {}
+  return null;
+}
+
+function nativeBbProveIncremental(
+  witnessBytes: Uint8Array,
+): { proof: Uint8Array; publicInputs: string[] } {
+  const tmpDir = "/tmp/persistia_bb_prove_inc";
+  rmSync(tmpDir, { recursive: true, force: true });
+
+  const vkPath = ensureIncrementalVkCached();
+  const vkFlag = vkPath ? ` -k ${vkPath}` : " --write_vk";
+
+  writeFileSync("/tmp/persistia_bb_witness_inc.gz", witnessBytes);
+  execSync(
+    `${BB_PATH} prove -b ${INCREMENTAL_CIRCUIT_PATH} -w /tmp/persistia_bb_witness_inc.gz -o ${tmpDir}${vkFlag} -t noir-recursive-no-zk`,
+    { stdio: "pipe" },
+  );
+
+  const proof = readFileSync(join(tmpDir, "proof"));
+  const piRaw = readFileSync(join(tmpDir, "public_inputs"));
+
+  const publicInputs: string[] = [];
+  for (let i = 0; i < piRaw.length; i += 32) {
+    const hex = "0x" + Array.from(piRaw.subarray(i, i + 32)).map(b => b.toString(16).padStart(2, "0")).join("");
+    publicInputs.push(hex);
+  }
+
+  return { proof: new Uint8Array(proof), publicInputs };
+}
+
+async function cmdWatchIncremental(
+  nodeBase: string,
+  proofDir: string,
+  intervalSec: number,
+  useNative = false,
+  startBlock?: number,
+  treePath?: string,
+) {
+  if (!existsSync(proofDir)) mkdirSync(proofDir, { recursive: true });
+
+  const circuit = createIncrementalProver();
+  const api = await Barretenberg.new({ threads: 8 });
+  const backend = new UltraHonkBackend(circuit.bytecode, api);
+  const noir = new Noir(circuit);
+
+  // Initialize sparse Merkle tree (persisted to disk)
+  const smtPath = treePath ?? join(proofDir, "sparse_merkle_tree.json");
+  const smt = new SparseMerkleTree(smtPath);
+  await smt.init();
+
+  let lastProvenBlock = startBlock ?? (await fetchLatestBlock(nodeBase));
+  console.log(`Incremental prover watching ${nodeBase} (interval=${intervalSec}s, starting after block ${lastProvenBlock})`);
+  console.log(`Sparse Merkle tree: ${smt.size} leaves, root=${smt.getRoot().substring(0, 18)}...`);
+  console.log(`Circuit: ${INCREMENTAL_CIRCUIT_PATH}`);
+  console.log(`Native bb: ${useNative && nativeBbAvailable() ? "yes" : "no (WASM)"}`);
+
+  while (true) {
+    try {
+      const latestBlock = await fetchLatestBlock(nodeBase);
+
+      while (latestBlock > lastProvenBlock) {
+        const blockNum = await fetchNextCommitted(nodeBase, lastProvenBlock);
+        if (blockNum === null || blockNum > latestBlock) break;
+
+        const outPath = join(proofDir, `block_${blockNum}.json`);
+        try {
+          const block = await fetchBlock(nodeBase, blockNum);
+          const allMutations = (block.mutations ?? []).map((m: any) => {
+            const w = buildIncrementalMutationWitness(m);
+            return {
+              keyHex: w.key,
+              newValueHex: w.new_value,
+              isDelete: w.is_delete,
+            };
+          });
+          // Incremental circuit supports max 64 mutations per proof
+          const mutations = allMutations.slice(0, 64);
+          if (allMutations.length > 64) {
+            console.log(`  Block ${blockNum}: truncated ${allMutations.length} mutations to 64`);
+          }
+
+          // Apply mutations to sparse Merkle tree and get sibling paths
+          const { updates, prevRoot, newRoot } = await smt.applyMutations(mutations);
+
+          // Build witness for incremental circuit
+          const witness = await buildIncrementalWitness(block, updates, prevRoot, newRoot);
+
+          const start = performance.now();
+          const { witness: solvedWitness } = await noir.execute(witness as any);
+
+          let proof: { proof: Uint8Array; publicInputs: string[] };
+          if (useNative && nativeBbAvailable()) {
+            proof = nativeBbProveIncremental(solvedWitness);
+          } else {
+            proof = await backend.generateProof(solvedWitness);
+          }
+          const elapsed = ((performance.now() - start) / 1000).toFixed(2);
+
+          const proofOutput = {
+            proof: Buffer.from(proof.proof).toString("base64"),
+            publicInputs: proof.publicInputs,
+            blockNumber: blockNum,
+            provenBlocks: 1,
+            prover: useNative ? "persistia-incremental-native" : "persistia-incremental-wasm",
+            timestamp: new Date().toISOString(),
+            meta: {
+              circuit: "incremental",
+              tree_size: smt.size,
+              mutations: mutations.length,
+              state_root: newRoot,
+            },
+          };
+
+          writeFileSync(outPath, JSON.stringify(proofOutput, null, 2));
+          console.log(`Block ${blockNum}: proof in ${elapsed}s (${mutations.length} mutations, tree=${smt.size} leaves)`);
+
+          // Submit to node
+          try {
+            await submitProof(nodeBase, proofOutput);
+          } catch (e: any) {
+            // non-fatal
+          }
+        } catch (e: any) {
+          console.log(`Block ${blockNum} skipped: ${e.message?.substring(0, 150)}`);
+        }
+        lastProvenBlock = blockNum;
+      }
+    } catch (e: any) {
+      console.error(`Error: ${e.message}`);
+    }
+
+    await new Promise((r) => setTimeout(r, intervalSec * 1000));
+  }
+}
+
 // --- CLI ---
 
 const args = process.argv.slice(2);
@@ -1109,6 +1277,7 @@ function getArg(name: string, defaultVal?: string): string {
 
 const useNative = args.includes("--native");
 const verifierTarget: VerifierTarget = args.includes("--evm") ? "evm-no-zk" : "noir-recursive-no-zk";
+if (args.includes("--shard")) _globalShard = getArg("shard");
 
 switch (command) {
   case "execute":
@@ -1162,6 +1331,16 @@ switch (command) {
       parseInt(getArg("workers", "6")),
     );
     break;
+  case "watch-incremental":
+    cmdWatchIncremental(
+      getArg("node", "http://localhost:8787"),
+      getArg("proof-dir", "./proofs"),
+      parseInt(getArg("interval", "10")),
+      useNative,
+      args.includes("--start") ? parseInt(getArg("start")) : undefined,
+      args.includes("--tree") ? getArg("tree") : undefined,
+    );
+    break;
   case "bb-version":
     cmdBbVersion();
     break;
@@ -1175,7 +1354,8 @@ Usage:
   tsx prover.ts execute  --node <url> --block <n>      Execute without proof (test)
   tsx prover.ts prove    --node <url> --block <n>      Generate proof
   tsx prover.ts verify   --proof <path>                Verify a proof file
-  tsx prover.ts watch    --node <url>                  Watch and prove continuously
+  tsx prover.ts watch    --node <url>                  Watch and prove (full-tree circuit)
+  tsx prover.ts watch-incremental --node <url>         Watch and prove (incremental circuit, 21x faster)
   tsx prover.ts watch-parallel --node <url>            Parallel proving (catch-up mode)
   tsx prover.ts watch-pipelined --node <url>           Pipelined proving (overlaps witness + prove)
   tsx prover.ts watch-parallel-msgpack --node <url>    Persistent bb workers (6-9% faster parallel)

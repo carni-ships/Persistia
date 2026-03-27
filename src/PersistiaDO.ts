@@ -628,8 +628,8 @@ export class PersistiaWorldV4 implements DurableObject {
       lastCommittedRound: this.lastCommittedRound,
       consecutiveEmptyRounds: this._consecutiveEmptyRounds,
       utilizationHistory: this._utilizationHistory,
-      // ZK circuit mutation ceiling: 1024 slots, ~5 mutations/event, 2 vertices/block
-      circuitMutationSlots: 1024,
+      // ZK circuit mutation ceiling: 512 slots, ~5 mutations/event, 2 vertices/block
+      circuitMutationSlots: 512,
       avgMutationsPerEvent: 5,
       verticesPerBlock: 2,
     };
