@@ -317,6 +317,120 @@ export class AccountManager {
     }));
   }
 
+  // ─── Escrow Holds ──────────────────────────────────────────────────────
+  // Locks funds during in-flight operations (federated calls, provider sessions).
+  // Available balance = balance - held. Withdrawals/transfers can't touch held funds.
+
+  /**
+   * Place a hold on funds. Returns hold_id or error.
+   * Held funds can't be spent by transfers or withdrawals until released.
+   */
+  placeHold(address: string, denom: string, amount: bigint, reason: string): { ok: boolean; hold_id?: string; error?: string } {
+    if (amount <= 0n) return { ok: false, error: "Amount must be positive" };
+
+    const available = this.getAvailableBalance(address, denom);
+    if (available < amount) {
+      return { ok: false, error: `Insufficient available balance: have ${available}, need ${amount} (some may be held)` };
+    }
+
+    const hold_id = `hold_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    this.sql.exec(
+      `INSERT INTO escrow_holds (hold_id, address, denom, amount, reason, created_at, status)
+       VALUES (?, ?, ?, ?, ?, ?, 'active')`,
+      hold_id, address, denom, amount.toString(), reason, Date.now(),
+    );
+
+    return { ok: true, hold_id };
+  }
+
+  /**
+   * Release a hold, making funds available again.
+   * If settleAmount > 0, that portion is deducted from balance (paid out).
+   * The rest returns to available balance.
+   */
+  releaseHold(holdId: string, settleAmount?: bigint): { ok: boolean; error?: string; released: bigint; settled: bigint } {
+    const rows = [...this.sql.exec(
+      "SELECT * FROM escrow_holds WHERE hold_id = ? AND status = 'active'", holdId,
+    )] as any[];
+    if (rows.length === 0) return { ok: false, error: "Hold not found or already released", released: 0n, settled: 0n };
+
+    const hold = rows[0];
+    const holdAmount = BigInt(hold.amount);
+    const toSettle = settleAmount !== undefined ? (settleAmount > holdAmount ? holdAmount : settleAmount) : 0n;
+    const toRelease = holdAmount - toSettle;
+
+    // Deduct the settled portion from actual balance
+    if (toSettle > 0n) {
+      const balance = this.getBalance(hold.address, hold.denom);
+      this.sql.exec(
+        `UPDATE token_balances SET amount = ? WHERE address = ? AND denom = ?`,
+        (balance - toSettle).toString(), hold.address, hold.denom,
+      );
+    }
+
+    // Mark hold as released
+    this.sql.exec(
+      "UPDATE escrow_holds SET status = 'released', settled_amount = ?, released_at = ? WHERE hold_id = ?",
+      toSettle.toString(), Date.now(), holdId,
+    );
+
+    return { ok: true, released: toRelease, settled: toSettle };
+  }
+
+  /**
+   * Get total held amount for an address+denom.
+   */
+  getHeldAmount(address: string, denom: string = "PERSIST"): bigint {
+    const rows = [...this.sql.exec(
+      "SELECT COALESCE(SUM(CAST(amount AS INTEGER)), 0) as total FROM escrow_holds WHERE address = ? AND denom = ? AND status = 'active'",
+      address, denom,
+    )] as any[];
+    return BigInt((rows[0] as any).total || 0);
+  }
+
+  /**
+   * Get available balance (balance minus active holds).
+   */
+  getAvailableBalance(address: string, denom: string = "PERSIST"): bigint {
+    const balance = this.getBalance(address, denom);
+    const held = this.getHeldAmount(address, denom);
+    const available = balance - held;
+    return available > 0n ? available : 0n;
+  }
+
+  /**
+   * Clean up expired holds (safety net — holds older than 10 minutes auto-release).
+   */
+  cleanupExpiredHolds(maxAgeMs: number = 10 * 60_000): number {
+    const cutoff = Date.now() - maxAgeMs;
+    const expired = [...this.sql.exec(
+      "SELECT hold_id FROM escrow_holds WHERE status = 'active' AND created_at < ?", cutoff,
+    )] as any[];
+
+    for (const row of expired) {
+      this.releaseHold(row.hold_id);
+    }
+    return expired.length;
+  }
+
+  /** Create escrow_holds table. Call during DO init. */
+  static initHoldsTable(sql: any): void {
+    sql.exec(`
+      CREATE TABLE IF NOT EXISTS escrow_holds (
+        hold_id TEXT PRIMARY KEY,
+        address TEXT NOT NULL,
+        denom TEXT NOT NULL,
+        amount TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        released_at INTEGER,
+        settled_amount TEXT,
+        status TEXT NOT NULL DEFAULT 'active'
+      )
+    `);
+    sql.exec(`CREATE INDEX IF NOT EXISTS idx_holds_address ON escrow_holds(address, denom, status)`);
+  }
+
   /** Create burn_ledger table. Call during DO init. */
   static initBurnTable(sql: any): void {
     sql.exec(`

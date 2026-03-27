@@ -57,6 +57,7 @@ export interface ValidatorRecord {
   equivocation_count: number;
   total_vertices: number;
   total_commits: number;
+  services: string[];          // service IDs this validator can execute (e.g. ["llm","tts"])
 }
 
 export interface EquivocationEvidence {
@@ -226,6 +227,8 @@ export class ValidatorRegistry {
   }
 
   private rowToRecord(row: any): ValidatorRecord {
+    let services: string[] = [];
+    try { services = row.services ? JSON.parse(row.services) : []; } catch {}
     return {
       pubkey: row.pubkey,
       url: row.url,
@@ -238,6 +241,7 @@ export class ValidatorRegistry {
       equivocation_count: row.equivocation_count,
       total_vertices: row.total_vertices,
       total_commits: row.total_commits,
+      services,
     };
   }
 
@@ -564,5 +568,52 @@ export class ValidatorRegistry {
       leading_zero_bits: this.powDifficulty,
       estimated_hashes: Math.pow(2, this.powDifficulty),
     };
+  }
+
+  // ─── Service Capabilities ──────────────────────────────────────────────
+
+  /**
+   * Register or update the AI services a validator can execute.
+   */
+  updateServices(pubkey: string, serviceIds: string[]): boolean {
+    const validator = this.getValidator(pubkey);
+    if (!validator || validator.status !== "active") return false;
+
+    // Ensure the services column exists (migration-safe)
+    try {
+      this.sql.exec("ALTER TABLE validators ADD COLUMN services TEXT DEFAULT '[]'");
+    } catch {
+      // Column already exists
+    }
+
+    this.sql.exec(
+      "UPDATE validators SET services = ? WHERE pubkey = ?",
+      JSON.stringify(serviceIds), pubkey,
+    );
+    return true;
+  }
+
+  /**
+   * Get active validators that support a specific service.
+   */
+  getServiceProviders(serviceId: string): ValidatorRecord[] {
+    return this.getActiveValidators().filter(v =>
+      v.services.includes(serviceId),
+    );
+  }
+
+  /**
+   * Get the list of all services offered across the network (union of all validators).
+   */
+  getNetworkServices(): { service: string; providers: number }[] {
+    const serviceCounts = new Map<string, number>();
+    for (const v of this.getActiveValidators()) {
+      for (const svc of v.services) {
+        serviceCounts.set(svc, (serviceCounts.get(svc) || 0) + 1);
+      }
+    }
+    return Array.from(serviceCounts.entries())
+      .map(([service, providers]) => ({ service, providers }))
+      .sort((a, b) => b.providers - a.providers);
   }
 }

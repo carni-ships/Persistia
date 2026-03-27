@@ -284,6 +284,102 @@ export class FeeSplitter {
     return rows as any[];
   }
 
+  // ─── Federated Payments ─────────────────────────────────────────────────
+
+  /**
+   * Split a payment among multiple participating nodes in a federated service call.
+   * The originator gets a coordination bonus; the rest is split by reputation weight.
+   *
+   * Split: 10% burn, 5% treasury, 10% coordinator bonus, 75% split among participants
+   */
+  splitFederatedPayment(params: {
+    receiptId: string;
+    originatorAddress: string;
+    participantPubkeys: string[];
+    amount: bigint;
+    denom: string;
+    payerAddress: string;
+  }): { splits: Array<{ pubkey: string; address: string; share: bigint }>; burned: bigint; treasury: bigint } {
+    const { receiptId, originatorAddress, participantPubkeys, amount, denom, payerAddress } = params;
+    const isPersist = denom === "PERSIST";
+
+    // Fixed fee structure for federated calls
+    const burnShare = isPersist ? (amount * 100n) / 1000n : 0n;    // 10%
+    const treasuryShare = (amount * 50n) / 1000n;                    // 5%
+    const coordinatorBonus = (amount * 100n) / 1000n;                // 10%
+    const participantPool = amount - burnShare - treasuryShare - coordinatorBonus;  // 75%
+
+    // Burn
+    if (burnShare > 0n && isPersist) {
+      this.accounts.burn(payerAddress, denom, burnShare, `fed_burn:${receiptId}`);
+    }
+
+    // Treasury
+    if (treasuryShare > 0n) {
+      this.accounts.mint(this.config.treasuryAddress, denom, treasuryShare);
+    }
+
+    // Coordinator bonus
+    if (coordinatorBonus > 0n) {
+      this.accounts.mint(originatorAddress, denom, coordinatorBonus);
+    }
+
+    // Split participant pool by reputation weight
+    const splits: Array<{ pubkey: string; address: string; share: bigint }> = [];
+    let totalReputation = 0;
+    const participantInfo: Array<{ pubkey: string; address: string; reputation: number }> = [];
+
+    for (const pubkey of participantPubkeys) {
+      const validator = this.validators.getValidator(pubkey);
+      if (!validator) continue;
+
+      const addrRows = [...this.sql.exec(
+        "SELECT address FROM accounts WHERE pubkey = ?", pubkey,
+      )];
+      if (addrRows.length === 0) continue;
+
+      const reputation = Math.max(1, validator.reputation);
+      totalReputation += reputation;
+      participantInfo.push({
+        pubkey,
+        address: (addrRows[0] as any).address,
+        reputation,
+      });
+    }
+
+    let distributed = 0n;
+    for (const p of participantInfo) {
+      const share = totalReputation > 0
+        ? (participantPool * BigInt(p.reputation)) / BigInt(totalReputation)
+        : participantPool / BigInt(participantInfo.length || 1);
+
+      if (share > 0n) {
+        this.accounts.mint(p.address, denom, share);
+        splits.push({ pubkey: p.pubkey, address: p.address, share });
+        distributed += share;
+      }
+    }
+
+    // Rounding dust goes to originator
+    const dust = participantPool - distributed;
+    if (dust > 0n) {
+      this.accounts.mint(originatorAddress, denom, dust);
+    }
+
+    // Audit log
+    this.sql.exec(
+      `INSERT INTO fee_split_log
+       (receipt_id, denom, total, node_share, validator_share, burn_share, treasury_share, node_address, timestamp)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `fed:${receiptId}`, denom, amount.toString(),
+      (coordinatorBonus + dust).toString(), distributed.toString(),
+      burnShare.toString(), treasuryShare.toString(),
+      originatorAddress, Date.now(),
+    );
+
+    return { splits, burned: burnShare, treasury: treasuryShare };
+  }
+
   /** Summary stats. */
   getStats(): {
     totalSplits: number;

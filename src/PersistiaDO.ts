@@ -31,6 +31,11 @@ import { ServiceAttestationManager } from "./service-attestations";
 import { FeeSplitter, type FeeSplitConfig, PERSIST_FEE_SPLIT } from "./fee-splitter";
 import { computeAdaptiveInterval, SMOOTHING_WINDOW, type AdaptiveSignals } from "./adaptive-params";
 import { SnapshotManager, type SnapshotMeta } from "./snapshot";
+import { ServiceFederation, type FederationMode, type FederationResult } from "./service-federation";
+import type { ServiceRequestPayload, ServiceResponsePayload } from "./gossip";
+import { ProviderRegistry, type ProviderRecord } from "./provider-registry";
+import { ProviderProxy } from "./provider-proxy";
+import { SettlementBatcher } from "./settlement";
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -64,6 +69,10 @@ export class PersistiaWorldV4 implements DurableObject {
   mppHandler!: MPPHandler;
   attestationMgr!: ServiceAttestationManager;
   feeSplitter!: FeeSplitter;
+  serviceFederation!: ServiceFederation;
+  providerRegistry!: ProviderRegistry;
+  providerProxy!: ProviderProxy;
+  settlementBatcher!: SettlementBatcher;
   shardName: string = "global-world";
   currentRound: number = 0;
   finalizedSeq: number = 0;
@@ -381,6 +390,12 @@ export class PersistiaWorldV4 implements DurableObject {
     ServiceAttestationManager.initTables(sql);
     FeeSplitter.initTables(sql);
     AccountManager.initBurnTable(sql);
+    AccountManager.initHoldsTable(sql);
+    ProviderRegistry.initTables(sql);
+
+    // External provider marketplace
+    this.providerRegistry = new ProviderRegistry(sql, this.accountManager);
+    this.settlementBatcher = new SettlementBatcher(this.accountManager, this.providerRegistry);
 
     const anchorConfig: Partial<AnchorConfig> = {};
     if (this.env.BERACHAIN_RPC) {
@@ -403,6 +418,23 @@ export class PersistiaWorldV4 implements DurableObject {
       // Service attestation manager (needs node identity for signing)
       this.attestationMgr = new ServiceAttestationManager(sql, this.nodeIdentity);
       await this.attestationMgr.init();
+
+      // Service federation (pools validator compute for multi-node AI service calls)
+      this.serviceFederation = new ServiceFederation(
+        this.gossipManager, this.validatorRegistry,
+        this.nodeIdentity.pubkey, this.nodeUrl,
+      );
+
+      // Register this node's available services (all AI services)
+      this.validatorRegistry.updateServices(this.nodeIdentity.pubkey, [
+        "llm", "tts", "stt", "image", "embed", "translate", "vision",
+        "classify", "summarize", "code", "screenshot",
+      ]);
+
+      // Provider proxy (routes to external providers with failover, falls back to local Workers AI)
+      this.providerProxy = new ProviderProxy(
+        this.providerRegistry, this.settlementBatcher, this.attestationMgr,
+      );
 
       // Bootstrap from seed nodes if configured
       if (this.env.SEED_NODES) {
@@ -780,6 +812,9 @@ export class PersistiaWorldV4 implements DurableObject {
       if (url.pathname.startsWith("/governance/")) {
         return this.handleGovernanceRoute(req, url);
       }
+      if (url.pathname.startsWith("/providers/")) {
+        return this.handleProviderRoute(req, url);
+      }
       if (url.pathname === "/app-serve") {
         return this.handleAppServe(req, url);
       }
@@ -798,31 +833,173 @@ export class PersistiaWorldV4 implements DurableObject {
           return this.handleAttestationVerify(req, url);
         }
 
-        const response = await dispatchApiRoute(
-          url.pathname, req,
-          { AI: this.env.AI, BROWSER: this.env.BROWSER },
-          this.attestationMgr,
-        );
+        // Federation mode: ?federation=verified|parallel (default: solo)
+        const federationMode = (url.searchParams.get("federation") || "solo") as FederationMode;
+
+        // Federation catalog/stats endpoint
+        if (url.pathname === "/api/federation") {
+          const stats = this.serviceFederation?.getStats() || { pending: 0, active_nodes: 0, federation_capable: false };
+          const networkServices = this.validatorRegistry.getNetworkServices();
+          const proxyStats = this.providerProxy?.getStats() || { external_providers: 0, available_models: 0, pending_settlements: 0, pending_settlement_amount: 0n };
+          return this.json({
+            federation: stats, network_services: networkServices,
+            marketplace: {
+              ...proxyStats,
+              pending_settlement_amount: proxyStats.pending_settlement_amount.toString(),
+              providers: this.providerRegistry.getAvailableModels().map(m => ({
+                ...m, cheapest: m.cheapest.toString(), most_expensive: m.most_expensive.toString(),
+              })),
+            },
+          });
+        }
+
+        // ─── External Provider Routing (try external providers first) ─────
+        const serviceId = url.pathname.replace(/^\/api\//, "").replace(/\/$/, "");
+        let response: Response;
+        let usedExternalProvider = false;
+
+        // Try external providers first (if any registered for this service)
+        const bodyCloneForProxy = req.clone();
+        let requestBodyText = "";
+        try { requestBodyText = await bodyCloneForProxy.text(); } catch {}
+
+        if (this.providerProxy && requestBodyText) {
+          const body = JSON.parse(requestBodyText);
+          const model = body.model || "";
+
+          // Place escrow hold for external provider payment
+          const buyerAddress = mppResult.receipt?.payer || "";
+          let holdId: string | null = null;
+          if (buyerAddress) {
+            const hold = this.accountManager.placeHold(buyerAddress, "PERSIST", 500n, `api:${serviceId}`);
+            if (hold.ok) holdId = hold.hold_id || null;
+          }
+
+          const proxyResult = await this.providerProxy.routeToProvider({
+            serviceType: serviceId,
+            model,
+            requestBody: requestBodyText,
+            buyerAddress,
+          });
+
+          if (proxyResult) {
+            response = proxyResult.response;
+            usedExternalProvider = true;
+
+            // Release hold — settle the provider's price
+            if (holdId && proxyResult.provider) {
+              this.accountManager.releaseHold(holdId, proxyResult.provider.price);
+            } else if (holdId) {
+              this.accountManager.releaseHold(holdId);
+            }
+          } else {
+            // No external providers — release hold and fall back to local Workers AI
+            if (holdId) this.accountManager.releaseHold(holdId);
+
+            // Reconstruct request for local dispatch
+            const localReq = new Request(req.url, {
+              method: req.method,
+              headers: req.headers,
+              body: requestBodyText,
+            });
+            response = await dispatchApiRoute(
+              url.pathname, localReq,
+              { AI: this.env.AI, BROWSER: this.env.BROWSER },
+              this.attestationMgr,
+            );
+          }
+        } else {
+          response = await dispatchApiRoute(
+            url.pathname, req,
+            { AI: this.env.AI, BROWSER: this.env.BROWSER },
+            this.attestationMgr,
+          );
+        }
+
+        // If federation requested and response is OK, initiate multi-node verification
+        let federationResult: FederationResult | null = null;
+        if (federationMode !== "solo" && response.ok && this.serviceFederation) {
+          const attestationId = response.headers.get("X-Attestation-Id") || "";
+          const responseClone = response.clone();
+          const outputBytes = new Uint8Array(await responseClone.arrayBuffer());
+          const outputHex = Array.from(outputBytes).map(b => b.toString(16).padStart(2, "0")).join("");
+          const outputHash = await sha256(outputHex);
+
+          // Get the original request body for federation
+          const bodyClone = req.clone();
+          let inputBodyB64 = "";
+          try {
+            const bodyText = await bodyClone.text();
+            inputBodyB64 = btoa(bodyText);
+          } catch {}
+
+          const service = url.pathname.replace(/^\/api\//, "").replace(/\/$/, "");
+          federationResult = await this.serviceFederation.initiateRequest({
+            service,
+            model: "", // model is inside the body
+            inputBodyB64,
+            mode: federationMode,
+            localOutputHash: outputHash,
+            localAttestationId: attestationId,
+          });
+        }
+
         // Attach MPP receipt header + split fees if payment was verified
         if (mppResult.receipt) {
-          // Split the payment: node / validators / burn / treasury
           const nodeAddr = this.nodeIdentity
             ? await import("./wallet").then(w => w.pubkeyB64ToAddress(this.nodeIdentity!.pubkey))
             : this.feeSplitter["config"].treasuryAddress;
-          this.feeSplitter.splitPayment({
-            receiptId: mppResult.receipt.receipt_id,
-            nodeAddress: nodeAddr,
-            amount: BigInt(mppResult.receipt.amount),
-            denom: mppResult.receipt.denom,
-            payerAddress: mppResult.receipt.payer,
-          });
+
+          // Use federated payment split if multiple nodes participated
+          if (federationResult && federationResult.participating_nodes.length > 1) {
+            this.feeSplitter.splitFederatedPayment({
+              receiptId: mppResult.receipt.receipt_id,
+              originatorAddress: nodeAddr,
+              participantPubkeys: federationResult.participating_nodes,
+              amount: BigInt(mppResult.receipt.amount),
+              denom: mppResult.receipt.denom,
+              payerAddress: mppResult.receipt.payer,
+            });
+          } else {
+            // Solo payment split
+            this.feeSplitter.splitPayment({
+              receiptId: mppResult.receipt.receipt_id,
+              nodeAddress: nodeAddr,
+              amount: BigInt(mppResult.receipt.amount),
+              denom: mppResult.receipt.denom,
+              payerAddress: mppResult.receipt.payer,
+            });
+          }
 
           const receiptResponse = new Response(response.body, response);
           receiptResponse.headers.set(
             "Payment-Receipt",
             MPPHandler.formatReceiptHeader(mppResult.receipt),
           );
+          // Attach federation result if available
+          if (federationResult) {
+            receiptResponse.headers.set("X-Federation", JSON.stringify({
+              mode: federationResult.mode,
+              agreed: federationResult.agreed,
+              participating_nodes: federationResult.participating_nodes.length,
+              agreeing_nodes: federationResult.agreeing_nodes.length,
+              required: federationResult.required_responses,
+            }));
+          }
           return receiptResponse;
+        }
+
+        // No MPP receipt — still attach federation headers if applicable
+        if (federationResult) {
+          const fedResponse = new Response(response.body, response);
+          fedResponse.headers.set("X-Federation", JSON.stringify({
+            mode: federationResult.mode,
+            agreed: federationResult.agreed,
+            participating_nodes: federationResult.participating_nodes.length,
+            agreeing_nodes: federationResult.agreeing_nodes.length,
+            required: federationResult.required_responses,
+          }));
+          return fedResponse;
         }
         return response;
       }
@@ -1311,6 +1488,22 @@ export class PersistiaWorldV4 implements DurableObject {
       // 8. Housekeeping: prune stale rate-limit entries + old anchor bundles
       this.validatorRegistry.pruneRateLimitLog();
       this.anchorManager.pruneOldAnchors();
+
+      // 8b. Flush settlement batches and clean up expired escrow holds
+      if (this.settlementBatcher?.getPendingCount() > 0) {
+        const result = this.settlementBatcher.flush();
+        if (result.entries_settled > 0) {
+          console.log(`Settlement: ${result.entries_settled} entries, ${result.total_amount} PERSIST`);
+        }
+      }
+      this.accountManager.cleanupExpiredHolds();
+
+      // 8c. Resolve pending downtime reports past grace period
+      for (const provider of this.providerRegistry.getAllActive()) {
+        if (provider.down_reported_at) {
+          this.providerRegistry.resolveDownReport(provider.provider_id);
+        }
+      }
 
       // 7. Prune old DAG data to stay within free-tier row limits
       // Keep last 100 rounds of vertices, prune 200 per cycle to avoid heavy deletes
@@ -2882,6 +3075,186 @@ export class PersistiaWorldV4 implements DurableObject {
 
   // ─── Gossip Routes ──────────────────────────────────────────────────────
 
+  /**
+   * Execute a federated service request received from a peer.
+   * Runs the AI inference locally, creates an attestation, and gossips the response.
+   */
+  // ─── Provider Marketplace Routes (/providers/*) ──────────────────────
+
+  private async handleProviderRoute(req: Request, url: URL): Promise<Response> {
+    const subpath = url.pathname.replace(/^\/providers\/?/, "");
+
+    switch (subpath) {
+      case "register": {
+        if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+        const body = await req.json() as any;
+        const result = await this.providerRegistry.register({
+          owner_address: body.owner_address,
+          endpoint_url: body.endpoint_url,
+          service_type: body.service_type,
+          model: body.model,
+          price: BigInt(body.price || 0),
+          bond_amount: BigInt(body.bond_amount || 0),
+        });
+        if (!result.ok) return this.json({ error: result.error }, 400);
+        return this.json({
+          ok: true,
+          provider: {
+            ...result.provider,
+            price: result.provider!.price.toString(),
+            bond: result.provider!.bond.toString(),
+            total_earnings: result.provider!.total_earnings.toString(),
+          },
+        });
+      }
+
+      case "deactivate": {
+        if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+        const body = await req.json() as any;
+        const result = this.providerRegistry.deactivate(body.provider_id, body.owner_address);
+        if (!result.ok) return this.json({ error: result.error }, 400);
+        return this.json({ ok: true, refunded: result.refunded?.toString() });
+      }
+
+      case "update-price": {
+        if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+        const body = await req.json() as any;
+        const result = this.providerRegistry.updatePrice(body.provider_id, body.owner_address, BigInt(body.price || 0));
+        if (!result.ok) return this.json({ error: result.error }, 400);
+        return this.json({ ok: true });
+      }
+
+      case "update-endpoint": {
+        if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+        const body = await req.json() as any;
+        const result = this.providerRegistry.updateEndpoint(body.provider_id, body.owner_address, body.endpoint_url);
+        if (!result.ok) return this.json({ error: result.error }, 400);
+        return this.json({ ok: true });
+      }
+
+      case "claim": {
+        if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+        const body = await req.json() as any;
+        const result = this.providerRegistry.claimEarnings(body.provider_id, body.owner_address);
+        if (!result.ok) return this.json({ error: result.error }, 400);
+        return this.json({ ok: true, amount: result.amount?.toString() });
+      }
+
+      case "report-down": {
+        if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+        const body = await req.json() as any;
+        const report = this.providerRegistry.reportDown(body.provider_id, body.reporter_address);
+        if (!report) return this.json({ error: "Provider not found, already reported, or inactive" }, 400);
+        return this.json({ ok: true, report });
+      }
+
+      case "list": {
+        const serviceType = url.searchParams.get("service_type") || "";
+        const model = url.searchParams.get("model") || "";
+        const providers = serviceType && model
+          ? this.providerRegistry.getActive(serviceType, model)
+          : this.providerRegistry.getAllActive();
+        return this.json({
+          providers: providers.map(p => ({
+            ...p,
+            price: p.price.toString(),
+            bond: p.bond.toString(),
+            total_earnings: p.total_earnings.toString(),
+          })),
+        });
+      }
+
+      case "models": {
+        const models = this.providerRegistry.getAvailableModels();
+        return this.json({
+          models: models.map(m => ({
+            ...m,
+            cheapest: m.cheapest.toString(),
+            most_expensive: m.most_expensive.toString(),
+          })),
+        });
+      }
+
+      case "stats": {
+        const stats = this.providerRegistry.getStats();
+        return this.json({
+          ...stats,
+          total_bond_locked: stats.total_bond_locked.toString(),
+        });
+      }
+
+      case "my-providers": {
+        const owner = url.searchParams.get("address") || "";
+        if (!owner) return this.json({ error: "address param required" }, 400);
+        const providers = this.providerRegistry.getByOwner(owner);
+        return this.json({
+          providers: providers.map(p => ({
+            ...p,
+            price: p.price.toString(),
+            bond: p.bond.toString(),
+            total_earnings: p.total_earnings.toString(),
+          })),
+        });
+      }
+
+      default:
+        return this.json({ error: "Unknown provider route", routes: [
+          "register", "deactivate", "update-price", "update-endpoint",
+          "claim", "report-down", "list", "models", "stats", "my-providers",
+        ] }, 404);
+    }
+  }
+
+  private async handleFederatedServiceRequest(payload: ServiceRequestPayload): Promise<void> {
+    if (!payload.input_body_b64) return;
+
+    const bodyRaw = atob(payload.input_body_b64);
+    const body = JSON.parse(bodyRaw);
+    const modelId = body.model || payload.model;
+
+    // Pre-commit
+    const preCommit = await this.attestationMgr.preCommit(payload.service, modelId, bodyRaw);
+
+    // Execute via AI binding
+    const fakeRequest = new Request("https://internal/api/" + payload.service, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: bodyRaw,
+    });
+
+    const response = await dispatchApiRoute(
+      "/api/" + payload.service,
+      fakeRequest,
+      this.env,
+      null, // skip individual attestation wrapping — we do it manually
+    );
+
+    if (!response.ok) return;
+
+    // Hash the output
+    const outputClone = response.clone();
+    const outputBytes = new Uint8Array(await outputClone.arrayBuffer());
+    const outputHex = Array.from(outputBytes).map(b => b.toString(16).padStart(2, "0")).join("");
+    const outputHash = await sha256(outputHex);
+
+    // Create attestation
+    const attestation = await this.attestationMgr.attest({
+      service: payload.service,
+      model: modelId,
+      input_hash: preCommit.input_hash,
+      output_bytes: outputBytes,
+      pre_commitment: preCommit.pre_commitment,
+      nonce: preCommit.nonce,
+    });
+
+    // Send response back via gossip
+    await this.serviceFederation.sendResponse({
+      request_id: payload.request_id,
+      output_hash: outputHash,
+      attestation_id: attestation.attestation_id,
+    });
+  }
+
   private async handleGossipRoute(req: Request, url: URL): Promise<Response> {
     switch (url.pathname) {
       case "/gossip/push": {
@@ -2966,6 +3339,23 @@ export class PersistiaWorldV4 implements DurableObject {
             // Re-gossip to peers (excluding sender)
             const exclude = new Set([envelope.sender_pubkey]);
             this.gossipManager.flood(envelope, exclude).catch(() => {});
+            return this.json({ ok: true });
+          }
+          case "service_request": {
+            const payload = envelope.payload as ServiceRequestPayload;
+            if (!this.serviceFederation?.shouldHandleRequest(payload)) {
+              return this.json({ ok: false, reason: "not handling" });
+            }
+            // Execute the service locally and send response back via gossip
+            this.handleFederatedServiceRequest(payload).catch(e =>
+              console.error("Federation request failed:", e.message));
+            return this.json({ ok: true, accepted: true });
+          }
+          case "service_response": {
+            const payload = envelope.payload as ServiceResponsePayload;
+            if (this.serviceFederation) {
+              this.serviceFederation.handleResponse(payload);
+            }
             return this.json({ ok: true });
           }
           default:

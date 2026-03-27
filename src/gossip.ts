@@ -24,7 +24,7 @@ export interface GossipPeer {
 }
 
 export interface GossipEnvelope {
-  type: "vertex" | "event" | "peer_exchange" | "sync_request" | "sync_response" | "zk_proof";
+  type: "vertex" | "event" | "peer_exchange" | "sync_request" | "sync_response" | "zk_proof" | "service_request" | "service_response";
   sender_pubkey: string;
   sender_url: string;
   signature: string;         // signs the payload JSON
@@ -33,6 +33,30 @@ export interface GossipEnvelope {
   nonce: string;             // dedup
   grumpkin_x?: string;       // sender's Grumpkin public key x-coordinate
   grumpkin_y?: string;       // sender's Grumpkin public key y-coordinate
+}
+
+// ─── Service Federation Payloads ──────────────────────────────────────────────
+
+export interface ServiceRequestPayload {
+  request_id: string;          // unique ID for correlating responses
+  service: string;             // e.g. "llm", "tts"
+  model: string;               // model ID
+  input_hash: string;          // H(request body) — peers fetch actual body from originator
+  input_body_b64?: string;     // base64-encoded request body (included for verified/parallel modes)
+  mode: "verified" | "parallel";  // solo doesn't gossip
+  originator_pubkey: string;   // node that received the original client request
+  originator_url: string;      // where to POST the response back
+  min_responses: number;       // minimum agreeing nodes for quorum
+  expires_at: number;          // reject if past this timestamp
+}
+
+export interface ServiceResponsePayload {
+  request_id: string;          // correlates to the original request
+  responder_pubkey: string;    // node that executed the inference
+  output_hash: string;         // H(output) for agreement checking
+  output_body_b64?: string;    // base64-encoded output (only for parallel split recombination)
+  attestation_id: string;      // the responder's local attestation ID
+  timestamp: number;
 }
 
 export interface PeerExchangePayload {
