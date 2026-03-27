@@ -160,7 +160,15 @@ function nativeBbVerify(proof: Uint8Array, publicInputs: string[], vk: Uint8Arra
 function nodeUrl(base: string, path: string): string {
   try {
     const u = new URL(base);
-    u.pathname = u.pathname.replace(/\/$/, "") + path;
+    // Split path from its query string so pathname doesn't encode the '?'
+    const [pathname, query] = path.split("?", 2);
+    u.pathname = u.pathname.replace(/\/$/, "") + pathname;
+    if (query) {
+      for (const param of query.split("&")) {
+        const [k, v] = param.split("=", 2);
+        u.searchParams.set(k, v ?? "");
+      }
+    }
     return u.toString();
   } catch {
     return `${base}${path}`;
@@ -340,7 +348,7 @@ async function cmdProve(
   console.log(`  Proof size: ${proof.proof.length} bytes`);
   console.log(`  Recursive: ${prevProofPath ? "yes (chained)" : "no (genesis)"}`);
 
-  await backend.destroy();
+  if (typeof backend.destroy === "function") await backend.destroy();
 }
 
 async function cmdVerify(proofPath: string, useNative = false) {
@@ -364,7 +372,7 @@ async function cmdVerify(proofPath: string, useNative = false) {
     const start = performance.now();
     valid = await backend.verifyProof({ proof: proofBytes, publicInputs: proofData.publicInputs });
     elapsed = ((performance.now() - start) / 1000).toFixed(2);
-    await backend.destroy();
+    if (typeof backend.destroy === "function") await backend.destroy();
   }
 
   if (valid) {
@@ -477,7 +485,7 @@ async function cmdBench(nodeBase: string, blockNumber: number) {
   console.log(`  Proof:    ${proof.proof.length} bytes`);
   console.log(`  Speedup vs SP1 (~70s): ~${(70000 / proveTime).toFixed(1)}x`);
 
-  await backend.destroy();
+  if (typeof backend.destroy === "function") await backend.destroy();
 }
 
 // --- Parallel Prover ---
