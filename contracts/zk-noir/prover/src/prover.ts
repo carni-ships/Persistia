@@ -405,12 +405,15 @@ async function cmdWatch(
     try {
       const latestBlock = await fetchLatestBlock(nodeBase);
 
-      if (latestBlock > lastProvenBlock) {
+      // Catch up to latest committed block
+      while (latestBlock > lastProvenBlock) {
         const blockNum = lastProvenBlock + 1;
         const outPath = join(proofDir, `block_${blockNum}.json`);
+        let proved = false;
         try {
           await cmdProve(nodeBase, blockNum, outPath, prevProofPath, useNative);
           prevProofPath = outPath;
+          proved = true;
 
           // Submit to node
           try {
@@ -422,7 +425,7 @@ async function cmdWatch(
           }
         } catch (e: any) {
           // Skip blocks that don't exist (pre-deploy blocks without mutations)
-          if (e.message?.includes("404") || e.message?.includes("not found") || e.message?.includes("not committed")) {
+          if (e.message?.includes("404") || e.message?.includes("not found") || e.message?.includes("not committed") || e.message?.includes("Too many mutations")) {
             console.log(`Block ${blockNum} not available, skipping`);
           } else {
             throw e;
