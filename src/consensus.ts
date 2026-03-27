@@ -148,11 +148,6 @@ export function checkCommit(
     return { committed: false, anchorHash: null, reason: "Not an anchor round (must be even)" };
   }
 
-  const quorum = getQuorumSize(activeCount);
-  if (activeCount < 3) {
-    return { committed: false, anchorHash: null, reason: `Need >= 3 active nodes, have ${activeCount}` };
-  }
-
   // Find leader's vertex at this round
   const roundVertices = verticesByRound.get(round) || [];
   const anchor = roundVertices.find(v => v.author === leaderPubkey);
@@ -169,13 +164,15 @@ export function checkCommit(
     }
   }
 
-  if (supporters.size >= quorum) {
+  const quorum = getQuorumSize(activeCount);
+  if (activeCount >= 3 && supporters.size >= quorum) {
     return { committed: true, anchorHash: anchor.hash, reason: `Quorum met: ${supporters.size}/${quorum}` };
   }
 
   // Single-author fallback: if the same author created vertices in both rounds
   // and references their own anchor, allow self-commit (solo node operation).
-  // This handles the case where sibling DOs exist but don't cross-reference.
+  // This handles the case where there are fewer than 3 active nodes, or
+  // sibling DOs exist but don't cross-reference.
   if (nextRoundVertices.length > 0) {
     const selfRef = nextRoundVertices.find(v => v.author === leaderPubkey && v.refs.includes(anchor.hash));
     if (selfRef) {

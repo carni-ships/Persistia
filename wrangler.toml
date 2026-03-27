@@ -12,9 +12,17 @@ binding = "ASSETS"
 name = "PERSISTIA_WORLD"
 class_name = "PersistiaWorldV4"
 
+[[durable_objects.bindings]]
+name = "PERSISTIA_AGENT"
+class_name = "PersistiaAgent"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["PersistiaWorldV4"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["PersistiaAgent"]
 
 # ─── R2 Object Storage (WASM binaries + ZK proof blobs) ───────────────
 [[r2_buckets]]
@@ -31,9 +39,24 @@ queue = "persistia-relay"
 max_batch_size = 10
 max_batch_timeout = 5
 
+# ─── Workers AI (GPU inference at the edge) ──────────────────────────
+[ai]
+binding = "AI"
+
+# ─── Browser Rendering (headless Chrome) ─────────────────────────────
+# Note: Browser binding not supported in local dev. Uncomment for production.
+# [browser]
+# binding = "BROWSER"
+
 # ─── Environment Variables ─────────────────────────────────────────────
 # NODE_URL       — This node's public URL
 # SEED_NODES     — Comma-separated seed node URLs for gossip bootstrap
 # BERACHAIN_RPC        — Berachain RPC URL (default: https://rpc.berachain.com)
 # BERACHAIN_PRIVATE_KEY — Hex-encoded private key for signing anchor txs
 # HYBERDB_ADDRESS       — HyberDB contract address
+# MPP_RECIPIENT         — persistia address receiving service payments
+# MPP_ROUTES            — JSON array of route pricing configs for AI services gateway
+# SHARD_NAMES           — Comma-separated shard names (default: node-1,node-2,node-3)
+
+[vars]
+SHARD_NAMES = "node-1,node-2,node-3"

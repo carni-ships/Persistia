@@ -12,9 +12,12 @@
     "wrangler": "^3.100.0"
   },
   "dependencies": {
+    "@cloudflare/puppeteer": "^1.0.6",
     "@types/ws": "^8.18.1",
+    "agents": "^0.1.6",
     "fflate": "^0.8.2",
     "viem": "^2.47.6",
-    "ws": "^8.20.0"
+    "ws": "^8.20.0",
+    "zod": "^3.24.0"
   }
 }

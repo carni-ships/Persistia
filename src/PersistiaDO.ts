@@ -28,6 +28,7 @@ import { AccountManager, pubkeyB64ToAddress, validateAddress } from "./wallet";
 import { MPPHandler, type MPPConfig, type MPPReceipt } from "./mpp";
 import { dispatchApiRoute } from "./ai-services";
 import { ServiceAttestationManager } from "./service-attestations";
+import { FeeSplitter, type FeeSplitConfig, PERSIST_FEE_SPLIT } from "./fee-splitter";
 import { computeAdaptiveInterval, SMOOTHING_WINDOW, type AdaptiveSignals } from "./adaptive-params";
 import { SnapshotManager, type SnapshotMeta } from "./snapshot";
 
@@ -62,6 +63,7 @@ export class PersistiaWorldV4 implements DurableObject {
   accountManager!: AccountManager;
   mppHandler!: MPPHandler;
   attestationMgr!: ServiceAttestationManager;
+  feeSplitter!: FeeSplitter;
   shardName: string = "global-world";
   currentRound: number = 0;
   finalizedSeq: number = 0;
@@ -368,10 +370,17 @@ export class PersistiaWorldV4 implements DurableObject {
     };
     this.mppHandler = new MPPHandler(sql, mppConfig);
 
-    // Service attestation manager (verifiable AI compute)
+    // Fee splitter (distributes MPP payments: node/validators/burn/treasury)
+    const feeSplitConfig: FeeSplitConfig = {
+      treasuryAddress: this.env.MPP_RECIPIENT || "persistia1default",
+      ...PERSIST_FEE_SPLIT,
+    };
+    this.feeSplitter = new FeeSplitter(sql, this.accountManager, this.validatorRegistry, feeSplitConfig);
+
+    // Service attestation tables (created before identity is available)
     ServiceAttestationManager.initTables(sql);
-    this.attestationMgr = new ServiceAttestationManager(sql, this.nodeIdentity);
-    await this.attestationMgr.init();
+    FeeSplitter.initTables(sql);
+    AccountManager.initBurnTable(sql);
 
     const anchorConfig: Partial<AnchorConfig> = {};
     if (this.env.BERACHAIN_RPC) {
@@ -390,6 +399,10 @@ export class PersistiaWorldV4 implements DurableObject {
     if (CONSENSUS_ENABLED) {
       this.nodeIdentity = await loadOrCreateNodeIdentity(sql, this.nodeUrl);
       this.gossipManager.setIdentity(this.nodeIdentity);
+
+      // Service attestation manager (needs node identity for signing)
+      this.attestationMgr = new ServiceAttestationManager(sql, this.nodeIdentity);
+      await this.attestationMgr.init();
 
       // Bootstrap from seed nodes if configured
       if (this.env.SEED_NODES) {
@@ -535,6 +548,7 @@ export class PersistiaWorldV4 implements DurableObject {
     max_events_per_vertex: { min: 5, max: 500 },
     pending_event_ttl_ms: { min: 30_000, max: 3_600_000 },
     min_nodes_for_consensus: { min: 1, max: 100 },
+    reactive_alarm_delay_ms: { min: 100, max: 30_000 },
   };
 
   private getNetworkParam(key: string, fallback: number): number {
@@ -614,6 +628,10 @@ export class PersistiaWorldV4 implements DurableObject {
       lastCommittedRound: this.lastCommittedRound,
       consecutiveEmptyRounds: this._consecutiveEmptyRounds,
       utilizationHistory: this._utilizationHistory,
+      // ZK circuit mutation ceiling: 1024 slots, ~5 mutations/event, 2 vertices/block
+      circuitMutationSlots: 1024,
+      avgMutationsPerEvent: 5,
+      verticesPerBlock: 2,
     };
 
     const intervalBounds = PersistiaWorldV4.GOVERNABLE_PARAMS["round_interval_ms"];
@@ -785,8 +803,20 @@ export class PersistiaWorldV4 implements DurableObject {
           { AI: this.env.AI, BROWSER: this.env.BROWSER },
           this.attestationMgr,
         );
-        // Attach MPP receipt header if payment was verified
+        // Attach MPP receipt header + split fees if payment was verified
         if (mppResult.receipt) {
+          // Split the payment: node / validators / burn / treasury
+          const nodeAddr = this.nodeIdentity
+            ? await import("./wallet").then(w => w.pubkeyB64ToAddress(this.nodeIdentity!.pubkey))
+            : this.feeSplitter["config"].treasuryAddress;
+          this.feeSplitter.splitPayment({
+            receiptId: mppResult.receipt.receipt_id,
+            nodeAddress: nodeAddr,
+            amount: BigInt(mppResult.receipt.amount),
+            denom: mppResult.receipt.denom,
+            payerAddress: mppResult.receipt.payer,
+          });
+
           const receiptResponse = new Response(response.body, response);
           receiptResponse.headers.set(
             "Payment-Receipt",
@@ -882,6 +912,21 @@ export class PersistiaWorldV4 implements DurableObject {
           const mintAmount = BigInt(amount || 1000);
           this.accountManager.mint(acct.address, mintDenom, mintAmount);
           return this.json({ ok: true, address: acct.address, balance: this.accountManager.getBalance(acct.address, mintDenom).toString() });
+        }
+
+        case "/economics": {
+          const feeStats = this.feeSplitter.getStats();
+          const totalBurned = this.accountManager.totalBurned("PERSIST");
+          return this.json({
+            fee_splits: feeStats.totalSplits,
+            total_node_earnings: feeStats.totalNodeEarnings.toString(),
+            total_validator_rewards: feeStats.totalValidatorRewards.toString(),
+            total_burned: totalBurned.toString(),
+            total_treasury: feeStats.totalTreasuryEarnings.toString(),
+            validator_pool_balance: feeStats.poolBalance.toString(),
+            burn_history: this.accountManager.burnHistory({ denom: "PERSIST", limit: 10 })
+              .map(b => ({ ...b, amount: b.amount.toString() })),
+          });
         }
 
         case "/sync": {
@@ -1254,11 +1299,16 @@ export class PersistiaWorldV4 implements DurableObject {
           await this.createAndBroadcastVertex();
         }
 
-        // 6. Anchor state if due
+        // 6. Try to commit rounds (essential — without this, commits only happen
+        // via gossip/receiveVertex, which doesn't fire in single-node mode)
+        const gap = this.currentRound - this.lastCommittedRound;
+        await this.tryCommitRounds(gap > 40 ? 50 : 10);
+
+        // 7. Anchor state if due
         await this.maybeAnchorState();
       }
 
-      // 6. Housekeeping: prune stale rate-limit entries + old anchor bundles
+      // 8. Housekeeping: prune stale rate-limit entries + old anchor bundles
       this.validatorRegistry.pruneRateLimitLog();
       this.anchorManager.pruneOldAnchors();
 
@@ -1397,9 +1447,10 @@ export class PersistiaWorldV4 implements DurableObject {
    */
   private scheduleReactiveAlarm() {
     const now = Date.now();
-    const IMMINENT_THRESHOLD_MS = 500;
-    if (this._nextAlarmTime - now <= IMMINENT_THRESHOLD_MS) return; // already firing soon
-    const reactiveTime = now + 100;
+    // Use configurable minimum delay (default 5s) to prevent runaway block production
+    const minDelay = this.getNetworkParam("reactive_alarm_delay_ms", 5000);
+    if (this._nextAlarmTime - now <= minDelay) return; // already firing soon enough
+    const reactiveTime = now + minDelay;
     this._nextAlarmTime = reactiveTime;
     this.state.storage.setAlarm(reactiveTime);
   }
@@ -1602,6 +1653,33 @@ export class PersistiaWorldV4 implements DurableObject {
       }
 
       case "/admin/peers":
+        if (req.method === "DELETE") {
+          const { pubkey } = await req.json() as any;
+          if (!pubkey) return this.json({ error: "pubkey required" }, 400);
+          this.state.storage.sql.exec("DELETE FROM active_nodes WHERE pubkey = ? AND is_self = 0", pubkey);
+          this.state.storage.sql.exec("DELETE FROM gossip_peers WHERE pubkey = ?", pubkey);
+          this.invalidateActiveCache();
+          return this.json({ ok: true, peers: this.getActiveNodes() });
+        }
+        if (req.method === "POST") {
+          // Re-bootstrap from sibling shards
+          const siblingShards = (this.env.SHARD_NAMES || "node-1,node-2,node-3")
+            .split(",").map((s: string) => s.trim()).filter((s: string) => s && s !== this.shardName);
+          const siblingUrls = siblingShards.map((s: string) => `${url.origin}/?shard=${s}`);
+          const n = await this.gossipManager.bootstrapFromSeeds(siblingUrls);
+          for (const peer of this.gossipManager.getPeers()) {
+            if (peer.pubkey && peer.url) {
+              this.state.storage.sql.exec(
+                `INSERT INTO active_nodes (pubkey, url, last_vertex_round, last_seen, is_self)
+                 VALUES (?, ?, 0, ?, 0)
+                 ON CONFLICT(pubkey) DO UPDATE SET url = ?, last_seen = ?`,
+                peer.pubkey, peer.url, Date.now(), peer.url, Date.now(),
+              );
+            }
+          }
+          this.invalidateActiveCache();
+          return this.json({ ok: true, discovered: n, peers: this.getActiveNodes() });
+        }
         return this.json({ peers: this.getActiveNodes() });
 
       case "/admin/reset": {
@@ -1661,6 +1739,25 @@ export class PersistiaWorldV4 implements DurableObject {
         } catch (e: any) {
           return this.json({ ok: false, error: e.message, stack: e.stack });
         }
+      }
+
+      case "/admin/dag-stats": {
+        const sql2 = this.state.storage.sql;
+        const totalVerts = [...sql2.exec("SELECT COUNT(*) as cnt FROM dag_vertices")][0]?.cnt ?? 0;
+        const minRound = [...sql2.exec("SELECT MIN(round) as r FROM dag_vertices")][0]?.r ?? null;
+        const maxRound = [...sql2.exec("SELECT MAX(round) as r FROM dag_vertices")][0]?.r ?? null;
+        const recentVerts = [...sql2.exec(
+          "SELECT round, COUNT(*) as cnt FROM dag_vertices WHERE round >= ? GROUP BY round ORDER BY round ASC LIMIT 20",
+          this.lastCommittedRound,
+        )];
+        return this.json({
+          total_vertices: totalVerts,
+          min_round: minRound,
+          max_round: maxRound,
+          current_round: this.currentRound,
+          last_committed_round: this.lastCommittedRound,
+          recent_vertices: recentVerts,
+        });
       }
 
       case "/admin/set-round": {
@@ -1895,6 +1992,20 @@ export class PersistiaWorldV4 implements DurableObject {
         if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
         const body = await req.json() as SignedEvent;
         body.type = "contract.call";
+        return this.json(await this.receiveClientEvent(body));
+      }
+
+      case "/contract/upgrade": {
+        if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+        const body = await req.json() as SignedEvent;
+        body.type = "contract.upgrade";
+        return this.json(await this.receiveClientEvent(body));
+      }
+
+      case "/contract/lock": {
+        if (req.method !== "POST") return this.json({ error: "POST required" }, 405);
+        const body = await req.json() as SignedEvent;
+        body.type = "contract.lock";
         return this.json(await this.receiveClientEvent(body));
       }
 
@@ -3175,20 +3286,11 @@ export class PersistiaWorldV4 implements DurableObject {
         );
       },
       // Bootstrap adaptive params from peers (cold-start convergence)
-      (peerAdaptive: { round_interval_ms: number; max_events_per_vertex: number }) => {
-        // Only adopt peer's adaptive state if we're catching up (far behind)
-        if (this._adaptiveEnabled && this._utilizationHistory.length === 0) {
-          const currentInterval = this.getNetworkParam("round_interval_ms", ROUND_INTERVAL_MS);
-          if (peerAdaptive.round_interval_ms !== currentInterval) {
-            this.setNetworkParam("round_interval_ms", peerAdaptive.round_interval_ms.toString(), "adaptive-bootstrap");
-            console.log(`Adaptive bootstrap: round_interval_ms → ${peerAdaptive.round_interval_ms}ms from peer`);
-          }
-          const currentMax = this.getNetworkParam("max_events_per_vertex", MAX_EVENTS_PER_VERTEX);
-          if (peerAdaptive.max_events_per_vertex !== currentMax) {
-            this.setNetworkParam("max_events_per_vertex", peerAdaptive.max_events_per_vertex.toString(), "adaptive-bootstrap");
-            console.log(`Adaptive bootstrap: max_events_per_vertex → ${peerAdaptive.max_events_per_vertex} from peer`);
-          }
-        }
+      // Disabled: adaptive-bootstrap overwrites admin-set config on every deploy
+      // since deploys reset runtime state (_utilizationHistory). The adaptive
+      // system itself will converge to the right values after a few rounds.
+      (_peerAdaptive: { round_interval_ms: number; max_events_per_vertex: number }) => {
+        // No-op: rely on adaptive system to converge organically
       },
     );
 
@@ -3542,8 +3644,8 @@ export class PersistiaWorldV4 implements DurableObject {
         event: { type: event.type, payload, pubkey: event.pubkey, hash: eventHash },
       });
 
-      // Try to create a vertex immediately if we have pending events
-      await this.maybeCreateVertex();
+      // Vertex creation is alarm-driven only — event-triggered vertex creation
+      // causes runaway round advancement that outpaces the prover.
 
       return { ok: true, pending: true };
     } else {
@@ -3592,8 +3694,15 @@ export class PersistiaWorldV4 implements DurableObject {
 
   // ─── Vertex Creation ────────────────────────────────────────────────────
 
+  private _lastVertexTime = 0;
+
   private async maybeCreateVertex() {
     if (!this.nodeIdentity) return;
+
+    // Throttle vertex creation to at most once per round_interval_ms / 2
+    // to prevent every accepted event from advancing the round
+    const minInterval = this.getNetworkParam("round_interval_ms", ROUND_INTERVAL_MS) / 2;
+    if (Date.now() - this._lastVertexTime < minInterval) return;
 
     // Don't create if we already have a vertex this round
     const existing = [...this.state.storage.sql.exec(
@@ -3602,6 +3711,7 @@ export class PersistiaWorldV4 implements DurableObject {
     )];
     if (existing.length > 0) return;
 
+    this._lastVertexTime = Date.now();
     await this.createAndBroadcastVertex();
   }
 
@@ -4071,8 +4181,9 @@ export class PersistiaWorldV4 implements DurableObject {
     }
 
     // ── Persist per-block state mutations for ZK prover ─────────────────────
-    // Capture dirty entries from the state tree before computeCommitment clears them.
+    // Capture dirty entries and clear them so next block starts fresh.
     const blockMutations = this.stateTree.getDirtyMutations();
+    this.stateTree.clearDirtyKeys();
     if (blockMutations.length > 0) {
       // Cloudflare DO SQLite limits bind params; insert one row at a time
       for (const m of blockMutations) {
@@ -4172,6 +4283,9 @@ export class PersistiaWorldV4 implements DurableObject {
       "SELECT DISTINCT author FROM dag_vertices WHERE round = ?", round,
     )].map((r: any) => r.author as string);
     this.validatorRegistry.rewardCommitParticipation(commitParticipants);
+
+    // Distribute accumulated validator token rewards (reputation-weighted)
+    this.feeSplitter.distributeValidatorRewards(round, "PERSIST");
 
     // ── Adaptive parameter adjustment (EIP-1559 style) ───────────────────
     this.adjustAdaptiveParams(round, finalizedBroadcasts.length);
@@ -4538,6 +4652,19 @@ export class PersistiaWorldV4 implements DurableObject {
         const address = await this.contractExecutor.deploy(wasmBytes, pubkey, this.latestSeq);
         this.stateTree.markDirty(`deployed:${address}`, `${pubkey}:${address}`);
         this.broadcast({ type: "contract.deployed", address, deployer: pubkey });
+        break;
+      }
+      case "contract.upgrade": {
+        const upgradeWasm = this.b64ToBytes(payload.wasm_b64);
+        await this.contractExecutor.upgrade(payload.contract, upgradeWasm, pubkey);
+        this.stateTree.markDirty(`deployed:${payload.contract}`, `${pubkey}:${payload.contract}:upgraded`);
+        this.broadcast({ type: "contract.upgraded", address: payload.contract, deployer: pubkey });
+        break;
+      }
+      case "contract.lock": {
+        this.contractExecutor.lockContract(payload.contract, pubkey);
+        this.stateTree.markDirty(`deployed:${payload.contract}`, `${pubkey}:${payload.contract}:locked`);
+        this.broadcast({ type: "contract.locked", address: payload.contract, locked_by: pubkey });
         break;
       }
       case "app.upload": {

@@ -29,6 +29,12 @@ export interface AdaptiveSignals {
   lastCommittedRound: number;   // latest committed round
   consecutiveEmptyRounds: number; // how many recent rounds had 0 events
   utilizationHistory: number[]; // recent utilization values for smoothing
+  /** Circuit mutation slot limit (e.g. 256). Used to cap max_events_per_vertex. */
+  circuitMutationSlots?: number;
+  /** Average mutations produced per event (e.g. ~5). */
+  avgMutationsPerEvent?: number;
+  /** Vertices included per committed block (e.g. 2). */
+  verticesPerBlock?: number;
 }
 
 export interface AdaptiveResult {
@@ -170,13 +176,20 @@ export function computeAdaptiveInterval(
   if (newInterval < effectiveMin) newInterval = effectiveMin;
 
   // ── 7. Adjust max_events_per_vertex ───────────────────────────────────
-  // More conservative: only adjust when sustained high/low utilization
+  // More conservative: only adjust when sustained high/low utilization.
+  // Mutation-aware ceiling: never exceed what the ZK circuit can prove.
+  const circuitSlots = signals.circuitMutationSlots ?? 1024;
+  const mutsPerEvent = signals.avgMutationsPerEvent ?? 5;
+  const verticesPerBlock = signals.verticesPerBlock ?? 2;
+  const mutationCeiling = Math.floor(circuitSlots / (mutsPerEvent * verticesPerBlock));
+
   let newMaxEvents: number | null = null;
   if (utilization > EVENTS_UPSCALE_UTILIZATION && proverBrakeFactor === 0) {
     // High sustained utilization + prover healthy → increase capacity
     const eventsChange = Math.ceil(currentMaxEvents * MAX_EVENTS_CHANGE_RATE);
     const proposed = currentMaxEvents + eventsChange;
-    if (proposed <= eventsBounds.max && proposed !== currentMaxEvents) {
+    const cap = Math.min(eventsBounds.max, mutationCeiling);
+    if (proposed <= cap && proposed !== currentMaxEvents) {
       newMaxEvents = proposed;
     }
   } else if (utilization < EVENTS_DOWNSCALE_UTILIZATION && consecutiveEmptyRounds === 0) {
@@ -186,6 +199,14 @@ export function computeAdaptiveInterval(
     if (proposed >= eventsBounds.min && proposed !== currentMaxEvents) {
       newMaxEvents = proposed;
     }
+  }
+
+  // Hard cap: never exceed mutation ceiling regardless of utilization
+  if (newMaxEvents !== null && newMaxEvents > mutationCeiling) {
+    newMaxEvents = mutationCeiling;
+  }
+  if (currentMaxEvents > mutationCeiling) {
+    newMaxEvents = mutationCeiling;
   }
 
   // ── 8. Build reason string ────────────────────────────────────────────

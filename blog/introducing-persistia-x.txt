@@ -1,0 +1,321 @@
+Persistia: BFT Consensus at the Edge
+
+A decentralized ledger that runs on Cloudflare Workers, proves state with zero-knowledge proofs, and anchors to Berachain.
+
+---
+
+Most blockchain infrastructure demands dedicated servers, significant capital for staking, and months of DevOps work before a single transaction is processed. Persistia takes a different path: it runs a full Byzantine Fault Tolerant consensus protocol on Cloudflare's edge network, using Durable Objects as validator nodes. No tokens to stake. No VMs to provision. Just deploy a Worker and you're running a validator.
+
+This post covers the architecture, the design decisions behind it, and why it matters.
+
+
+THE PROBLEM WITH INFRASTRUCTURE LOCK-IN
+
+Every existing L1 requires operators to run full nodes — machines that store the complete chain state, execute every transaction, and participate in consensus. This creates a hardware floor that excludes most developers and concentrates validation power among well-funded operators.
+
+We asked: what if the infrastructure layer was already solved? Cloudflare operates data centers in 300+ cities. Their Durable Objects provide strongly consistent, single-threaded execution with built-in persistence. Their Workers handle HTTP routing, WebSocket upgrades, and TLS termination globally. What if a consensus protocol could run on top of that?
+
+
+ARCHITECTURE
+
+Bullshark DAG Consensus on Durable Objects
+
+Persistia implements Bullshark, a DAG-based BFT consensus protocol. Each validator is a Cloudflare Durable Object — a stateful, single-threaded compute unit with a co-located SQLite database.
+
+The protocol operates in rounds. Every 12 seconds, each validator:
+
+1. Bundles pending events into a DAG vertex with cryptographic references to vertices from prior rounds
+2. Broadcasts the vertex to peers via HTTP gossip
+3. Checks if quorum (2f+1 of active validators) has been reached for the current round
+4. On even-numbered rounds, evaluates the commit rule: if a round's leader vertex is referenced by quorum vertices in the next round, that anchor and all causally reachable vertices are finalized
+
+This gives us the safety and liveness guarantees of Bullshark with the operational simplicity of a serverless deployment. The entire consensus state — vertices, events, commit history — lives in each Durable Object's embedded SQLite instance. No external database. No separate storage layer.
+
+Shard Routing
+
+A single Cloudflare Worker acts as the HTTP gateway. Requests carry a ?shard=node-1 query parameter that routes to the corresponding Durable Object via idFromName(). This means every validator has a stable URL, cross-shard communication is just HTTP, and the network topology is decoupled from the physical infrastructure.
+
+Cross-shard message relay is handled at the Worker layer: fetch outbox from source shard, deliver to target, acknowledge back. No custom networking protocols — just HTTP over Cloudflare's backbone.
+
+Tokenless Validation
+
+Persistia has no native token and no staking requirement. Validators participate based on reputation, weighted by their consistency in producing vertices across recent rounds. The active set is computed from a sliding window — if you've been producing vertices, you're in.
+
+This eliminates the cold-start problem that plagues new networks: you don't need to bootstrap a token economy before you can bootstrap consensus. It also means the barrier to running a validator is deploying a Cloudflare Worker, not acquiring capital.
+
+
+FINALITY
+
+Persistia has five distinct finality stages, each with increasing guarantees.
+
+Level 0: Optimistic — instant
+
+When a client submits a signed event, the receiving node validates rules and adds it to the pending pool. A pending message is broadcast to all WebSocket clients immediately. The client can optimistically update its UI. This is the fastest feedback loop, but provides no ordering guarantee.
+
+Level 1: DAG Inclusion — ~12 seconds
+
+On the next alarm cycle, the node bundles pending events into a DAG vertex (up to 500 events per vertex), signs it with its Ed25519 key, and gossips it to all peers. The vertex is now part of the DAG with causal references to prior rounds.
+
+Level 2: BFT Commit — ~24–36 seconds
+
+This is the core finality guarantee. Bullshark's commit rule works on even-numbered rounds:
+
+1. Round R (even): The deterministically-elected leader creates an anchor vertex
+2. Round R+1: Validators create vertices that reference the anchor
+3. Commit check: If >= 2f+1 distinct validators in round R+1 reference the anchor, the anchor is committed
+
+On commit, all causally reachable vertices are collected via topological sort, their events are applied to state in deterministic order, and the finalized state root is updated. This is BFT-safe finality — the same guarantee as Tendermint or HotStuff.
+
+Level 3: ZK Proven — minutes
+
+The SP1 prover watches committed rounds and generates STARK proofs that attest to three properties: BFT quorum signatures were valid, the Merkle state root transition is correct, and the previous proof in the chain verifies.
+
+Recursive Proofs (IVC)
+
+The key design choice is Incrementally Verifiable Computation (IVC): each proof includes a verification of the previous proof as part of its circuit. This creates a cryptographic chain stretching back to genesis — proof N attests to the validity of all state transitions from block 0 through block N.
+
+This recursion has three major benefits:
+
+1. Constant verification cost. A verifier only needs to check the latest proof. It doesn't matter whether the chain has 100 blocks or 10 million — the verification time and proof size are the same (~200ms, ~few KB).
+
+2. No trusted checkpoints. Traditional light clients bootstrap from a trusted recent state. With a recursive proof chain, the genesis block is the trust root, and the latest proof cryptographically covers every state transition since then. There's nothing to trust except math.
+
+3. Composable bridging. A Berachain smart contract that can verify one SP1 proof can verify the entire Persistia chain. This makes the anchoring bridge trustless.
+
+Batch Proving
+
+The prover supports batch mode (up to 32 blocks per proof), amortizing the fixed overhead of proof generation. On consumer hardware, this brings the amortized cost to ~1–3 minutes per block.
+
+Level 4: DA Anchored — minutes
+
+State roots and metadata are anchored to Berachain (EVM-compatible L1 with Proof of Liquidity consensus). Even if every Persistia validator disappears, the state history is recoverable from the Berachain anchor transactions.
+
+Finality Comparison
+
+Level 0 — Optimistic — instant — Revertible
+Level 1 — DAG Inclusion — ~12s — Revertible
+Level 2 — BFT Commit — ~24–36s — Not revertible (unless >1/3 Byzantine)
+Level 3 — ZK Proven — ~5–15 min — Not revertible (cryptographic)
+Level 4 — DA Anchored — ~5–10 min — Not revertible (permanent external storage)
+
+For context: Ethereum reaches finality in ~12 minutes (2 epochs). Cosmos chains finalize in ~6 seconds. Persistia's ~24–36 second BFT finality is practical for most applications, running on $0 infrastructure.
+
+
+THROUGHPUT
+
+Persistia's throughput is shaped by Cloudflare's execution model rather than traditional blockchain bottlenecks.
+
+Each Durable Object processes events sequentially. On the current configuration with 3 validators, each producing a vertex with up to 500 events per round at 12-second intervals, the baseline throughput is ~42 transactions per second.
+
+At the faster 2-second round interval, throughput reaches ~250 TPS per shard.
+
+Horizontal Scaling via Sharding
+
+Persistia's shard routing (?shard=X) means each shard is an independent consensus domain. Throughput scales linearly:
+
+• Current (12s rounds, free tier): 1 shard, ~42 TPS
+• Fast rounds (2s): 1 shard, ~250 TPS
+• Optimized (2s + pipelining): 1 shard, ~500–750 TPS
+• Paid + 10 shards: ~10,000 TPS
+• Paid + 100 shards: ~100,000 TPS
+
+The Unusual Economics
+
+Most chains measure cost-per-transaction against validator hardware. Persistia's validators run on Cloudflare's free tier — the operational cost is effectively zero for small deployments. On the paid plan ($5/month), you get higher CPU limits and faster alarm scheduling. This makes Persistia's cost-per-transaction fundamentally different from chains that require dedicated infrastructure.
+
+
+ZERO-KNOWLEDGE STATE PROOFS
+
+Every finalized block produces a state transition that can be proven in zero knowledge using SP1, a STARK-based zkVM.
+
+What the Proof Verifies
+
+Each proof attests to three properties:
+
+1. BFT Quorum: Ed25519 signatures from 2f+1 validators confirmed the block
+2. State Root Transition: The SHA-256 Merkle root correctly transitions given the block's mutations
+3. Proof Chain Continuity: The previous proof is recursively verified, ensuring an unbroken chain back to genesis
+
+Incremental Merkle Trees
+
+State commitments use an incremental Merkle tree with dirty-node tracking. Only the paths affected by mutations are recomputed — O(changed keys) rather than O(total state).
+
+
+WASM SMART CONTRACTS
+
+Persistia runs user-deployed smart contracts as WebAssembly modules, executed inside V8 isolates on Cloudflare Workers.
+
+Contracts are deployed as WASM binaries (max 1MB). On deployment:
+
+• Float opcodes are banned (f32.*, f64.*) — floating-point arithmetic is non-deterministic across hardware
+• WASI imports are banned — no filesystem, no clock, no randomness
+• Fuel metering is injected — every function call decrements fuel, and when it runs out, the module traps deterministically
+
+State mutations are buffered during execution and flushed atomically on success. If the contract traps or exhausts fuel, nothing is written — all-or-nothing semantics.
+
+Cross-Contract Calls
+
+Contracts can call other contracts synchronously, up to 10 levels deep. The execution context — mutations, fuel, call stack — is shared across the call chain. Either all mutations commit or none.
+
+CosmWasm Compatibility
+
+A compatibility shim (cosmwasm-compat) maps CosmWasm's message-passing model onto Persistia's register ABI. Contracts written for CosmWasm can be ported with minimal changes — swap the import, adjust the entry point, rebuild. This opens the door to porting existing DEXs, lending protocols, and NFT marketplaces.
+
+
+STATE ANCHORING: BERACHAIN
+
+Persistia anchors finalized state to Berachain, an EVM-compatible L1 secured by Proof of Liquidity consensus.
+
+State roots and ZK proof commitments are published on-chain as HYTE-encoded calldata, making them permanently retrievable. Optionally, structured data is written to a HyberDB contract for on-chain queryability.
+
+This creates a trust bridge: Berachain contracts can act on Persistia-proven state, and Persistia can reference Berachain finality as an external checkpoint.
+
+
+MACHINE PAYMENT PROTOCOL (MPP): HTTP 402 FOR THE MACHINE ECONOMY
+
+APIs are increasingly consumed by autonomous agents — LLMs calling tools, bots executing workflows, IoT devices requesting data. These machine-to-machine interactions need a payment layer that works at HTTP speed.
+
+Persistia implements MPP (Machine Payment Protocol), a native HTTP 402-based payment flow:
+
+1. Client requests a protected resource → server responds 402 Payment Required with a challenge (amount, recipient, denomination, expiry)
+2. Client pays on-chain → submits a token.transfer event
+3. Client retries with credential → includes Authorization: Payment header
+4. Server verifies on-chain → checks the transfer exists in the finalized ledger, serves the resource
+
+The entire flow is machine-readable. No OAuth, no API keys, no billing dashboards. An LLM agent that encounters a 402 can parse the challenge, pay, and retry — all programmatically.
+
+This enables:
+• Paid API endpoints with per-request pricing
+• Agent-to-agent commerce
+• Micropayments (no gas fees inside Persistia)
+• Metered access for oracle data, contract state reads, or premium analytics
+
+
+NO INDEXER REQUIRED: SQL OVER THE CHAIN
+
+Most blockchains store state in a Merkle trie optimized for proof generation, not queries. Want to find all NFTs owned by an address? You need an indexer — The Graph, Helius, Goldsky — a separate service that replays every block and serves via GraphQL.
+
+Persistia doesn't have this problem. Each validator runs SQLite as its primary state store. The chain state IS a relational database:
+
+GET /query?q=SELECT author, COUNT(*) as vertices FROM dag_vertices GROUP BY author
+GET /query?q=SELECT * FROM contracts WHERE deployer = 'abc...'
+GET /query?q=SELECT * FROM token_balances WHERE amount != '0'
+
+Any SELECT, PRAGMA, or EXPLAIN query runs directly against the node's SQLite instance. No separate indexing service. No subgraph deployment. No sync lag.
+
+Queryable tables include: dag_vertices, dag_commits, consensus_events, contracts, contract_state, token_balances, zk_proofs, and more.
+
+Comparison:
+
+• Events by contract → Ethereum: deploy a subgraph, wait for sync. Persistia: SELECT * FROM consensus_events WHERE ...
+• Token balance → Ethereum: eth_call + ABI decode. Persistia: SELECT * FROM token_balances WHERE address = ?
+• Custom aggregation → Ethereum: write a custom indexer. Persistia: write a SQL query.
+
+
+HTTP-NATIVE LIGHT CLIENTS
+
+Most blockchains require specialized libraries to verify state. Light clients are separate binaries that must implement the chain's wire protocol, handle peer discovery, and maintain header sync.
+
+Persistia doesn't need a separate light client. The HTTP API IS the light client protocol.
+
+Verifying State in Three Requests
+
+1. Get the latest header with its BFT certificate
+
+GET /headers/latest?shard=node-1
+
+Returns the block header plus a bft_certificate — Ed25519 signatures from the validators who committed this round. Verify: check signatures, confirm signers are in the validator set, confirm quorum.
+
+2. Request a Merkle proof for any state key
+
+GET /proof/generate?key=contract:abc123:count
+
+Returns sibling hashes along the path from leaf to root.
+
+3. Verify locally
+
+Recompute the Merkle root from the leaf and sibling path. If it matches the BFT-certified state root, the value is proven. ~30 lines of code. No library to install. No protocol to implement. Just fetch(), sha256(), and ed25519.verify().
+
+Non-Inclusion Proofs
+
+The sparse Merkle tree also supports non-inclusion proofs: cryptographic proof that a key does NOT exist in the state. This lets a light client prove negative facts — impossible with most Merkle Patricia tries.
+
+
+FULLY ON-CHAIN APPLICATIONS
+
+Most "decentralized apps" aren't. The smart contract runs on-chain, but the frontend is on Vercel, the backend talks to a centralized API, and governance is a Discord vote.
+
+Persistia is different because the consensus network IS an HTTP server. A Persistia node can serve a complete web application — HTML, CSS, JavaScript — directly from contract state.
+
+How It Works
+
+1. Deploy a WASM contract with your business logic
+2. Upload frontend files via app.upload events — stored as key-value pairs under the _app/ prefix
+3. Visit /app/{contract_address}/ — the node serves files from contract state with proper MIME types
+4. The frontend calls its own contract via /contract/query and /contract/call
+
+The Full Stack
+
+Every layer of a traditional web application has an on-chain equivalent:
+
+• Frontend → Contract state served at /app/{addr}/
+• Backend Logic → WASM smart contracts
+• Database → Contract KV storage + SQL over the chain
+• Authentication → Ed25519 signatures on every request
+• Payments → MPP (HTTP 402) with on-chain transfers
+• Cron Jobs → Triggers (DO alarms with configurable intervals)
+• External Data → Oracles (multi-node consensus)
+• CDN / Hosting → Consensus network IS the CDN (300+ edge locations)
+• Governance → Reputation-weighted on-chain voting
+• State Proofs → Merkle proofs + recursive ZK proof chain
+• Cross-Service → Cross-shard messaging with nullifier-based atomicity
+• Privacy → Commitment-based private state, notes + nullifiers
+
+
+WHAT'S NOVEL
+
+Persistia vs. Typical L1:
+
+• Infrastructure: Cloudflare Workers + DOs vs. Dedicated servers
+• Validator requirement: Deploy a Worker vs. Stake tokens + run hardware
+• Consensus: Bullshark DAG-BFT vs. Various
+• BFT finality: ~24–36s (12s rounds) / ~4–6s (2s rounds) vs. 6s–12min
+• Throughput: ~42 TPS to ~100k TPS (sharded) vs. 15–4000 TPS
+• State proofs: SP1 STARK recursive proofs vs. Optional or none
+• Smart contracts: WASM with fuel metering, no floats vs. EVM / WASM / Move
+• State anchoring: Berachain (EVM L1) vs. Self-hosted or single DA layer
+• State queries: SQL over HTTP vs. Requires external indexer
+• Token: None (reputation-based) vs. Required for staking/gas
+• Light client: 3 HTTP requests vs. Dedicated binary or trusted RPC
+• Operational cost: Cloudflare free tier ($0) vs. $500–$5000+/month
+
+
+TRY IT
+
+Persistia is live with a 3-validator cluster on Cloudflare's edge. The dashboard, consensus, gossip, ZK proofs, and contract runtime are all running on the free tier.
+
+The codebase is structured as:
+• src/ — TypeScript: Durable Object consensus, gossip, contract executor, anchoring
+• contracts/zk/ — Rust: SP1 zkVM prover, guest program, shared types
+• contracts/persistia-sdk/ — Rust: SDK for writing smart contracts
+• contracts/cosmwasm-compat/ — Rust: CosmWasm compatibility layer
+• client/ — Dashboard, wallet, and client library
+
+
+WHAT'S NEXT: APPCHAIN ROLLUP FRAMEWORK
+
+Persistia today is a single network. The next step is making it a framework — so anyone can deploy their own BFT chain with a single command, secured by restaked tokens, with built-in cross-chain services.
+
+Three interlocking products:
+
+Appchain Rollups. Fork Persistia, configure your consensus parameters (round time, staking token, anchor chain), and deploy. You get BFT consensus, WASM contracts, oracles, cron, payments, and frontend hosting — all for $0 on Cloudflare's free tier. No other rollup framework offers this.
+
+Cross-Chain Execution Runtime. Persistia validators already run 24/7 on Cloudflare's edge, fetch external data with multi-node consensus, and execute scheduled tasks. The leap: instead of only serving Persistia contracts, these validators can execute tasks for any chain — oracle data feeds, automated liquidations, verified off-chain computation, cross-chain message relay. Same capabilities as Chainlink's CRE, but with BFT consensus on every output and ZK proofs for trustless verification.
+
+Restaking Security. Rather than bootstrapping a new token for each appchain, validators can stake existing tokens (ETH, BERA, any ERC-20) on L1. Persistia observes the stake via its oracle system, admits the validator with proportional weight, and slashes via ZK-proven misbehavior evidence submitted to the L1 staking contract. One restaked position can secure multiple appchains simultaneously.
+
+These create a flywheel: more appchains → more validators needed → more restaking demand → better oracle security → more external chains integrate → more appchain demand. The infrastructure layer is already built — what comes next is making it composable.
+
+---
+
+Persistia is open source. Star the repo, deploy a validator, or port your CosmWasm contracts — contributions welcome.

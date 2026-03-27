@@ -91,6 +91,7 @@ export interface ContractInfo {
   wasm_hash: string;
   created_at: number;
   deploy_seq: number;
+  locked: boolean;
 }
 
 export interface CallResult {
@@ -338,6 +339,108 @@ export class ContractExecutor {
 
     this.cacheSet(address, module);
     return address;
+  }
+
+  // ─── Upgrade ────────────────────────────────────────────────────────────
+
+  /**
+   * Upgrade a contract's WASM code in-place. Only the original deployer can upgrade.
+   * The contract address stays the same; state is preserved.
+   * If the contract has been locked (upgrade_locked flag), upgrade is permanently rejected.
+   */
+  async upgrade(address: string, newWasmBytes: Uint8Array, caller: string): Promise<void> {
+    // Verify contract exists and caller is the deployer
+    const rows = [...this.sql.exec(
+      "SELECT deployer, wasm_hash FROM contracts WHERE address = ?", address,
+    )];
+    if (rows.length === 0) throw new Error("Contract not found");
+    const deployer = rows[0].deployer as string;
+    if (caller !== deployer) throw new Error("Only the original deployer can upgrade");
+
+    // Check if contract has been locked
+    const lockKey = new TextEncoder().encode("__upgrade_locked");
+    const lockRows = [...this.sql.exec(
+      "SELECT value FROM contract_state WHERE contract_address = ? AND key = ?",
+      address, lockKey,
+    )];
+    if (lockRows.length > 0) {
+      const val = lockRows[0].value;
+      const lockVal = val instanceof Uint8Array ? new TextDecoder().decode(val) : String(val);
+      if (lockVal === "1") throw new Error("Contract is permanently locked and cannot be upgraded");
+    }
+
+    // Validate new WASM
+    const validation = validateWasm(newWasmBytes);
+    if (!validation.ok) throw new Error(validation.error);
+
+    const meteredBytes = injectFuelMetering(newWasmBytes);
+    const module = await WebAssembly.compile(meteredBytes);
+
+    const exports = WebAssembly.Module.exports(module);
+    const hasMemory = exports.some(e => e.name === "memory" && e.kind === "memory");
+    if (!hasMemory) throw new Error("Contract must export 'memory'");
+
+    const newWasmHash = await sha256(bytesToHex(newWasmBytes));
+    const oldWasmHash = rows[0].wasm_hash as string;
+    if (newWasmHash === oldWasmHash) throw new Error("New WASM is identical to current");
+
+    // Store new WASM
+    if (this.blobStore) {
+      await this.blobStore.put(`wasm/${newWasmHash}`, meteredBytes);
+      this.sql.exec(
+        "UPDATE contracts SET wasm_hash = ?, wasm_bytes = ? WHERE address = ?",
+        newWasmHash, new Uint8Array(0), address,
+      );
+    } else {
+      this.sql.exec(
+        "UPDATE contracts SET wasm_hash = ?, wasm_bytes = ? WHERE address = ?",
+        newWasmHash, meteredBytes, address,
+      );
+    }
+
+    // Invalidate cache — next call will compile the new module
+    this.moduleCache.delete(address);
+    this.cacheSet(address, module);
+  }
+
+  /**
+   * Lock a contract permanently, preventing any future upgrades.
+   * Can be called by the deployer or by the contract itself (via host import).
+   */
+  lockContract(address: string, caller: string): void {
+    const rows = [...this.sql.exec(
+      "SELECT deployer FROM contracts WHERE address = ?", address,
+    )];
+    if (rows.length === 0) throw new Error("Contract not found");
+
+    // Allow deployer or the contract itself to lock
+    const deployer = rows[0].deployer as string;
+    if (caller !== deployer && caller !== address) {
+      throw new Error("Only the deployer or the contract itself can lock");
+    }
+
+    const lockKey = new TextEncoder().encode("__upgrade_locked");
+    const lockVal = new TextEncoder().encode("1");
+    this.sql.exec(
+      `INSERT INTO contract_state (contract_address, key, value) VALUES (?, ?, ?)
+       ON CONFLICT(contract_address, key) DO UPDATE SET value = ?`,
+      address, lockKey, lockVal, lockVal,
+    );
+  }
+
+  /**
+   * Check if a contract is upgrade-locked.
+   */
+  isLocked(address: string): boolean {
+    const lockKey = new TextEncoder().encode("__upgrade_locked");
+    const rows = [...this.sql.exec(
+      "SELECT value FROM contract_state WHERE contract_address = ? AND key = ?",
+      address, lockKey,
+    )];
+    if (rows.length === 0) return false;
+    const val = rows[0].value;
+    const lockVal = val instanceof Uint8Array ? new TextDecoder().decode(val) : String(val);
+    return lockVal === "1";
   }
 
   // ─── Public Call Interface ──────────────────────────────────────────────
@@ -717,6 +820,18 @@ export class ContractExecutor {
         return ctx.fuel.remaining;
       },
 
+      // ─── Upgrade Lock ──────────────────────────────────────────────────
+      // Permanently locks the calling contract, preventing future upgrades.
+      // This is irreversible — once locked, even the deployer cannot upgrade.
+      lock_contract: () => {
+        if (!deductFuel(FUEL_COSTS.storage_write)) return;
+        if (ctx.readOnly) return;
+        // Write the lock flag into mutations so it commits atomically
+        const lockKeyHex = bytesToHex(new TextEncoder().encode("__upgrade_locked"));
+        mutations.set(lockKeyHex, new TextEncoder().encode("1"));
+        ctx.logs.push(`[${address.slice(0, 8)}] contract permanently locked`);
+      },
+
       // ─── ZK-Friendly Cryptographic Primitives (Miden-inspired) ─────────
       poseidon2_hash: (inputReg: number, outputReg: number) => {
         if (!deductFuel(FUEL_COSTS.storage_read)) return;
@@ -1080,6 +1195,14 @@ export class ContractExecutor {
         ctx.fuel.syncFromGlobal(fuelGlobal);
         return ctx.fuel.remaining;
       },
+
+      lock_contract: () => {
+        if (!deductFuel(FUEL_COSTS.storage_write)) return;
+        if (ctx.readOnly) return;
+        const lockKeyHex = bytesToHex(new TextEncoder().encode("__upgrade_locked"));
+        mutations.set(lockKeyHex, new TextEncoder().encode("1"));
+        ctx.logs.push(`[${address.slice(0, 8)}] contract permanently locked`);
+      },
     };
 
     return { env, metering: { fuel: fuelGlobal } };
@@ -1162,6 +1285,10 @@ export class ContractExecutor {
     )];
     if (rows.length === 0) return null;
     const r = rows[0] as any;
-    return { address: r.address, deployer: r.deployer, wasm_hash: r.wasm_hash, created_at: r.created_at, deploy_seq: r.deploy_seq };
+    return {
+      address: r.address, deployer: r.deployer, wasm_hash: r.wasm_hash,
+      created_at: r.created_at, deploy_seq: r.deploy_seq,
+      locked: this.isLocked(address),
+    };
   }
 }

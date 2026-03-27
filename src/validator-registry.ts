@@ -504,8 +504,8 @@ export class ValidatorRegistry {
   checkRateLimit(pubkey: string, windowMs: number = 60_000, maxEvents?: number): boolean {
     const validator = this.getValidator(pubkey);
 
-    // Base limit for non-validators
-    let limit = maxEvents || 10;
+    // Base limit for non-validators (1000/min allows stress testing)
+    let limit = maxEvents || 1000;
 
     // Validators get higher limits scaled by reputation
     if (validator && validator.status === "active") {

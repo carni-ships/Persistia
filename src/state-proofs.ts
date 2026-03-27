@@ -155,6 +155,10 @@ export class IncrementalStateTree {
     }));
   }
 
+  clearDirtyKeys() {
+    this.dirtyKeys.clear();
+  }
+
   /**
    * Compute the state commitment. Applies all dirty mutations to the tree.
    */

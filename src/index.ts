@@ -1,14 +1,19 @@
 import { PersistiaWorldV4 } from "./PersistiaDO";
+import { PersistiaAgent } from "./persistia-agent";
+import { routeAgentRequest } from "agents";
 import { APP_SDK_JS } from "./app-sdk";
-export { PersistiaWorldV4 };
+export { PersistiaWorldV4, PersistiaAgent };
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 interface Env {
   PERSISTIA_WORLD: DurableObjectNamespace;
+  PERSISTIA_AGENT: DurableObjectNamespace;
   BLOB_STORE?: R2Bucket;
   RELAY_QUEUE?: Queue;
   ASSETS?: { fetch: (req: Request) => Promise<Response> };
+  AI?: any;
+  BROWSER?: any;
   [key: string]: any;
 }
 
@@ -17,7 +22,7 @@ interface Env {
 const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
 };
 
 const MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024; // 2MB
@@ -38,6 +43,7 @@ const CACHEABLE_ENDPOINTS: Record<string, number> = {
   "/network": CACHE_TTL_STATUS,
   "/snapshot/latest": CACHE_TTL_GOV_CONFIG,  // changes per anchor (~5 min)
   "/snapshot/list": CACHE_TTL_GOV_CONFIG,
+  "/api/catalog": 300,  // service catalog changes rarely
 };
 
 // Static HTML routes served from Workers Static Assets
@@ -51,6 +57,8 @@ const STATIC_ROUTES: Record<string, string> = {
   "/verifier.html": "/verifier.html",
   "/wallet": "/wallet.html",
   "/wallet.html": "/wallet.html",
+  "/services": "/services.html",
+  "/services.html": "/services.html",
 };
 
 // ─── Worker ───────────────────────────────────────────────────────────────────
@@ -67,6 +75,10 @@ export default {
     }
 
     const url = new URL(request.url);
+
+    // ─── MCP Agent routing (/agents/*) ─────────────────────────────────
+    const agentResponse = await routeAgentRequest(request, env);
+    if (agentResponse) return agentResponse;
 
     // ─── Static HTML via Workers Static Assets (CDN edge) ──────────────
     const staticFile = STATIC_ROUTES[url.pathname];

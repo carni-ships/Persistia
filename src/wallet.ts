@@ -250,4 +250,86 @@ export class AccountManager {
       address, denom, (current + amount).toString(), (current + amount).toString(),
     );
   }
+
+  /**
+   * Burn tokens from an address, permanently removing them from circulation.
+   * Records the burn in the burn_ledger for audit trail.
+   * Returns error string or null on success.
+   */
+  burn(fromAddress: string, denom: string, amount: bigint, reason: string = "fee"): string | null {
+    if (amount <= 0n) return "Amount must be positive";
+
+    const balance = this.getBalance(fromAddress, denom);
+    if (balance < amount) return `Insufficient balance: have ${balance}, need ${amount}`;
+
+    // Debit the account
+    this.sql.exec(
+      `INSERT INTO token_balances (address, denom, amount) VALUES (?, ?, ?)
+       ON CONFLICT(address, denom) DO UPDATE SET amount = CAST(CAST(amount AS INTEGER) - ? AS TEXT)`,
+      fromAddress, denom, (balance - amount).toString(), amount.toString(),
+    );
+
+    // Record in burn ledger
+    this.sql.exec(
+      `INSERT INTO burn_ledger (address, denom, amount, reason, timestamp)
+       VALUES (?, ?, ?, ?, ?)`,
+      fromAddress, denom, amount.toString(), reason, Date.now(),
+    );
+
+    return null;
+  }
+
+  /**
+   * Get total tokens burned for a denomination.
+   */
+  totalBurned(denom: string = "PERSIST"): bigint {
+    const rows = [...this.sql.exec(
+      "SELECT COALESCE(SUM(CAST(amount AS INTEGER)), 0) as total FROM burn_ledger WHERE denom = ?",
+      denom,
+    )];
+    return BigInt((rows[0] as any).total || 0);
+  }
+
+  /**
+   * Get burn history, optionally filtered by address.
+   */
+  burnHistory(opts: { address?: string; denom?: string; limit?: number } = {}): Array<{
+    address: string; denom: string; amount: bigint; reason: string; timestamp: number;
+  }> {
+    const limit = opts.limit || 50;
+    let query = "SELECT * FROM burn_ledger";
+    const params: any[] = [];
+    const clauses: string[] = [];
+
+    if (opts.address) { clauses.push("address = ?"); params.push(opts.address); }
+    if (opts.denom) { clauses.push("denom = ?"); params.push(opts.denom); }
+    if (clauses.length > 0) query += " WHERE " + clauses.join(" AND ");
+    query += " ORDER BY timestamp DESC LIMIT ?";
+    params.push(limit);
+
+    const rows = [...this.sql.exec(query, ...params)];
+    return rows.map((r: any) => ({
+      address: r.address,
+      denom: r.denom,
+      amount: BigInt(r.amount as string),
+      reason: r.reason,
+      timestamp: r.timestamp,
+    }));
+  }
+
+  /** Create burn_ledger table. Call during DO init. */
+  static initBurnTable(sql: any): void {
+    sql.exec(`
+      CREATE TABLE IF NOT EXISTS burn_ledger (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        address TEXT NOT NULL,
+        denom TEXT NOT NULL,
+        amount TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        timestamp INTEGER NOT NULL
+      )
+    `);
+    sql.exec(`CREATE INDEX IF NOT EXISTS idx_burn_denom ON burn_ledger(denom)`);
+    sql.exec(`CREATE INDEX IF NOT EXISTS idx_burn_address ON burn_ledger(address)`);
+  }
 }

@@ -1,0 +1,692 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Persistia AI Services</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+
+  :root {
+    --bg: #0a0a0f;
+    --surface: #12121a;
+    --surface-2: #1a1a25;
+    --border: #2a2a3a;
+    --text: #e0e0e8;
+    --text-dim: #7a7a8e;
+    --accent: #6c5ce7;
+    --accent-dim: rgba(108,92,231,0.15);
+    --green: #00d2a0;
+    --green-dim: rgba(0,210,160,0.15);
+    --yellow: #ffd166;
+    --yellow-dim: rgba(255,209,102,0.15);
+    --red: #ff6b6b;
+    --red-dim: rgba(255,107,107,0.15);
+    --blue: #48bfe3;
+    --blue-dim: rgba(72,191,227,0.15);
+    --orange: #ff9f43;
+    --orange-dim: rgba(255,159,67,0.15);
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    padding-top: 48px;
+  }
+
+  /* ─── Header & Nav ─── */
+  header {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+  }
+  .logo { display: flex; align-items: center; gap: 8px; }
+  .logo-icon { width: 26px; height: 26px; background: var(--accent); color: #fff; border-radius: 6px; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 14px; }
+  .logo-text { font-weight: 700; font-size: 14px; color: var(--text); }
+  .logo-tag { font-size: 10px; color: var(--text-dim); border: 1px solid var(--border); padding: 1px 6px; border-radius: 4px; }
+  .header-nav { display: flex; align-items: center; gap: 6px; }
+  .header-nav a { text-decoration: none; font-size: 12px; padding: 4px 12px; border-radius: 6px; transition: background 0.15s; font-family: inherit; }
+  .nav-primary { color: var(--accent); border: 1px solid rgba(108,92,231,0.3); }
+  .nav-primary:hover { background: var(--accent-dim); }
+  .nav-green { color: var(--green); border: 1px solid rgba(0,210,160,0.3); }
+  .nav-green:hover { background: var(--green-dim); }
+  .nav-gold { color: var(--yellow); border: 1px solid rgba(255,209,102,0.3); }
+  .nav-gold:hover { background: var(--yellow-dim); }
+  .nav-blue { color: var(--blue); border: 1px solid rgba(72,191,227,0.3); }
+  .nav-blue:hover { background: var(--blue-dim); }
+  .nav-dim { color: var(--text-dim); border: 1px solid transparent; }
+  .nav-dim:hover { color: var(--text); background: rgba(255,255,255,0.05); }
+
+  /* ─── Layout ─── */
+  .main { display: flex; flex: 1; overflow: hidden; }
+  .sidebar { width: 320px; border-right: 1px solid var(--border); overflow-y: auto; padding: 1rem; flex-shrink: 0; }
+  .content { flex: 1; overflow-y: auto; padding: 1.5rem; display: flex; flex-direction: column; }
+
+  /* ─── Service Cards ─── */
+  .section-title { font-size: 0.7rem; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 0.75rem; margin-top: 1rem; }
+  .section-title:first-child { margin-top: 0; }
+  .svc-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.75rem;
+    margin-bottom: 0.5rem;
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .svc-card:hover { border-color: var(--accent); }
+  .svc-card.active { border-color: var(--blue); background: var(--blue-dim); }
+  .svc-card .svc-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.25rem; }
+  .svc-card .svc-name { font-size: 0.85rem; font-weight: 600; }
+  .svc-card .svc-price { font-size: 0.7rem; color: var(--orange); background: var(--orange-dim); padding: 2px 8px; border-radius: 4px; }
+  .svc-card .svc-price.free { color: var(--green); background: var(--green-dim); }
+  .svc-card .svc-desc { font-size: 0.7rem; color: var(--text-dim); line-height: 1.4; }
+
+  /* ─── Playground ─── */
+  .playground { max-width: 800px; width: 100%; }
+  .playground h2 { font-size: 1rem; font-weight: 600; margin-bottom: 0.5rem; }
+  .playground .subtitle { font-size: 0.75rem; color: var(--text-dim); margin-bottom: 1.5rem; }
+
+  .form-group { margin-bottom: 1rem; }
+  .form-group label { display: block; font-size: 0.75rem; color: var(--text-dim); margin-bottom: 0.3rem; }
+  input, select, textarea {
+    width: 100%;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    padding: 0.6rem 0.75rem;
+    font-family: inherit;
+    font-size: 0.8rem;
+    resize: vertical;
+  }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
+  textarea { min-height: 80px; }
+
+  button {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 0.6rem 1.5rem;
+    font-family: inherit;
+    font-size: 0.85rem;
+    cursor: pointer;
+    transition: background 0.2s;
+  }
+  button:hover { background: #7d6ff0; }
+  button:disabled { background: var(--border); color: var(--text-dim); cursor: not-allowed; }
+  button.secondary { background: var(--surface-2); border: 1px solid var(--border); }
+  button.secondary:hover { background: var(--border); }
+  .btn-row { display: flex; gap: 0.5rem; align-items: center; }
+
+  /* ─── Results ─── */
+  .result-panel {
+    margin-top: 1.5rem;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .result-header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.75rem; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.05em;
+  }
+  .result-header .result-status { font-size: 0.7rem; padding: 2px 8px; border-radius: 4px; }
+  .result-header .result-status.success { color: var(--green); background: var(--green-dim); }
+  .result-header .result-status.error { color: var(--red); background: var(--red-dim); }
+  .result-header .result-status.pending { color: var(--yellow); background: var(--yellow-dim); }
+  .result-body { padding: 1rem; overflow-x: auto; }
+  .result-body pre {
+    font-family: inherit;
+    font-size: 0.8rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--text);
+    line-height: 1.5;
+  }
+  .result-body img {
+    max-width: 100%;
+    border-radius: 6px;
+    display: block;
+  }
+  .result-body audio {
+    width: 100%;
+    margin-top: 0.5rem;
+  }
+
+  /* ─── Welcome / Empty ─── */
+  .welcome {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    flex: 1;
+    padding: 2rem;
+  }
+  .welcome h1 { font-size: 1.3rem; font-weight: 700; margin-bottom: 0.5rem; }
+  .welcome p { font-size: 0.8rem; color: var(--text-dim); max-width: 480px; line-height: 1.6; }
+  .welcome .stats { display: flex; gap: 2rem; margin-top: 1.5rem; }
+  .welcome .stat { text-align: center; }
+  .welcome .stat-value { font-size: 1.5rem; font-weight: 700; color: var(--blue); }
+  .welcome .stat-label { font-size: 0.65rem; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.05em; }
+
+  /* ─── Node Selector ─── */
+  .node-bar {
+    display: flex; gap: 0.5rem; align-items: center;
+    padding: 0.5rem 1rem;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+    font-size: 0.75rem;
+  }
+  .node-bar input { margin-bottom: 0; flex: 1; font-size: 0.75rem; padding: 0.4rem 0.6rem; }
+  .node-bar button { font-size: 0.7rem; padding: 0.4rem 0.8rem; }
+
+  /* ─── Payment Banner ─── */
+  .payment-banner {
+    background: var(--yellow-dim);
+    border: 1px solid var(--yellow);
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+    margin-bottom: 1rem;
+    font-size: 0.8rem;
+    color: var(--yellow);
+    display: none;
+  }
+  .payment-banner.show { display: block; }
+  .payment-banner code { background: rgba(0,0,0,0.3); padding: 1px 6px; border-radius: 3px; font-size: 0.75rem; }
+
+  /* ─── Responsive ─── */
+  @media (max-width: 768px) {
+    .main { flex-direction: column; }
+    .sidebar { width: 100%; max-height: 250px; border-right: none; border-bottom: 1px solid var(--border); }
+  }
+</style>
+</head>
+<body>
+
+<header style="display:flex;align-items:center;justify-content:space-between;padding:10px 20px;border-bottom:1px solid var(--border);background:var(--surface);height:48px">
+  <div class="logo">
+    <div class="logo-icon">P</div>
+    <span class="logo-text">Persistia</span>
+    <span class="logo-tag">v0.5.0</span>
+  </div>
+  <div class="header-nav">
+    <a href="/game" class="nav-primary">Game</a>
+    <a href="/dashboard" class="nav-primary">Dashboard</a>
+    <a href="/verifier" class="nav-green">Verifier</a>
+    <a href="/wallet" class="nav-gold">Wallet</a>
+    <a href="/services" class="nav-blue" style="background:var(--blue-dim)">Services</a>
+    <a href="https://github.com/carni-ships/Persistia" target="_blank" rel="noopener" class="nav-dim" title="GitHub">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" style="vertical-align:-2px"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+    </a>
+    <a href="/blog/introducing-persistia" target="_blank" class="nav-dim">Blog</a>
+  </div>
+  <div style="display:flex;align-items:center;gap:8px">
+    <div id="status-dot" style="width:8px;height:8px;border-radius:50%;background:var(--text-dim)"></div>
+    <span style="font-size:11px;color:var(--text-dim)" id="node-status">services</span>
+  </div>
+</header>
+
+<div class="node-bar">
+  <span style="color:var(--text-dim)">Node:</span>
+  <input type="text" id="nodeUrl" value="https://persistia.carnation-903.workers.dev/?shard=node-1" placeholder="Node URL">
+  <button onclick="loadCatalog()">Connect</button>
+</div>
+
+<div class="main">
+  <!-- Sidebar: Service Catalog -->
+  <div class="sidebar" id="sidebar">
+    <div class="section-title">loading catalog...</div>
+  </div>
+
+  <!-- Content: Playground or Welcome -->
+  <div class="content" id="content">
+    <div class="welcome" id="welcome">
+      <h1>AI Services Gateway</h1>
+      <p>Pay-per-call AI inference powered by Cloudflare Workers AI, gated by the Machine Payment Protocol. Select a service from the sidebar to get started.</p>
+      <div class="stats">
+        <div class="stat">
+          <div class="stat-value" id="stat-services">-</div>
+          <div class="stat-label">Services</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value" id="stat-models">-</div>
+          <div class="stat-label">Models</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value">MPP</div>
+          <div class="stat-label">Protocol</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ─── State ────────────────────────────────────────────────────────────────────
+
+let catalog = [];
+let selectedService = null;
+let pendingChallenge = null;
+
+function getNodeUrl() {
+  const raw = document.getElementById('nodeUrl').value.trim();
+  try {
+    const u = new URL(raw);
+    return u.origin + u.pathname.replace(/\/$/, '');
+  } catch { return raw; }
+}
+
+function getShard() {
+  const raw = document.getElementById('nodeUrl').value.trim();
+  try { return new URL(raw).searchParams.get('shard') || 'node-1'; } catch { return 'node-1'; }
+}
+
+// ─── Catalog ──────────────────────────────────────────────────────────────────
+
+async function loadCatalog() {
+  const base = getNodeUrl();
+  const shard = getShard();
+  try {
+    const res = await fetch(`${base}/api/catalog?shard=${shard}`);
+    const data = await res.json();
+    catalog = data.services || [];
+    renderSidebar();
+    document.getElementById('status-dot').style.background = 'var(--green)';
+    document.getElementById('node-status').textContent = 'connected';
+    document.getElementById('stat-services').textContent = catalog.length;
+    document.getElementById('stat-models').textContent = catalog.reduce((n, s) => n + s.models.length, 0);
+  } catch (e) {
+    document.getElementById('sidebar').innerHTML = `<div class="section-title" style="color:var(--red)">Failed to load catalog</div><p style="font-size:0.75rem;color:var(--text-dim)">${e.message}</p>`;
+    document.getElementById('status-dot').style.background = 'var(--red)';
+    document.getElementById('node-status').textContent = 'error';
+  }
+}
+
+function renderSidebar() {
+  const sb = document.getElementById('sidebar');
+  const ai = catalog.filter(s => s.category === 'ai');
+  const util = catalog.filter(s => s.category === 'utility');
+  let html = '';
+  if (ai.length) {
+    html += '<div class="section-title">AI Services</div>';
+    ai.forEach(s => { html += svcCardHTML(s); });
+  }
+  if (util.length) {
+    html += '<div class="section-title">Utility Services</div>';
+    util.forEach(s => { html += svcCardHTML(s); });
+  }
+  sb.innerHTML = html;
+}
+
+function svcCardHTML(s) {
+  const active = selectedService && selectedService.id === s.id ? ' active' : '';
+  const priceClass = s.price === '0' ? ' free' : '';
+  const priceLabel = s.price === '0' ? 'FREE' : `${s.price} ${s.denom}`;
+  return `<div class="svc-card${active}" onclick="selectService('${s.id}')">
+    <div class="svc-header">
+      <span class="svc-name">${s.name}</span>
+      <span class="svc-price${priceClass}">${priceLabel}</span>
+    </div>
+    <div class="svc-desc">${s.description}</div>
+  </div>`;
+}
+
+// ─── Service Selection & Playground ───────────────────────────────────────────
+
+function selectService(id) {
+  selectedService = catalog.find(s => s.id === id);
+  if (!selectedService) return;
+  renderSidebar();
+  renderPlayground();
+}
+
+function renderPlayground() {
+  const s = selectedService;
+  if (!s) return;
+  const content = document.getElementById('content');
+  let formHTML = '';
+
+  // Model selector (if models available)
+  if (s.models.length > 0) {
+    formHTML += `<div class="form-group"><label>Model</label><select id="inp-model">`;
+    s.models.forEach((m, i) => {
+      formHTML += `<option value="${m.id}"${i === 0 ? ' selected' : ''}>${m.name} — ${m.description || ''}</option>`;
+    });
+    formHTML += `</select></div>`;
+  }
+
+  // Dynamic input fields
+  for (const [key, field] of Object.entries(s.inputFields)) {
+    if (key === 'model') continue; // handled above
+    if (key === 'messages') {
+      formHTML += `<div class="form-group"><label>${field.description}</label>
+        <textarea id="inp-${key}" placeholder='[{"role":"user","content":"Hello!"}]' rows="4">[{"role":"user","content":"Hello, how are you?"}]</textarea></div>`;
+    } else if (field.type === 'file') {
+      formHTML += `<div class="form-group"><label>${field.description}</label>
+        <input type="file" id="inp-${key}" accept="${key === 'audio' ? 'audio/*' : 'image/*'}"></div>`;
+    } else if (field.type === 'number') {
+      formHTML += `<div class="form-group"><label>${key} — ${field.description}</label>
+        <input type="number" id="inp-${key}" placeholder="${field.description}"></div>`;
+    } else {
+      const tag = (field.maxLength && field.maxLength > 200) ? 'textarea' : 'input';
+      const extra = tag === 'textarea' ? ' rows="3"' : ' type="text"';
+      formHTML += `<div class="form-group"><label>${key} — ${field.description}</label>
+        <${tag} id="inp-${key}"${extra} placeholder="${field.description}"${field.maxLength ? ` maxlength="${field.maxLength}"` : ''}></${tag}></div>`;
+    }
+  }
+
+  content.innerHTML = `
+    <div class="playground">
+      <h2>${s.name}</h2>
+      <div class="subtitle">${s.description} &mdash; ${s.price} ${s.denom} per call</div>
+      <div class="payment-banner" id="payment-banner"></div>
+      ${formHTML}
+      <div class="btn-row">
+        <button onclick="submitRequest()" id="btn-submit">Send Request</button>
+        <span id="btn-status" style="font-size:0.75rem;color:var(--text-dim)"></span>
+      </div>
+      <div class="result-panel" id="result-panel" style="display:none">
+        <div class="result-header">
+          <span>Response</span>
+          <span class="result-status" id="result-status"></span>
+        </div>
+        <div class="result-body" id="result-body"></div>
+      </div>
+      <div class="result-panel" id="attestation-panel" style="display:none">
+        <div class="result-header">
+          <span>Attestation Proof</span>
+          <span class="result-status" id="att-status"></span>
+        </div>
+        <div class="result-body" id="att-body"></div>
+      </div>
+    </div>`;
+}
+
+// ─── Request Submission ───────────────────────────────────────────────────────
+
+async function submitRequest() {
+  const s = selectedService;
+  if (!s) return;
+
+  const btn = document.getElementById('btn-submit');
+  const status = document.getElementById('btn-status');
+  btn.disabled = true;
+  status.textContent = 'sending...';
+
+  const base = getNodeUrl();
+  const shard = getShard();
+  const body = {};
+
+  // Collect model
+  const modelEl = document.getElementById('inp-model');
+  if (modelEl) body.model = modelEl.value;
+
+  // Collect fields
+  for (const [key, field] of Object.entries(s.inputFields)) {
+    if (key === 'model') continue;
+    const el = document.getElementById(`inp-${key}`);
+    if (!el) continue;
+
+    if (field.type === 'file') {
+      const file = el.files && el.files[0];
+      if (file) {
+        const buf = await file.arrayBuffer();
+        const bytes = new Uint8Array(buf);
+        let binary = '';
+        for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+        body[key] = btoa(binary);
+      }
+    } else if (key === 'messages') {
+      try { body.messages = JSON.parse(el.value); } catch { body.messages = el.value; }
+    } else if (field.type === 'number') {
+      if (el.value) body[key] = Number(el.value);
+    } else {
+      if (el.value) body[key] = el.value;
+    }
+  }
+
+  try {
+    const headers = { 'Content-Type': 'application/json' };
+
+    // If we have a pending credential from a prior 402, attach it
+    if (pendingChallenge && pendingChallenge.credential) {
+      headers['Authorization'] = `Payment ${btoa(JSON.stringify(pendingChallenge.credential))}`;
+      pendingChallenge = null;
+    }
+
+    const res = await fetch(`${base}${s.endpoint}?shard=${shard}`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+    });
+
+    // Handle 402 Payment Required
+    if (res.status === 402) {
+      const challenge = await res.json();
+      showPaymentBanner(challenge);
+      btn.disabled = false;
+      status.textContent = 'payment required';
+      return;
+    }
+
+    // Handle result based on content type
+    const ct = res.headers.get('Content-Type') || '';
+    const panel = document.getElementById('result-panel');
+    const resultBody = document.getElementById('result-body');
+    const resultStatus = document.getElementById('result-status');
+    panel.style.display = 'block';
+
+    // Receipt header
+    const receipt = res.headers.get('Payment-Receipt');
+    if (receipt) {
+      try {
+        const r = JSON.parse(atob(receipt));
+        status.textContent = `paid: ${r.receipt_id.slice(0, 12)}...`;
+      } catch { status.textContent = 'paid'; }
+    }
+
+    // Attestation header
+    const attHeader = res.headers.get('X-Attestation');
+    const attId = res.headers.get('X-Attestation-Id');
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: res.statusText }));
+      resultStatus.className = 'result-status error';
+      resultStatus.textContent = `${res.status} error`;
+      resultBody.innerHTML = `<pre>${JSON.stringify(err, null, 2)}</pre>`;
+    } else if (ct.includes('audio')) {
+      resultStatus.className = 'result-status success';
+      resultStatus.textContent = 'audio';
+      const blob = await res.blob();
+      const audioUrl = URL.createObjectURL(blob);
+      resultBody.innerHTML = `<audio controls autoplay src="${audioUrl}"></audio>
+        <div style="margin-top:0.5rem;font-size:0.7rem;color:var(--text-dim)">Model: ${res.headers.get('X-Model') || 'unknown'}</div>`;
+    } else if (ct.includes('image')) {
+      resultStatus.className = 'result-status success';
+      resultStatus.textContent = 'image';
+      const blob = await res.blob();
+      const imgUrl = URL.createObjectURL(blob);
+      resultBody.innerHTML = `<img src="${imgUrl}" alt="Generated image">
+        <div style="margin-top:0.5rem;font-size:0.7rem;color:var(--text-dim)">Model: ${res.headers.get('X-Model') || 'unknown'}</div>`;
+    } else {
+      resultStatus.className = 'result-status success';
+      resultStatus.textContent = `${res.status} ok`;
+      const data = await res.json();
+      if (data.result && data.result.response) {
+        resultBody.innerHTML = `<pre style="color:var(--green);margin-bottom:0.75rem">${escapeHtml(data.result.response)}</pre>
+          <details><summary style="font-size:0.7rem;color:var(--text-dim);cursor:pointer">Raw JSON</summary><pre style="margin-top:0.5rem">${escapeHtml(JSON.stringify(data, null, 2))}</pre></details>`;
+      } else {
+        resultBody.innerHTML = `<pre>${escapeHtml(JSON.stringify(data, null, 2))}</pre>`;
+      }
+    }
+
+    // Render attestation proof panel
+    if (attHeader && attId) {
+      renderAttestationPanel(attHeader, attId);
+    }
+  } catch (e) {
+    const panel = document.getElementById('result-panel');
+    const resultBody = document.getElementById('result-body');
+    const resultStatus = document.getElementById('result-status');
+    panel.style.display = 'block';
+    resultStatus.className = 'result-status error';
+    resultStatus.textContent = 'network error';
+    resultBody.innerHTML = `<pre style="color:var(--red)">${escapeHtml(e.message)}</pre>`;
+  } finally {
+    btn.disabled = false;
+    if (document.getElementById('btn-status').textContent === 'sending...') {
+      document.getElementById('btn-status').textContent = '';
+    }
+  }
+}
+
+function showPaymentBanner(challenge) {
+  const banner = document.getElementById('payment-banner');
+  if (!banner) return;
+  const ch = challenge.challenge || challenge;
+  pendingChallenge = { challenge: ch };
+  banner.className = 'payment-banner show';
+  banner.innerHTML = `<strong>Payment Required</strong> &mdash; This service costs <code>${ch.amount || '?'} ${ch.denom || 'PERSIST'}</code>.<br>
+    <span style="font-size:0.7rem">
+      Pay to: <code>${ch.recipient || '?'}</code><br>
+      Challenge: <code>${(ch.challenge_id || '').slice(0, 16)}...</code> &mdash;
+      Expires: ${ch.expires_at ? new Date(ch.expires_at).toLocaleTimeString() : '?'}<br><br>
+      After paying via the <a href="/wallet" style="color:var(--blue)">Wallet</a>, enter your tx hash below and retry.
+    </span><br>
+    <div style="display:flex;gap:0.5rem;margin-top:0.5rem">
+      <input type="text" id="mpp-tx-hash" placeholder="Transaction hash" style="font-size:0.75rem;flex:1;margin:0">
+      <input type="text" id="mpp-payer" placeholder="Your persistia1... address" style="font-size:0.75rem;flex:1;margin:0">
+      <button onclick="submitCredential()" style="font-size:0.7rem;padding:0.4rem 0.8rem">Retry with Payment</button>
+    </div>`;
+}
+
+function submitCredential() {
+  if (!pendingChallenge) return;
+  const txHash = document.getElementById('mpp-tx-hash').value.trim();
+  const payer = document.getElementById('mpp-payer').value.trim();
+  if (!txHash || !payer) return alert('Enter tx hash and payer address');
+  pendingChallenge.credential = {
+    version: 'MPP/0.1',
+    challenge_id: pendingChallenge.challenge.challenge_id,
+    method: 'persistia',
+    tx_hash: txHash,
+    payer: payer,
+  };
+  document.getElementById('payment-banner').className = 'payment-banner';
+  submitRequest();
+}
+
+function escapeHtml(str) {
+  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// ─── Attestation Rendering ────────────────────────────────────────────────────
+
+function renderAttestationPanel(attHeader, attId) {
+  const panel = document.getElementById('attestation-panel');
+  const attStatus = document.getElementById('att-status');
+  const attBody = document.getElementById('att-body');
+  if (!panel) return;
+
+  let att;
+  try { att = JSON.parse(atob(attHeader)); } catch { return; }
+
+  panel.style.display = 'block';
+  attStatus.className = 'result-status success';
+  attStatus.textContent = 'signed';
+
+  attBody.innerHTML = `
+    <div style="display:grid;grid-template-columns:120px 1fr;gap:4px 12px;font-size:0.75rem;line-height:1.6">
+      <span style="color:var(--text-dim)">Attestation</span>
+      <code style="color:var(--blue);word-break:break-all">${escapeHtml(att.attestation_id || attId)}</code>
+      <span style="color:var(--text-dim)">Chain Link</span>
+      <code style="word-break:break-all">${escapeHtml(att.prev_hash || '-')}</code>
+      <span style="color:var(--text-dim)">Model</span>
+      <code style="color:var(--green)">${escapeHtml(att.model)}</code>
+      <span style="color:var(--text-dim)">Input Hash</span>
+      <code style="word-break:break-all">${escapeHtml(att.input_hash)}</code>
+      <span style="color:var(--text-dim)">Output Hash</span>
+      <code style="word-break:break-all">${escapeHtml(att.output_hash)}</code>
+      <span style="color:var(--text-dim)">Pre-commit</span>
+      <code style="word-break:break-all">${escapeHtml(att.pre_commitment)}</code>
+      <span style="color:var(--text-dim)">Node</span>
+      <code style="word-break:break-all">${escapeHtml(att.node_pubkey)}</code>
+      <span style="color:var(--text-dim)">Signature</span>
+      <code style="word-break:break-all;color:var(--accent)">${escapeHtml((att.node_signature || '').slice(0, 32))}...</code>
+      <span style="color:var(--text-dim)">Timestamp</span>
+      <span>${att.timestamp ? new Date(att.timestamp).toISOString() : '-'}</span>
+    </div>
+    <div style="margin-top:0.75rem;display:flex;gap:0.5rem">
+      <button onclick="verifyAttestation('${escapeHtml(attId)}')" style="font-size:0.7rem;padding:0.35rem 0.8rem;background:var(--green);color:#000">Verify On-Chain</button>
+      <button onclick="viewChain('${escapeHtml(attId)}')" style="font-size:0.7rem;padding:0.35rem 0.8rem" class="secondary">View Hash Chain</button>
+    </div>
+    <div id="att-verify-result" style="margin-top:0.5rem"></div>`;
+}
+
+async function verifyAttestation(attId) {
+  const el = document.getElementById('att-verify-result');
+  if (!el) return;
+  el.innerHTML = '<span style="font-size:0.7rem;color:var(--yellow)">verifying...</span>';
+  const base = getNodeUrl();
+  const shard = getShard();
+  try {
+    const res = await fetch(`${base}/api/verify?shard=${shard}&id=${encodeURIComponent(attId)}`);
+    const data = await res.json();
+    if (data.valid) {
+      const checks = Object.entries(data.checks).map(([k, v]) =>
+        `<span style="color:${v ? 'var(--green)' : 'var(--red)'}">${v ? 'PASS' : 'FAIL'} ${k}</span>`
+      ).join(' &middot; ');
+      el.innerHTML = `<div style="font-size:0.7rem;padding:0.5rem;background:var(--green-dim);border:1px solid var(--green);border-radius:4px;color:var(--green)">
+        <strong>VERIFIED</strong> &mdash; All checks passed<br>${checks}</div>`;
+    } else {
+      const checks = Object.entries(data.checks || {}).map(([k, v]) =>
+        `<span style="color:${v ? 'var(--green)' : 'var(--red)'}">${v ? 'PASS' : 'FAIL'} ${k}</span>`
+      ).join(' &middot; ');
+      el.innerHTML = `<div style="font-size:0.7rem;padding:0.5rem;background:var(--red-dim);border:1px solid var(--red);border-radius:4px;color:var(--red)">
+        <strong>FAILED</strong> &mdash; Some checks failed<br>${checks}</div>`;
+    }
+  } catch (e) {
+    el.innerHTML = `<span style="font-size:0.7rem;color:var(--red)">Error: ${escapeHtml(e.message)}</span>`;
+  }
+}
+
+async function viewChain(attId) {
+  const el = document.getElementById('att-verify-result');
+  if (!el) return;
+  el.innerHTML = '<span style="font-size:0.7rem;color:var(--yellow)">loading chain...</span>';
+  const base = getNodeUrl();
+  const shard = getShard();
+  try {
+    const res = await fetch(`${base}/api/attestation?shard=${shard}&id=${encodeURIComponent(attId)}`);
+    const data = await res.json();
+    const chain = [data.attestation, ...(data.chain_depth > 1 ? [] : [])];
+    let html = `<div style="font-size:0.7rem;margin-top:0.25rem">
+      <strong>Chain depth:</strong> ${data.chain_depth} attestations &middot;
+      <strong>Challenges:</strong> ${(data.challenges || []).length}</div>`;
+    html += `<details style="margin-top:0.5rem"><summary style="font-size:0.7rem;color:var(--text-dim);cursor:pointer">Full attestation record</summary>
+      <pre style="font-size:0.65rem;margin-top:0.25rem">${escapeHtml(JSON.stringify(data.attestation, null, 2))}</pre></details>`;
+    if (data.challenges && data.challenges.length > 0) {
+      html += `<details style="margin-top:0.25rem"><summary style="font-size:0.7rem;color:var(--text-dim);cursor:pointer">Challenge history</summary>
+        <pre style="font-size:0.65rem;margin-top:0.25rem">${escapeHtml(JSON.stringify(data.challenges, null, 2))}</pre></details>`;
+    }
+    el.innerHTML = html;
+  } catch (e) {
+    el.innerHTML = `<span style="font-size:0.7rem;color:var(--red)">Error: ${escapeHtml(e.message)}</span>`;
+  }
+}
+
+// ─── Init ─────────────────────────────────────────────────────────────────────
+
+loadCatalog();
+</script>
+</body>
+</html>

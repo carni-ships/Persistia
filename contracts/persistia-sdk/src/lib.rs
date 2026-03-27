@@ -36,6 +36,8 @@ extern "C" {
     fn trigger_manage(action_reg: u32, data_reg: u32);
     // Deploy: programmatically deploy a new contract from WASM bytes
     fn deploy_contract(wasm_reg: u32) -> u32;
+    // Lock: permanently prevent future upgrades to this contract
+    fn lock_contract();
 }
 
 // ─── Register Helpers ────────────────────────────────────────────────────────
@@ -226,6 +228,15 @@ pub fn deploy_child_contract(wasm_bytes: &[u8]) -> Result<String, String> {
     } else {
         Err(String::from_utf8(result).unwrap_or_default())
     }
+}
+
+// ─── Upgrade Lock ───────────────────────────────────────────────────────────
+
+/// Permanently lock this contract, preventing any future code upgrades.
+/// This is irreversible — once called, even the original deployer cannot
+/// replace the WASM binary. Use this to make a contract trustlessly immutable.
+pub fn lock_upgrades() {
+    unsafe { lock_contract() };
 }
 
 // ─── Global Allocator ────────────────────────────────────────────────────────
