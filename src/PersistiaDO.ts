@@ -25,7 +25,9 @@ import { GossipManager, type GossipEnvelope, type SyncResponsePayload } from "./
 import { AnchorManager, type AnchorConfig, type AnchorRecord } from "./anchoring";
 import { ValidatorRegistry, verifyPoW } from "./validator-registry";
 import { AccountManager, pubkeyB64ToAddress, validateAddress } from "./wallet";
-import { MPPHandler, type MPPConfig } from "./mpp";
+import { MPPHandler, type MPPConfig, type MPPReceipt } from "./mpp";
+import { dispatchApiRoute } from "./ai-services";
+import { ServiceAttestationManager } from "./service-attestations";
 import { computeAdaptiveInterval, SMOOTHING_WINDOW, type AdaptiveSignals } from "./adaptive-params";
 import { SnapshotManager, type SnapshotMeta } from "./snapshot";
 
@@ -59,6 +61,7 @@ export class PersistiaWorldV4 implements DurableObject {
   validatorRegistry!: ValidatorRegistry;
   accountManager!: AccountManager;
   mppHandler!: MPPHandler;
+  attestationMgr!: ServiceAttestationManager;
   shardName: string = "global-world";
   currentRound: number = 0;
   finalizedSeq: number = 0;
@@ -343,6 +346,10 @@ export class PersistiaWorldV4 implements DurableObject {
     const hashFn = this.getNetworkParamString("state_hash_function", "poseidon2") as HashFunctionName;
     this.stateTree = new IncrementalStateTree(hashFn);
 
+    // Restore adaptive tuning preference (persisted so deploys don't re-enable it)
+    const adaptiveKV = this.getKV("adaptive_enabled");
+    if (adaptiveKV !== null) this._adaptiveEnabled = adaptiveKV === "1";
+
     // Contract executor + trigger manager
     this.contractExecutor = new ContractExecutor(sql, this.env.BLOB_STORE);
     this.triggerManager = new TriggerManager(sql);
@@ -360,6 +367,11 @@ export class PersistiaWorldV4 implements DurableObject {
       routes: this.env.MPP_ROUTES ? JSON.parse(this.env.MPP_ROUTES) : [],
     };
     this.mppHandler = new MPPHandler(sql, mppConfig);
+
+    // Service attestation manager (verifiable AI compute)
+    ServiceAttestationManager.initTables(sql);
+    this.attestationMgr = new ServiceAttestationManager(sql, this.nodeIdentity);
+    await this.attestationMgr.init();
 
     const anchorConfig: Partial<AnchorConfig> = {};
     if (this.env.BERACHAIN_RPC) {
@@ -757,6 +769,33 @@ export class PersistiaWorldV4 implements DurableObject {
       // MPP middleware: check if route requires payment
       const mppResult = await this.mppHandler.middleware(req);
       if (mppResult.response) return mppResult.response;
+
+      // ─── AI Services Gateway (/api/*) ─────────────────────────────────
+      if (url.pathname.startsWith("/api/")) {
+        // Attestation query endpoints (free, no payment)
+        if (url.pathname === "/api/attestation" || url.pathname === "/api/attestations") {
+          return this.handleAttestationQuery(req, url);
+        }
+        if (url.pathname === "/api/verify") {
+          return this.handleAttestationVerify(req, url);
+        }
+
+        const response = await dispatchApiRoute(
+          url.pathname, req,
+          { AI: this.env.AI, BROWSER: this.env.BROWSER },
+          this.attestationMgr,
+        );
+        // Attach MPP receipt header if payment was verified
+        if (mppResult.receipt) {
+          const receiptResponse = new Response(response.body, response);
+          receiptResponse.headers.set(
+            "Payment-Receipt",
+            MPPHandler.formatReceiptHeader(mppResult.receipt),
+          );
+          return receiptResponse;
+        }
+        return response;
+      }
 
       switch (url.pathname) {
         case "/root":
@@ -1722,6 +1761,7 @@ export class PersistiaWorldV4 implements DurableObject {
         if (req.method === "POST") {
           const { enabled } = await req.json() as any;
           this._adaptiveEnabled = !!enabled;
+          this.setKV("adaptive_enabled", this._adaptiveEnabled ? "1" : "0");
           return this.json({ ok: true, adaptive_enabled: this._adaptiveEnabled });
         }
         let latestProven = 0;
@@ -2974,6 +3014,39 @@ export class PersistiaWorldV4 implements DurableObject {
     }
   }
 
+  // ─── Service Attestation Routes ──────────────────────────────────────
+
+  private async handleAttestationQuery(_req: Request, url: URL): Promise<Response> {
+    const id = url.searchParams.get("id");
+    if (id) {
+      // Single attestation lookup
+      const att = this.attestationMgr.getAttestation(id);
+      if (!att) return this.json({ error: "Attestation not found" }, 404);
+      // Also return chain context
+      const chain = this.attestationMgr.getChain(id, 5);
+      const challenges = this.attestationMgr.getChallenges(id);
+      return this.json({ attestation: att, chain_depth: chain.length, challenges });
+    }
+    // List attestations
+    const service = url.searchParams.get("service") || undefined;
+    const after = url.searchParams.get("after");
+    const limit = Math.min(parseInt(url.searchParams.get("limit") || "50"), 200);
+    const attestations = this.attestationMgr.listAttestations({
+      service,
+      limit,
+      after: after ? parseInt(after) : undefined,
+    });
+    const stats = this.attestationMgr.getStats();
+    return this.json({ attestations, stats });
+  }
+
+  private async handleAttestationVerify(_req: Request, url: URL): Promise<Response> {
+    const id = url.searchParams.get("id");
+    if (!id) return this.json({ error: "id required (?id=attestation_id)" }, 400);
+    const result = await this.attestationMgr.verify(id);
+    return this.json(result);
+  }
+
   // ─── Snapshot Routes ───────────────────────────────────────────────────
 
   private async handleSnapshotRoute(req: Request, url: URL): Promise<Response> {
@@ -4000,13 +4073,14 @@ export class PersistiaWorldV4 implements DurableObject {
     // ── Persist per-block state mutations for ZK prover ─────────────────────
     // Capture dirty entries from the state tree before computeCommitment clears them.
     const blockMutations = this.stateTree.getDirtyMutations();
-    console.log(`[ZK] Round ${round}: ${blockMutations.length} mutations, ${newlyFinalizedHashes.length} events finalized`);
     if (blockMutations.length > 0) {
-      const mutPlaceholders = blockMutations.map(() => "(?, ?, ?, ?)").join(", ");
-      sql.exec(
-        `INSERT OR REPLACE INTO block_mutations (block_number, key, new_value, is_delete) VALUES ${mutPlaceholders}`,
-        ...blockMutations.flatMap(m => [round, m.key, m.value, m.value === null ? 1 : 0]),
-      );
+      // Cloudflare DO SQLite limits bind params; insert one row at a time
+      for (const m of blockMutations) {
+        sql.exec(
+          `INSERT OR REPLACE INTO block_mutations (block_number, key, new_value, is_delete) VALUES (?, ?, ?, ?)`,
+          round, m.key, m.value ?? "", m.value === null ? 1 : 0,
+        );
+      }
     }
 
     // ── Batch SQL flush ──────────────────────────────────────────────────────
