@@ -190,6 +190,14 @@ async function fetchLatestBlock(nodeBase: string): Promise<number> {
   return data.last_committed_round ?? data.latest_block ?? data.latestBlock ?? 0;
 }
 
+async function fetchNextCommitted(nodeBase: string, afterBlock: number): Promise<number | null> {
+  const url = nodeUrl(nodeBase, `/dag/next_committed?after=${afterBlock}`);
+  const res = await fetch(url);
+  if (!res.ok) return null;
+  const data = await res.json() as any;
+  return data.round ?? null;
+}
+
 async function submitProof(nodeBase: string, proofData: any) {
   const url = nodeUrl(nodeBase, "/proof/zk/submit");
   const res = await fetch(url, {
@@ -306,7 +314,8 @@ async function cmdProve(
   if (useNative && nativeBbAvailable()) {
     console.log(`Using native bb CLI for proving (${target})...`);
     proof = nativeBbProve(solvedWitness, target);
-    vkBytes = readFileSync("/tmp/persistia_bb_prove/vk");
+    const vkCachePath = ensureVkCached(target);
+    if (vkCachePath) vkBytes = readFileSync(vkCachePath);
   } else {
     if (useNative) console.warn("Native bb not available, falling back to WASM");
     proof = await backend.generateProof(solvedWitness);
@@ -405,15 +414,16 @@ async function cmdWatch(
     try {
       const latestBlock = await fetchLatestBlock(nodeBase);
 
-      // Catch up to latest committed block
+      // Catch up to latest committed block (sparse-aware via next_committed)
       while (latestBlock > lastProvenBlock) {
-        const blockNum = lastProvenBlock + 1;
+        const blockNum = await fetchNextCommitted(nodeBase, lastProvenBlock);
+        if (blockNum === null || blockNum > latestBlock) break;
+
         const outPath = join(proofDir, `block_${blockNum}.json`);
-        let proved = false;
         try {
-          await cmdProve(nodeBase, blockNum, outPath, prevProofPath, useNative);
+          // Note: recursive chaining disabled (ENABLE_RECURSIVE=false in circuit)
+          await cmdProve(nodeBase, blockNum, outPath, undefined, useNative);
           prevProofPath = outPath;
-          proved = true;
 
           // Submit to node
           try {
@@ -425,11 +435,7 @@ async function cmdWatch(
           }
         } catch (e: any) {
           // Skip blocks that don't exist (pre-deploy blocks without mutations)
-          if (e.message?.includes("404") || e.message?.includes("not found") || e.message?.includes("not committed") || e.message?.includes("Too many mutations")) {
-            console.log(`Block ${blockNum} not available, skipping`);
-          } else {
-            throw e;
-          }
+          console.log(`Block ${blockNum} skipped: ${e.message?.substring(0, 120)}`);
         }
         lastProvenBlock = blockNum;
       }
