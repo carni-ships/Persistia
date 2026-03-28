@@ -75,8 +75,8 @@ const HYBERDB_COMMIT_SIG = "0x5c36b186"; // commit(bytes32 namespace, bytes key,
 // ─── Defaults ─────────────────────────────────────────────────────────────────
 
 const DEFAULT_CONFIG: AnchorConfig = {
-  anchor_interval_seq: 100,
-  anchor_interval_ms: 300_000,      // 5 minutes
+  anchor_interval_seq: 500,         // anchor every 500 finalized events (reduced from 100 for free-tier R2 budget)
+  anchor_interval_ms: 600_000,      // 10 minutes minimum between anchors
   snapshot_with_anchor: false,
 };
 

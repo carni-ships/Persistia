@@ -474,6 +474,44 @@ const HANDLERS: Record<string, (ai: any, body: any) => Promise<Response>> = {
   code: handleCode,
 };
 
+// ─── AI Neuron Budget (free-tier: 10K neurons/day) ───────────────────────────
+
+const DAILY_NEURON_BUDGET = 9000; // leave 10% headroom below 10K limit
+const NEURON_COST_ESTIMATE: Record<string, number> = {
+  chat: 1000,       // LLM inference
+  summarize: 800,
+  sentiment: 300,
+  embedding: 200,
+  classify: 300,
+  tts: 500,
+  translate: 500,
+  code: 1000,
+  screenshot: 0,    // uses Browser binding, not AI neurons
+};
+
+// In-memory daily tracking (resets on DO eviction, which is fine — it's a soft limit)
+let _neuronBudget = { date: "", used: 0 };
+
+function checkNeuronBudget(service: string): { ok: boolean; remaining: number } {
+  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  if (_neuronBudget.date !== today) {
+    _neuronBudget = { date: today, used: 0 };
+  }
+  const cost = NEURON_COST_ESTIMATE[service] ?? 500;
+  const remaining = DAILY_NEURON_BUDGET - _neuronBudget.used;
+  if (cost > remaining) {
+    return { ok: false, remaining };
+  }
+  _neuronBudget.used += cost;
+  return { ok: true, remaining: remaining - cost };
+}
+
+export function getNeuronBudgetStatus(): { date: string; used: number; budget: number; remaining: number } {
+  const today = new Date().toISOString().slice(0, 10);
+  if (_neuronBudget.date !== today) return { date: today, used: 0, budget: DAILY_NEURON_BUDGET, remaining: DAILY_NEURON_BUDGET };
+  return { date: _neuronBudget.date, used: _neuronBudget.used, budget: DAILY_NEURON_BUDGET, remaining: DAILY_NEURON_BUDGET - _neuronBudget.used };
+}
+
 export async function dispatchApiRoute(
   path: string,
   request: Request,
@@ -527,6 +565,16 @@ export async function dispatchApiRoute(
       error: `Unknown service: ${service}`,
       available: Object.keys(HANDLERS),
     }, 404);
+  }
+
+  // Neuron budget check — reject if daily quota exhausted (free-tier protection)
+  const budget = checkNeuronBudget(service);
+  if (!budget.ok) {
+    return jsonResponse({
+      error: "Daily AI neuron budget exhausted",
+      remaining: budget.remaining,
+      hint: "Use federated service providers or wait until tomorrow",
+    }, 429);
   }
 
   let body: any;

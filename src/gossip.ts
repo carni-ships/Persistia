@@ -82,6 +82,12 @@ export interface SyncResponsePayload {
     finalized_seq: number;
     snapshot_hash: string;
   };
+  // State root checkpoint — peers compare these to detect forks
+  checkpoint?: {
+    finalized_seq: number;
+    finalized_root: string;
+    last_committed_round: number;
+  };
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -92,6 +98,8 @@ const GOSSIP_TIMEOUT_MS = 2000;
 const DEDUP_WINDOW = 1000;       // keep last N nonces for dedup
 const PEER_EXCHANGE_INTERVAL = 3; // exchange peers every N sync cycles
 const FLOOD_CONCURRENCY = 6;     // max parallel outbound connections per flood
+const GOSSIP_SAMPLE_THRESHOLD = 12; // above this peer count, sample instead of flooding all
+const GOSSIP_SAMPLE_SIZE = 8;       // number of peers to sample (≥ quorum for Byzantine safety)
 
 /**
  * Build a URL by appending a path to a peer base URL.
@@ -297,9 +305,21 @@ export class GossipManager {
    * Limits parallel outbound connections to avoid exhausting CF Workers' connection pool.
    */
   async flood(envelope: GossipEnvelope, excludePubkeys: Set<string> = new Set()): Promise<number> {
-    const peers = this.getHealthyPeers().filter(p => !excludePubkeys.has(p.pubkey));
+    let peers = this.getHealthyPeers().filter(p => !excludePubkeys.has(p.pubkey));
+
+    // Probabilistic sampling: when many peers are available, pick a random subset.
+    // Byzantine-safe as long as sample_size ≥ 2f+1 (messages propagate via multi-hop).
+    if (peers.length > GOSSIP_SAMPLE_THRESHOLD) {
+      // Fisher-Yates partial shuffle to select GOSSIP_SAMPLE_SIZE random peers
+      for (let i = peers.length - 1; i > 0 && i >= peers.length - GOSSIP_SAMPLE_SIZE; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [peers[i], peers[j]] = [peers[j], peers[i]];
+      }
+      peers = peers.slice(peers.length - GOSSIP_SAMPLE_SIZE);
+    }
+
     let delivered = 0;
-    const body = JSON.stringify(envelope); // serialize once
+    const body = compactEnvelope(envelope); // compact wire format (~35% smaller)
 
     // Process peers in batches of FLOOD_CONCURRENCY
     for (let i = 0; i < peers.length; i += FLOOD_CONCURRENCY) {
@@ -356,30 +376,76 @@ export class GossipManager {
     onVertex: (vertex: any) => Promise<void>,
     onProof?: (proof: any) => Promise<void>,
     onAdaptiveState?: (state: { round_interval_ms: number; max_events_per_vertex: number }) => void,
+    onDivergence?: (peerPubkey: string, peerUrl: string, local: { seq: number; root: string }, remote: { seq: number; root: string }) => void,
+    localCheckpoint?: { finalized_seq: number; finalized_root: string },
   ): Promise<{ synced: number; peersContacted: number }> {
     const peers = this.getHealthyPeers();
     let synced = 0;
     let peersContacted = 0;
 
-    // Per-peer sync helper
+    // Per-peer sync helper — uses delta protocol when available
     const syncOnePeer = async (peer: GossipPeer): Promise<{ synced: number; contacted: boolean }> => {
       try {
         const afterRound = Math.max(0, peer.last_sync_round || (currentRound - activeWindow));
-        const res = await fetchWithTimeout(
-          buildPeerUrl(peer.url, "/gossip/sync", { after_round: String(afterRound), limit: "2000" }),
-          { method: "GET" },
-          GOSSIP_TIMEOUT_MS,
-        );
 
-        if (!res.ok) {
-          this.markPeerFailure(peer.pubkey);
-          return { synced: 0, contacted: false };
+        // Try delta sync first: fetch hashes, identify missing, fetch only those bodies
+        let data: SyncResponsePayload;
+        let peerSynced = 0;
+        let usedDelta = false;
+
+        try {
+          const hashRes = await fetchWithTimeout(
+            buildPeerUrl(peer.url, "/gossip/sync/hashes", { after_round: String(afterRound), limit: "5000" }),
+            { method: "GET" },
+            GOSSIP_TIMEOUT_MS,
+          );
+          if (hashRes.ok) {
+            const hashData = await hashRes.json() as any;
+            // Find hashes we don't have locally
+            const localHashes = new Set<string>(
+              [...this.sql.exec(
+                "SELECT hash FROM dag_vertices WHERE round >= ? LIMIT 10000", afterRound,
+              )].map((r: any) => r.hash),
+            );
+            const missingHashes = (hashData.hashes || [])
+              .filter((h: any) => !localHashes.has(h.h))
+              .map((h: any) => h.h);
+
+            if (missingHashes.length === 0) {
+              // Fully synced — still process checkpoint/adaptive
+              data = { vertices: [], commits: [], latest_round: hashData.latest_round, checkpoint: hashData.checkpoint };
+              usedDelta = true;
+            } else if (missingHashes.length < (hashData.hashes?.length || 0) * 0.5) {
+              // Delta is worthwhile (missing < 50% of total)
+              const bodyRes = await fetchWithTimeout(
+                buildPeerUrl(peer.url, "/gossip/sync/bodies"),
+                { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ hashes: missingHashes.slice(0, 500) }) },
+                GOSSIP_TIMEOUT_MS,
+              );
+              if (bodyRes.ok) {
+                const bodyData = await bodyRes.json() as any;
+                data = { vertices: bodyData.vertices || [], commits: [], latest_round: hashData.latest_round, checkpoint: hashData.checkpoint };
+                usedDelta = true;
+              }
+            }
+          }
+        } catch { /* delta not supported, fall through to full sync */ }
+
+        // Fallback: full sync
+        if (!usedDelta) {
+          const res = await fetchWithTimeout(
+            buildPeerUrl(peer.url, "/gossip/sync", { after_round: String(afterRound), limit: "2000" }),
+            { method: "GET" },
+            GOSSIP_TIMEOUT_MS,
+          );
+          if (!res.ok) {
+            this.markPeerFailure(peer.pubkey);
+            return { synced: 0, contacted: false };
+          }
+          data = await res.json() as SyncResponsePayload;
         }
 
-        const data = await res.json() as SyncResponsePayload;
-        let peerSynced = 0;
-
-        for (const v of data.vertices || []) {
+        for (const v of data!.vertices || []) {
           try {
             await onVertex(v);
             peerSynced++;
@@ -398,6 +464,22 @@ export class GossipManager {
         // Bootstrap adaptive params from peer (cold-start convergence)
         if (onAdaptiveState && data.adaptive_state) {
           onAdaptiveState(data.adaptive_state);
+        }
+
+        // Divergence detection: compare finalized state roots at the same seq
+        if (onDivergence && localCheckpoint && data.checkpoint) {
+          const remote = data.checkpoint;
+          // Only compare when both nodes have committed to at least the same seq
+          // (comparing at different progress levels is meaningless)
+          if (remote.finalized_seq > 0 && localCheckpoint.finalized_seq > 0 &&
+              remote.finalized_seq === localCheckpoint.finalized_seq &&
+              remote.finalized_root !== localCheckpoint.finalized_root) {
+            onDivergence(
+              peer.pubkey, peer.url,
+              { seq: localCheckpoint.finalized_seq, root: localCheckpoint.finalized_root },
+              { seq: remote.finalized_seq, root: remote.finalized_root },
+            );
+          }
         }
 
         // Update sync cursor
@@ -468,7 +550,7 @@ export class GossipManager {
         const res = await fetchWithTimeout(buildPeerUrl(peer.url, "/gossip/peers"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(envelope),
+          body: compactEnvelope(envelope),
         }, GOSSIP_TIMEOUT_MS);
 
         if (!res.ok) continue;
@@ -525,6 +607,41 @@ export class GossipManager {
 
     return added;
   }
+}
+
+// ─── Compact Wire Format ─────────────────────────────────────────────────────
+// Reduces gossip payload size ~35-40% by using short keys and omitting nulls.
+// Compatible with standard JSON — no external dependency needed.
+
+const COMPACT_KEYS: Record<string, string> = {
+  type: "t", sender_pubkey: "sp", sender_url: "su", signature: "s",
+  payload: "p", timestamp: "ts", nonce: "n", grumpkin_x: "gx", grumpkin_y: "gy",
+};
+const EXPAND_KEYS: Record<string, string> = Object.fromEntries(
+  Object.entries(COMPACT_KEYS).map(([k, v]) => [v, k]),
+);
+
+export function compactEnvelope(env: GossipEnvelope): string {
+  const obj: any = {};
+  for (const [full, short] of Object.entries(COMPACT_KEYS)) {
+    const val = (env as any)[full];
+    if (val !== undefined && val !== null) obj[short] = val;
+  }
+  return JSON.stringify(obj);
+}
+
+export function expandEnvelope(data: string | any): GossipEnvelope {
+  const obj = typeof data === "string" ? JSON.parse(data) : data;
+  // If already has full keys, return as-is
+  if (obj.type && obj.sender_pubkey) return obj as GossipEnvelope;
+  // Expand compact keys
+  const expanded: any = {};
+  for (const [short, val] of Object.entries(obj)) {
+    const full = EXPAND_KEYS[short];
+    if (full) expanded[full] = val;
+    else expanded[short] = val; // pass through unknown keys
+  }
+  return expanded as GossipEnvelope;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

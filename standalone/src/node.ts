@@ -635,7 +635,14 @@ export class StandaloneNode {
       afterRound,
     );
 
-    return { vertices, commits, latest_round: this.currentRound };
+    return {
+      vertices, commits, latest_round: this.currentRound,
+      checkpoint: {
+        finalized_seq: this.finalizedSeq,
+        finalized_root: this.finalizedRoot,
+        last_committed_round: this.lastCommittedRound,
+      },
+    };
   }
 
   // ─── KV Helpers ───────────────────────────────────────────────────────

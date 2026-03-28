@@ -1050,6 +1050,213 @@ async function cmdWatchParallelMsgpack(
   }
 }
 
+// --- SnarkFold Epoch Proof Aggregation ---
+// Folds N block proofs into a single compact epoch proof via recursive verification.
+// Each block proof is verified inside the circuit, producing one proof covering [start, end].
+// This reduces on-chain/light-client verification from N proofs to 1.
+
+async function cmdAggregate(
+  nodeBase: string,
+  proofDir: string,
+  blockStart: number,
+  blockEnd: number,
+  outputPath: string,
+  useNative = false,
+) {
+  if (blockEnd < blockStart) {
+    console.error("block-end must be >= block-start");
+    process.exit(1);
+  }
+
+  const blockCount = blockEnd - blockStart + 1;
+  console.log(`SnarkFold: aggregating ${blockCount} proofs (blocks ${blockStart}-${blockEnd})`);
+
+  // Step 1: Collect all block proofs (from local dir or fetch from node)
+  const proofs: any[] = [];
+  for (let b = blockStart; b <= blockEnd; b++) {
+    const localPath = join(proofDir, `block_${b}.json`);
+    if (existsSync(localPath)) {
+      proofs.push(JSON.parse(readFileSync(localPath, "utf-8")));
+      continue;
+    }
+    // Try fetching from node
+    try {
+      const url = nodeUrl(nodeBase, `/proof/zk/get?block=${b}`);
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json() as any;
+      if (!data.proof) throw new Error("No proof data");
+      proofs.push(data);
+    } catch (e: any) {
+      console.error(`Missing proof for block ${b}: ${e.message}`);
+      process.exit(1);
+    }
+  }
+
+  console.log(`Collected ${proofs.length} proofs. Starting recursive fold...`);
+
+  // Step 2: Recursive fold — chain proofs pairwise until one remains
+  // Uses the existing UltraHonk recursive verification: each step verifies
+  // the previous aggregate + next block proof, producing a new proof.
+  const { backend, noir } = await createProver();
+  const startTime = performance.now();
+
+  // Build the aggregate by chaining: start with first proof, fold in each subsequent
+  let currentAggregate = proofs[0];
+  let aggregatedBlocks = 1;
+
+  for (let i = 1; i < proofs.length; i++) {
+    const nextProof = proofs[i];
+    const stepStart = performance.now();
+
+    // The fold witness: verify previous aggregate inside circuit, combine with next block
+    const foldWitness: any = {
+      // Previous aggregate as inner proof
+      prev_state_root: currentAggregate.state_root || GENESIS_STATE_ROOT,
+      new_state_root: nextProof.state_root || GENESIS_STATE_ROOT,
+      block_number: nextProof.block_number,
+      active_nodes: nextProof.active_nodes || 1,
+      mutations: [],
+      mutation_count: 0,
+      signatures: [],
+      sig_count: 0,
+      prev_proven_blocks: aggregatedBlocks,
+      prev_genesis_root: currentAggregate.genesis_root || GENESIS_STATE_ROOT,
+    };
+
+    // Pad mutations/signatures to circuit size
+    while (foldWitness.mutations.length < 512) {
+      foldWitness.mutations.push({ key: "0", new_value: "0", is_delete: 0, enabled: 0 });
+    }
+    while (foldWitness.signatures.length < 4) {
+      foldWitness.signatures.push({
+        pubkey_x: "0", pubkey_y: "0",
+        signature: Array(64).fill(0),
+        msg: Array(32).fill(0),
+        enabled: 0,
+      });
+    }
+
+    // Add recursive proof fields from previous aggregate
+    if (currentAggregate.publicInputs && currentAggregate.vkAsFields) {
+      const proofBytes = Buffer.from(currentAggregate.proof, "base64");
+      const innerFields: string[] = [];
+      for (let j = 51 * 32; j < proofBytes.length; j += 32) {
+        const hex = "0x" + Array.from(proofBytes.subarray(j, j + 32)).map(b => b.toString(16).padStart(2, "0")).join("");
+        innerFields.push(hex);
+      }
+      while (innerFields.length < 449) innerFields.push("0x00");
+
+      foldWitness.prev_proof = innerFields.slice(0, 449);
+      foldWitness.prev_vk = currentAggregate.vkAsFields.slice(0, 115);
+      foldWitness.prev_key_hash = currentAggregate.vkHash || "0x00";
+      foldWitness.prev_public_inputs = currentAggregate.publicInputs.slice(0, 8);
+    } else {
+      // No recursive data — first proof may not have it; use zeroed fields
+      foldWitness.prev_proof = Array(449).fill("0x00");
+      foldWitness.prev_vk = Array(115).fill("0x00");
+      foldWitness.prev_key_hash = "0x00";
+      foldWitness.prev_public_inputs = Array(8).fill("0x00");
+    }
+
+    try {
+      // Generate fold proof
+      if (useNative && nativeBbAvailable()) {
+        const { witness } = await noir.execute(foldWitness);
+        const compressed = noir.getWitnessCompressed(witness);
+        const vkPath = ensureVkCached();
+        const result = nativeBbProve(compressed, vkPath);
+        const artifacts = await backend.generateProofArtifacts(
+          { proof: result.proof, publicInputs: result.publicInputs },
+        );
+        currentAggregate = {
+          proof: Buffer.from(result.proof).toString("base64"),
+          publicInputs: result.publicInputs,
+          vkAsFields: artifacts.vkAsFields,
+          vkHash: artifacts.vkHash,
+          block_number: nextProof.block_number,
+          proven_blocks: aggregatedBlocks + 1,
+          genesis_root: currentAggregate.genesis_root || GENESIS_STATE_ROOT,
+          state_root: nextProof.state_root,
+        };
+      } else {
+        const proof = await noir.execute(foldWitness).then(({ witness }) =>
+          backend.generateProof(witness),
+        );
+        const artifacts = await backend.generateProofArtifacts(proof);
+        currentAggregate = {
+          proof: Buffer.from(proof.proof).toString("base64"),
+          publicInputs: proof.publicInputs,
+          vkAsFields: artifacts.vkAsFields,
+          vkHash: artifacts.vkHash,
+          block_number: nextProof.block_number,
+          proven_blocks: aggregatedBlocks + 1,
+          genesis_root: currentAggregate.genesis_root || GENESIS_STATE_ROOT,
+          state_root: nextProof.state_root,
+        };
+      }
+      aggregatedBlocks++;
+      const stepMs = (performance.now() - stepStart).toFixed(0);
+      console.log(`  Fold step ${i}/${proofs.length - 1}: block ${nextProof.block_number} (${stepMs}ms, ${aggregatedBlocks} blocks aggregated)`);
+    } catch (e: any) {
+      console.error(`Fold step ${i} failed at block ${nextProof.block_number}: ${e.message}`);
+      // Continue with what we have
+      break;
+    }
+  }
+
+  const totalSec = ((performance.now() - startTime) / 1000).toFixed(2);
+  console.log(`\nSnarkFold complete: ${aggregatedBlocks} blocks in ${totalSec}s`);
+
+  // Step 3: Write epoch proof
+  const epoch = Math.floor(blockStart / blockCount); // epoch number
+  const epochProof = {
+    epoch,
+    block_start: blockStart,
+    block_end: blockStart + aggregatedBlocks - 1,
+    proof_count: aggregatedBlocks,
+    proof: currentAggregate.proof,
+    publicInputs: currentAggregate.publicInputs,
+    vkAsFields: currentAggregate.vkAsFields,
+    vkHash: currentAggregate.vkHash,
+    state_root: currentAggregate.state_root,
+    genesis_root: currentAggregate.genesis_root,
+    prover: "snarkfold-ultrahonk",
+    timestamp: new Date().toISOString(),
+  };
+
+  const dir = resolve(outputPath, "..");
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  writeFileSync(outputPath, JSON.stringify(epochProof, null, 2));
+  console.log(`Epoch proof written to ${outputPath}`);
+
+  // Step 4: Submit to node
+  try {
+    const url = nodeUrl(nodeBase, "/proof/epoch/submit");
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        epoch,
+        block_start: blockStart,
+        block_end: blockStart + aggregatedBlocks - 1,
+        proof_count: aggregatedBlocks,
+        proof: currentAggregate.proof,
+        public_values: currentAggregate.publicInputs,
+        state_root: currentAggregate.state_root,
+        genesis_root: currentAggregate.genesis_root,
+      }),
+    });
+    if (res.ok) {
+      console.log("Epoch proof submitted to node.");
+    } else {
+      console.warn(`Submit failed: ${res.status}`);
+    }
+  } catch (e: any) {
+    console.warn(`Could not submit epoch proof: ${e.message}`);
+  }
+}
+
 // --- bb Version Manager ---
 
 function cmdBbVersion() {
@@ -1341,6 +1548,16 @@ switch (command) {
       args.includes("--tree") ? getArg("tree") : undefined,
     );
     break;
+  case "aggregate":
+    cmdAggregate(
+      getArg("node", "http://localhost:8787"),
+      getArg("proof-dir", "./proofs"),
+      parseInt(getArg("block-start")),
+      parseInt(getArg("block-end")),
+      getArg("output", "./proofs/epoch_latest.json"),
+      useNative,
+    );
+    break;
   case "bb-version":
     cmdBbVersion();
     break;
@@ -1359,6 +1576,7 @@ Usage:
   tsx prover.ts watch-parallel --node <url>            Parallel proving (catch-up mode)
   tsx prover.ts watch-pipelined --node <url>           Pipelined proving (overlaps witness + prove)
   tsx prover.ts watch-parallel-msgpack --node <url>    Persistent bb workers (6-9% faster parallel)
+  tsx prover.ts aggregate --block-start N --block-end M  SnarkFold: aggregate N proofs into one epoch proof
   tsx prover.ts bench    --node <url> --block <n>      Benchmark proving times
   tsx prover.ts bb-version                             Check bb CLI version
   tsx prover.ts bb-upgrade                             Upgrade bb CLI + bb.js

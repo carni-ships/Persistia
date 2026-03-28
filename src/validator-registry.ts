@@ -160,14 +160,24 @@ export class ValidatorRegistry {
   ): Promise<{ ok: boolean; error?: string; validator?: ValidatorRecord }> {
     // Check if already registered
     const existing = [...this.sql.exec(
-      "SELECT pubkey, status FROM validators WHERE pubkey = ?", pubkey,
+      "SELECT pubkey, status, last_active_round FROM validators WHERE pubkey = ?", pubkey,
     )] as any[];
     if (existing.length > 0) {
       if (existing[0].status === "active") {
-        return { ok: false, error: "Already registered" };
+        // Allow re-registration if node is stale (inactive too long)
+        const status = this.getValidatorStatus(pubkey);
+        if (status !== "stale") {
+          return { ok: false, error: "Already registered" };
+        }
+        // Stale node: fall through to re-register with fresh PoW
+        console.log(`Stale validator ${pubkey.slice(0, 12)} re-registering after ${existing[0].last_active_round} rounds inactive`);
+      }
+      if (existing[0].status === "suspended") {
+        // Suspended (equivocated): must wait for governance to reinstate
+        return { ok: false, error: "Suspended — governance reinstatement required" };
       }
       if (existing[0].status === "removed") {
-        // Must re-register with new PoW (previous equivocation or governance removal)
+        // Must re-register with new PoW (previous governance removal)
       }
     }
 
@@ -208,6 +218,43 @@ export class ValidatorRegistry {
     )] as any[];
     if (rows.length === 0) return null;
     return this.rowToRecord(rows[0]);
+  }
+
+  /**
+   * Quick status check for vertex gating. Returns:
+   * - "active": registered and in good standing
+   * - "suspended": equivocated or manually suspended
+   * - "stale": inactive for too long (must re-register)
+   * - "removed": explicitly removed
+   * - "unknown": not in validators table at all
+   */
+  getValidatorStatus(pubkey: string): "active" | "suspended" | "stale" | "removed" | "unknown" {
+    const rows = [...this.sql.exec(
+      "SELECT status, last_active_round FROM validators WHERE pubkey = ?", pubkey,
+    )] as any[];
+    if (rows.length === 0) return "unknown";
+    const { status, last_active_round } = rows[0];
+    if (status === "suspended") return "suspended";
+    if (status === "removed") return "removed";
+    // Active but stale if inactive for 2x ACTIVE_WINDOW — must re-register
+    // We read current round from consensus_state rather than taking it as param
+    const currentRoundRows = [...this.sql.exec(
+      "SELECT value FROM consensus_state WHERE key = 'current_round'",
+    )] as any[];
+    const currentRound = currentRoundRows.length > 0 ? parseInt(currentRoundRows[0].value) || 0 : 0;
+    const STALE_THRESHOLD = 100; // 2x ACTIVE_WINDOW(50)
+    if (currentRound - (last_active_round || 0) > STALE_THRESHOLD) return "stale";
+    return "active";
+  }
+
+  /**
+   * Mark a stale validator as requiring re-registration.
+   */
+  markStale(pubkey: string): void {
+    this.sql.exec(
+      "UPDATE validators SET status = 'suspended' WHERE pubkey = ? AND status = 'active'",
+      pubkey,
+    );
   }
 
   getActiveValidators(): ValidatorRecord[] {
@@ -332,7 +379,7 @@ export class ValidatorRegistry {
     this.adjustReputation(pubkey, PENALTY_INVALID_VERTEX);
   }
 
-  private adjustReputation(pubkey: string, delta: number) {
+  adjustReputation(pubkey: string, delta: number) {
     const current = [...this.sql.exec(
       "SELECT reputation FROM validators WHERE pubkey = ?", pubkey,
     )] as any[];
@@ -346,6 +393,14 @@ export class ValidatorRegistry {
       this.sql.exec("UPDATE validators SET status = 'suspended' WHERE pubkey = ? AND status = 'active'", pubkey);
     }
     this.invalidateQuorumCache();
+  }
+
+  /** Check if a pubkey is a registered active validator. */
+  isRegistered(pubkey: string): boolean {
+    const rows = [...this.sql.exec(
+      "SELECT status FROM validators WHERE pubkey = ? AND status = 'active' LIMIT 1", pubkey,
+    )] as any[];
+    return rows.length > 0;
   }
 
   // ─── Equivocation Detection & Slashing ──────────────────────────────────

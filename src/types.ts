@@ -139,3 +139,48 @@ export interface TokenTransfer {
   denom: string;
   amount: string;          // stringified bigint
 }
+
+// ─── Fraud Proof Types ──────────────────────────────────────────────────────
+
+export type ChallengeStatus =
+  | "open"          // challenge window active, no challenge yet
+  | "challenged"    // challenge submitted, awaiting response
+  | "finalized"     // unchallenged, window expired
+  | "resolved_valid"   // ZK proof confirmed proposer correct, challenger slashed
+  | "resolved_fraud"   // fraud confirmed, proposer slashed
+  | "timeout"          // proposer failed to respond, treated as fraud
+
+export interface ChallengeWindow {
+  block_number: number;
+  proposer: string;          // pubkey of anchor vertex author
+  post_state_root: string;
+  expires_at_round: number;
+  status: ChallengeStatus;
+}
+
+export interface ChallengeRecord {
+  id: string;
+  block_number: number;
+  challenger: string;        // pubkey
+  bond_hold_id: string;
+  claimed_invalid_root: string | null;  // challenger's computed post-state root (if different)
+  response_deadline_round: number;
+  status: ChallengeStatus;
+  created_at: number;
+  resolved_at: number | null;
+  resolution_proof_hash: string | null;
+  resolution_type: "zk_proof" | "timeout" | "withdrawn" | null;
+}
+
+export interface ChallengeWitness {
+  block_number: number;
+  prev_state_root: string;
+  post_state_root: string;
+  events: SignedEvent[];
+  event_hashes: string[];
+  mutations: { key: string; old_value: string | null; new_value: string | null }[];
+  commit_signatures: { pubkey: string; signature: string; message: string }[];
+  active_nodes: number;
+  prev_header_hash: string;
+  validator_set_hash: string;
+}
