@@ -356,6 +356,14 @@ export class PersistiaWorldV4 implements DurableObject {
       }
     } catch {}
 
+    // Migration: add schnorr_sig column to dag_vertices for ZK proving
+    try {
+      const vCols = [...sql.exec("PRAGMA table_info(dag_vertices)")] as any[];
+      if (!vCols.some((c: any) => c.name === "schnorr_sig")) {
+        sql.exec("ALTER TABLE dag_vertices ADD COLUMN schnorr_sig TEXT");
+      }
+    } catch {}
+
     // Migration: state expiry — chunk archive tracking
     try {
       sql.exec(`
@@ -1770,7 +1778,7 @@ export class PersistiaWorldV4 implements DurableObject {
         const afterRound = parseInt(url.searchParams.get("after_round") || "0");
         const limit = Math.min(parseInt(url.searchParams.get("limit") || "500"), 500);
         const vertices = [...this.state.storage.sql.exec(
-          "SELECT hash, author, round, events_json, refs_json, signature, received_at FROM dag_vertices WHERE round > ? ORDER BY round ASC, hash ASC LIMIT ?",
+          "SELECT hash, author, round, events_json, refs_json, signature, received_at, schnorr_sig FROM dag_vertices WHERE round > ? ORDER BY round ASC, hash ASC LIMIT ?",
           afterRound, limit,
         )].map((r: any) => ({
           hash: r.hash,
@@ -1779,6 +1787,7 @@ export class PersistiaWorldV4 implements DurableObject {
           events_json: r.events_json,
           refs_json: r.refs_json,
           signature: r.signature,
+          schnorr_sig: r.schnorr_sig || undefined,
         }));
 
         const commits = [...this.state.storage.sql.exec(
@@ -3702,7 +3711,7 @@ export class PersistiaWorldV4 implements DurableObject {
         const limit = Math.min(parseInt(url.searchParams.get("limit") || "2000"), 2000);
 
         const vertices = [...this.state.storage.sql.exec(
-          "SELECT hash, author, round, events_json, refs_json, signature, timestamp FROM dag_vertices WHERE round >= ? ORDER BY round ASC, hash ASC LIMIT ?",
+          "SELECT hash, author, round, events_json, refs_json, signature, timestamp, schnorr_sig FROM dag_vertices WHERE round >= ? ORDER BY round ASC, hash ASC LIMIT ?",
           afterRound, limit,
         )].map((r: any) => ({
           hash: r.hash, author: r.author, round: r.round,
@@ -3711,6 +3720,7 @@ export class PersistiaWorldV4 implements DurableObject {
           refs: (() => { try { return JSON.parse(r.refs_json); } catch { return []; } })(),
           timestamp: r.timestamp,
           signature: r.signature,
+          schnorr_sig: r.schnorr_sig ? (() => { try { return JSON.parse(r.schnorr_sig); } catch { return undefined; } })() : undefined,
         }));
 
         const commits = [...this.state.storage.sql.exec(
@@ -4052,7 +4062,7 @@ export class PersistiaWorldV4 implements DurableObject {
       this.currentRound,
       ACTIVE_WINDOW,
       async (v: any) => {
-        const vertex = {
+        const vertex: DAGVertex = {
           author: v.author,
           round: v.round,
           event_hashes: v.event_hashes || [],
@@ -4060,6 +4070,7 @@ export class PersistiaWorldV4 implements DurableObject {
           refs: v.refs || [],
           timestamp: v.timestamp || 0,
           signature: v.signature,
+          schnorr_sig: v.schnorr_sig ? (typeof v.schnorr_sig === "string" ? JSON.parse(v.schnorr_sig) : v.schnorr_sig) : undefined,
         };
         await this.receiveVertex(vertex, true); // skip consensus during bulk sync
       },
@@ -4517,11 +4528,12 @@ export class PersistiaWorldV4 implements DurableObject {
       const afterRound = msg.after_round || 0;
       const limit = Math.min(msg.limit || 500, 500);
       const vertices = [...sql.exec(
-        "SELECT hash, author, round, events_json, refs_json, signature, received_at FROM dag_vertices WHERE round > ? ORDER BY round ASC, hash ASC LIMIT ?",
+        "SELECT hash, author, round, events_json, refs_json, signature, received_at, schnorr_sig FROM dag_vertices WHERE round > ? ORDER BY round ASC, hash ASC LIMIT ?",
         afterRound, limit,
       )].map((r: any) => ({
         hash: r.hash, author: r.author, round: r.round,
         events_json: r.events_json, refs_json: r.refs_json, signature: r.signature,
+        schnorr_sig: r.schnorr_sig || undefined,
       }));
       const commits = [...sql.exec(
         "SELECT round, anchor_hash, committed_at FROM dag_commits WHERE round >= ? ORDER BY round ASC",
@@ -4704,6 +4716,13 @@ export class PersistiaWorldV4 implements DurableObject {
     // Get strong parents: vertices from previous round
     const refs = this.getStrongParents();
 
+    // Schnorr-sign block message for ZK proving (Schnorr on Grumpkin curve)
+    const blockMsg = new TextEncoder().encode(`block:${this.currentRound}`);
+    const blockMsgHash = new Uint8Array(
+      await crypto.subtle.digest("SHA-256", blockMsg),
+    );
+    const schnorrSig = signDataSchnorr(this.nodeIdentity, blockMsgHash);
+
     const vertex: DAGVertex = {
       author: this.nodeIdentity.pubkey,
       round: this.currentRound,
@@ -4712,6 +4731,7 @@ export class PersistiaWorldV4 implements DurableObject {
       refs,
       timestamp: Date.now(),
       signature: "",
+      schnorr_sig: schnorrSig,
     };
 
     vertex.signature = await signVertex(this.nodeIdentity, vertex);
@@ -4909,7 +4929,7 @@ export class PersistiaWorldV4 implements DurableObject {
     const sql = this.state.storage.sql;
 
     sql.exec(
-      "INSERT OR IGNORE INTO dag_vertices (hash, author, round, events_json, refs_json, signature, received_at, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      "INSERT OR IGNORE INTO dag_vertices (hash, author, round, events_json, refs_json, signature, received_at, timestamp, schnorr_sig) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
       hash,
       vertex.author,
       vertex.round,
@@ -4918,6 +4938,7 @@ export class PersistiaWorldV4 implements DurableObject {
       vertex.signature,
       Date.now(),
       vertex.timestamp,
+      vertex.schnorr_sig ? JSON.stringify(vertex.schnorr_sig) : null,
     );
 
     // dag_edges removed — topologicalSort uses in-memory refs_json
@@ -5065,7 +5086,7 @@ export class PersistiaWorldV4 implements DurableObject {
 
     // Collect vertex signatures + data for this round (persisted for ZK prover after pruning)
     const roundVertices = [...sql.exec(
-      "SELECT hash, author, signature, round, events_json, refs_json, timestamp FROM dag_vertices WHERE round = ?", round
+      "SELECT hash, author, signature, round, events_json, refs_json, timestamp, schnorr_sig FROM dag_vertices WHERE round = ?", round
     )] as any[];
     // Build canonical block message for Schnorr signing
     const blockMsg = new TextEncoder().encode(`block:${round}`);
@@ -5109,13 +5130,26 @@ export class PersistiaWorldV4 implements DurableObject {
         timestamp: v.timestamp || 0,
       };
 
-      if (v.author === this.nodeIdentity?.pubkey && this.nodeIdentity) {
+      // Use Schnorr signature stored in the vertex (created by each node at vertex creation time)
+      if (v.schnorr_sig) {
+        try {
+          const stored = typeof v.schnorr_sig === "string" ? JSON.parse(v.schnorr_sig) : v.schnorr_sig;
+          entry.schnorr_s = stored.schnorr_s;
+          entry.schnorr_e = stored.schnorr_e;
+          entry.grumpkin_x = stored.grumpkin_x;
+          entry.grumpkin_y = stored.grumpkin_y;
+        } catch {}
+      }
+      // Fallback: sign with own key if this is our vertex and no stored sig
+      if (!entry.schnorr_s && v.author === this.nodeIdentity?.pubkey && this.nodeIdentity) {
         const schnorr = signDataSchnorr(this.nodeIdentity, blockMsgHash);
         entry.schnorr_s = schnorr.schnorr_s;
         entry.schnorr_e = schnorr.schnorr_e;
         entry.grumpkin_x = schnorr.grumpkin_x;
         entry.grumpkin_y = schnorr.grumpkin_y;
-      } else {
+      }
+      // Fallback: attach Grumpkin public key from active_nodes (for old vertices without schnorr_sig)
+      if (!entry.grumpkin_x) {
         const cached = grumpkinCache.get(v.author);
         if (cached) {
           entry.grumpkin_x = cached.x;
@@ -5409,6 +5443,7 @@ export class PersistiaWorldV4 implements DurableObject {
             refs: JSON.parse(v.refs_json),
             timestamp: 0,
             signature: v.signature,
+            schnorr_sig: v.schnorr_sig ? (typeof v.schnorr_sig === "string" ? JSON.parse(v.schnorr_sig) : v.schnorr_sig) : undefined,
           };
           await this.receiveVertex(vertex, true); // skip consensus during bulk sync
         }

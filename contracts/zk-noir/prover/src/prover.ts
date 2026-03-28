@@ -1,263 +1,95 @@
 #!/usr/bin/env tsx
-// Persistia Noir Prover -- Host-side proof generation and verification.
+// Persistia Noir Prover — powered by the zkMetal SDK.
 //
-// Drop-in replacement for the SP1 prover (contracts/zk/prover/).
-// Uses @noir-lang/noir_js + Barretenberg UltraHonk backend.
+// Thin CLI wrapper around zkmetal's ProverEngine, Persistia adapter, and watch loops.
+// Persistia-specific features (SnarkFold aggregation, incremental SMT) are kept local.
 //
 // Usage:
 //   tsx prover.ts prove   --node http://localhost:8787 --block 5
-//   tsx prover.ts execute --node http://localhost:8787 --block 5
-//   tsx prover.ts verify  --proof proof.bin
 //   tsx prover.ts watch   --node http://localhost:8787
-//   tsx prover.ts bench   --block 5
+//   tsx prover.ts watch-incremental --node http://localhost:8787
+//   tsx prover.ts aggregate --block-start 1 --block-end 10
 
-import { Noir } from "@noir-lang/noir_js";
-import { Barretenberg, UltraHonkBackend } from "@aztec/bb.js";
+import { resolve, join } from "path";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from "fs";
-import { join, resolve } from "path";
-import { exec, execSync, spawn, fork, type ChildProcess } from "child_process";
-import { gunzipSync } from "zlib";
-import { Encoder, Decoder } from "msgpackr";
-import { buildSingleBlockWitness, buildTestWitness, destroyBb, buildMutationWitness, buildIncrementalMutationWitness, emptyMutation, computePoseidon2MerkleRoot, buildIncrementalWitness, type CircuitWitness } from "./witness.js";
+import { execSync } from "child_process";
+
+// zkMetal SDK imports
+import {
+  ProverEngine,
+  extractInnerProof,
+  proofToFields,
+  setMaxMutations,
+  watchSequential,
+  watchPipelined,
+  watchParallelMsgpack,
+} from "zkmetal";
+import type { VerifierTarget, ProofOutput, WatchOptions } from "zkmetal";
+import {
+  createPersistiaAdapter,
+  PersistiaDataSource,
+  PersistiaProofSink,
+} from "zkmetal/adapters/persistia";
+
+// Local imports for incremental proving (not in zkMetal SDK)
+import { buildIncrementalMutationWitness, buildIncrementalWitness } from "./witness.js";
 import { SparseMerkleTree } from "./sparse-merkle-tree.js";
 
-// --- Proof Field Conversion ---
-// UltraHonk proofs are serialized as concatenated 32-byte big-endian field elements.
-// The first 51 fields are overhead (pairing points etc), the remaining 449 are the
-// "inner proof" needed for recursive verification inside the circuit.
-
-const PROOF_OVERHEAD_FIELDS = 51;
-
-function proofToFields(proofBytes: Uint8Array): string[] {
-  const fields: string[] = [];
-  for (let i = 0; i < proofBytes.length; i += 32) {
-    const chunk = proofBytes.slice(i, i + 32);
-    const hex = "0x" + Array.from(chunk).map(b => b.toString(16).padStart(2, "0")).join("");
-    fields.push(hex);
-  }
-  return fields;
-}
-
-// --- Circuit Loading ---
+// --- Persistia circuit configuration ---
+// Persistia's circuit uses 512 mutations (zkMetal defaults to 1024).
+setMaxMutations(512);
 
 const CIRCUIT_PATH = resolve(import.meta.dirname ?? ".", "../../target/persistia_state_proof.json");
 const INCREMENTAL_CIRCUIT_PATH = resolve(import.meta.dirname ?? ".", "../../target/persistia_incremental_proof.json");
-
-function loadCircuit() {
-  if (!existsSync(CIRCUIT_PATH)) {
-    console.error(`Circuit not found at ${CIRCUIT_PATH}`);
-    console.error("Run 'nargo compile' in contracts/zk-noir/ first.");
-    process.exit(1);
-  }
-  return JSON.parse(readFileSync(CIRCUIT_PATH, "utf-8"));
-}
-
-async function createProver() {
-  const circuit = loadCircuit();
-  const api = await Barretenberg.new({ threads: 8 });
-  const backend = new UltraHonkBackend(circuit.bytecode, api);
-  const noir = new Noir(circuit);
-  return { backend, noir, circuit, api };
-}
-
-// --- Native bb CLI ---
-
-const BB_PATH = join(process.env.HOME ?? "~", ".bb", "bb");
-
-function nativeBbAvailable(): boolean {
-  try {
-    execSync(`${BB_PATH} --version`, { stdio: "pipe" });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-// Precomputed VK caches — bb write_vk outputs to a directory containing vk + vk_hash.
-// We cache both noir-recursive and evm VKs alongside the circuit artifact.
-type VerifierTarget = "noir-recursive-no-zk" | "evm-no-zk";
-
-const VK_CACHE_DIRS: Record<VerifierTarget, string> = {
-  "noir-recursive-no-zk": resolve(import.meta.dirname ?? ".", "../../target/bb_vk"),
-  "evm-no-zk": resolve(import.meta.dirname ?? ".", "../../target/bb_vk_evm"),
-};
-
-function ensureVkCached(target: VerifierTarget = "noir-recursive-no-zk"): string | null {
-  const cacheDir = VK_CACHE_DIRS[target];
-  const cacheFile = join(cacheDir, "vk");
-  if (existsSync(cacheFile)) return cacheFile;
-  try {
-    mkdirSync(cacheDir, { recursive: true });
-    execSync(
-      `${BB_PATH} write_vk -b ${CIRCUIT_PATH} -o ${cacheDir} -t ${target}`,
-      { stdio: "pipe" },
-    );
-    if (existsSync(cacheFile)) return cacheFile;
-  } catch {}
-  return null;
-}
-
-function nativeBbProve(
-  witnessBytes: Uint8Array,
-  target: VerifierTarget = "noir-recursive-no-zk",
-): { proof: Uint8Array; publicInputs: string[] } {
-  const tmpDir = "/tmp/persistia_bb_prove";
-  rmSync(tmpDir, { recursive: true, force: true });
-
-  // Use precomputed VK if available (saves ~700ms per prove)
-  const vkPath = ensureVkCached(target);
-  const vkFlag = vkPath ? ` -k ${vkPath}` : " --write_vk";
-
-  writeFileSync("/tmp/persistia_bb_witness.gz", witnessBytes);
-  execSync(
-    `${BB_PATH} prove -b ${CIRCUIT_PATH} -w /tmp/persistia_bb_witness.gz -o ${tmpDir}${vkFlag} -t ${target}`,
-    { stdio: "pipe" },
-  );
-
-  const proof = readFileSync(join(tmpDir, "proof"));
-  const piRaw = readFileSync(join(tmpDir, "public_inputs"));
-
-  // Public inputs are concatenated 32-byte fields
-  const publicInputs: string[] = [];
-  for (let i = 0; i < piRaw.length; i += 32) {
-    const hex = "0x" + Array.from(piRaw.subarray(i, i + 32)).map(b => b.toString(16).padStart(2, "0")).join("");
-    publicInputs.push(hex);
-  }
-
-  return { proof: new Uint8Array(proof), publicInputs };
-}
-
-function nativeBbVerify(proof: Uint8Array, publicInputs: string[], vk: Uint8Array): boolean {
-  const tmpDir = "/tmp/persistia_bb_verify";
-  rmSync(tmpDir, { recursive: true, force: true });
-  mkdirSync(tmpDir, { recursive: true });
-
-  writeFileSync(join(tmpDir, "proof"), proof);
-  writeFileSync(join(tmpDir, "vk"), vk);
-
-  // Write public inputs as concatenated 32-byte fields
-  const piBytes = Buffer.alloc(publicInputs.length * 32);
-  for (let i = 0; i < publicInputs.length; i++) {
-    const val = BigInt(publicInputs[i]);
-    const hex = val.toString(16).padStart(64, "0");
-    for (let j = 0; j < 32; j++) {
-      piBytes[i * 32 + j] = parseInt(hex.substring(j * 2, j * 2 + 2), 16);
-    }
-  }
-  writeFileSync(join(tmpDir, "public_inputs"), piBytes);
-
-  try {
-    execSync(
-      `${BB_PATH} verify -p ${tmpDir}/proof -k ${tmpDir}/vk -i ${tmpDir}/public_inputs -t noir-recursive-no-zk`,
-      { stdio: "pipe" },
-    );
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-// --- Node API ---
-
-// Global shard parameter — set from CLI --shard flag.
-let _globalShard: string | null = null;
-
-function nodeUrl(base: string, path: string): string {
-  try {
-    const u = new URL(base);
-    // Split path from its query string so pathname doesn't encode the '?'
-    const [pathname, query] = path.split("?", 2);
-    u.pathname = u.pathname.replace(/\/$/, "") + pathname;
-    if (query) {
-      for (const param of query.split("&")) {
-        const [k, v] = param.split("=", 2);
-        u.searchParams.set(k, v ?? "");
-      }
-    }
-    if (_globalShard) u.searchParams.set("shard", _globalShard);
-    return u.toString();
-  } catch {
-    return `${base}${path}`;
-  }
-}
-
-async function fetchBlock(nodeBase: string, blockNumber: number) {
-  const url = nodeUrl(nodeBase, `/proof/block?block=${blockNumber}`);
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Failed to fetch block ${blockNumber}: ${res.status}`);
-  return res.json();
-}
-
-async function fetchLatestBlock(nodeBase: string): Promise<number> {
-  const url = nodeUrl(nodeBase, "/proof/zk/status");
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Failed to fetch ZK status: ${res.status}`);
-  const data = await res.json() as any;
-  return data.last_committed_round ?? data.latest_block ?? data.latestBlock ?? 0;
-}
-
-async function fetchNextCommitted(nodeBase: string, afterBlock: number): Promise<number | null> {
-  const url = nodeUrl(nodeBase, `/dag/next_committed?after=${afterBlock}`);
-  const res = await fetch(url);
-  if (!res.ok) return null;
-  const data = await res.json() as any;
-  return data.round ?? null;
-}
-
-async function submitProof(nodeBase: string, proofData: any) {
-  const url = nodeUrl(nodeBase, "/proof/zk/submit");
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(proofData),
-  });
-  if (!res.ok) throw new Error(`Failed to submit proof: ${res.status}`);
-  return res.json();
-}
-
-// --- State Root Computation ---
-// The Noir circuit's state_root is a Poseidon2 Merkle root of the block's mutations.
-// prev_state_root for block N = new_state_root of block N-1.
-// For block 1, prev_state_root is a genesis value ("0").
-
 const GENESIS_STATE_ROOT = "0";
 
-async function computeBlockStateRoot(block: any): Promise<string> {
-  if (!block.mutations || block.mutations.length === 0) {
-    return GENESIS_STATE_ROOT;
-  }
-  const muts = block.mutations.map(buildMutationWitness);
-  while (muts.length < 32) muts.push(emptyMutation());
-  return computePoseidon2MerkleRoot(muts.slice(0, 32));
+// --- CLI helpers ---
+
+const args = process.argv.slice(2);
+const command = args[0];
+
+function getArg(name: string, defaultVal?: string): string {
+  const idx = args.indexOf(`--${name}`);
+  if (idx >= 0 && idx + 1 < args.length) return args[idx + 1];
+  if (defaultVal !== undefined) return defaultVal;
+  throw new Error(`Missing required argument: --${name}`);
 }
 
-async function fetchPrevStateRoot(nodeBase: string, blockNumber: number): Promise<string> {
-  if (blockNumber <= 1) return GENESIS_STATE_ROOT;
-  try {
-    const prevBlock = await fetchBlock(nodeBase, blockNumber - 1);
-    return computeBlockStateRoot(prevBlock);
-  } catch {
-    // Previous block not available — use genesis
-    return GENESIS_STATE_ROOT;
-  }
+const useNative = args.includes("--native");
+const verifierTarget: VerifierTarget = args.includes("--evm") ? "evm-no-zk" : "noir-recursive-no-zk";
+
+// Inject shard parameter into the node URL if provided
+function withShard(nodeBase: string): string {
+  if (!args.includes("--shard")) return nodeBase;
+  const shard = getArg("shard");
+  const u = new URL(nodeBase);
+  u.searchParams.set("shard", shard);
+  return u.toString();
 }
 
-// --- Commands ---
+// --- Engine + Adapter factory ---
+
+function createEngine(circuitPath = CIRCUIT_PATH): ProverEngine {
+  return new ProverEngine({
+    circuitPath,
+    threads: 8,
+    vkCacheDir: resolve(circuitPath, "../../target/bb_vk"),
+  });
+}
+
+// --- Standard commands (delegated to zkMetal SDK) ---
 
 async function cmdExecute(nodeBase: string, blockNumber: number) {
   console.log(`Executing circuit for block ${blockNumber} (no proof)...`);
-  const { noir } = await createProver();
-
-  const block = await fetchBlock(nodeBase, blockNumber);
-  const prevStateRoot = await fetchPrevStateRoot(nodeBase, blockNumber);
-  const witness = await buildSingleBlockWitness(block, prevStateRoot);
-
+  const engine = createEngine();
+  const { witnessBuilder, dataSource } = createPersistiaAdapter(nodeBase);
+  const block = await dataSource.fetchBlock(blockNumber);
+  const witness = await witnessBuilder.buildWitness(block, blockNumber);
   const start = performance.now();
-  const result = await noir.execute(witness as any);
+  const { returnValue } = await engine.execute(witness);
   const elapsed = ((performance.now() - start) / 1000).toFixed(2);
-
-  console.log(`Execution OK in ${elapsed}s`);
-  console.log("Public output:", result.returnValue);
+  console.log(`Execute OK (${elapsed}s). Return value:`, returnValue);
+  await engine.destroy();
 }
 
 async function cmdProve(
@@ -265,795 +97,182 @@ async function cmdProve(
   blockNumber: number,
   outputPath: string,
   prevProofPath?: string,
-  useNative = false,
-  target: VerifierTarget = "noir-recursive-no-zk",
 ) {
-  console.log(`Generating proof for block ${blockNumber}...`);
-  const { noir, backend } = await createProver();
+  console.log(`Proving block ${blockNumber}...`);
+  const engine = createEngine();
+  const { dataSource, witnessBuilder, proofSink } = createPersistiaAdapter(nodeBase);
 
-  const block = await fetchBlock(nodeBase, blockNumber);
+  const block = await dataSource.fetchBlock(blockNumber);
 
-  let opts: any = {};
+  // Build recursive inputs from previous proof if chaining
+  let recursiveOpts: any;
   if (prevProofPath && existsSync(prevProofPath)) {
-    const prevProofData = JSON.parse(readFileSync(prevProofPath, "utf-8"));
+    const prevData = JSON.parse(readFileSync(prevProofPath, "utf-8"));
+    const prevProofBytes = Buffer.from(prevData.proof, "base64");
+    const innerProof = extractInnerProof(new Uint8Array(prevProofBytes));
 
-    // Extract inner proof fields (skip 51-field overhead)
-    const prevProofBytes = Buffer.from(prevProofData.proof, "base64");
-    const allProofFields = proofToFields(new Uint8Array(prevProofBytes));
-    const innerProof = allProofFields.slice(PROOF_OVERHEAD_FIELDS);
-
-    // Use pre-stored VK fields if available, otherwise extract them
-    let vkAsFields: string[];
-    let vkHash: string;
-    if (prevProofData.vkAsFields && prevProofData.vkHash) {
-      vkAsFields = prevProofData.vkAsFields;
-      vkHash = prevProofData.vkHash;
-    } else {
-      const artifacts = await backend.generateRecursiveProofArtifacts(
-        { proof: prevProofBytes, publicInputs: prevProofData.publicInputs },
-        prevProofData.publicInputs.length,
-      );
+    let vkAsFields = prevData.vkAsFields;
+    let vkHash = prevData.vkHash;
+    if (!vkAsFields || !vkHash) {
+      const artifacts = await engine.generateRecursiveArtifacts({
+        proof: prevProofBytes,
+        publicInputs: prevData.publicInputs,
+      });
       vkAsFields = artifacts.vkAsFields;
       vkHash = artifacts.vkHash;
     }
 
-    opts = {
-      prevProvenBlocks: prevProofData.proven_blocks,
-      prevGenesisRoot: prevProofData.genesis_root,
+    recursiveOpts = {
+      prevProvenBlocks: prevData.provenBlocks ?? prevData.proven_blocks ?? 1,
+      prevGenesisRoot: prevData.genesis_root ?? prevData.meta?.genesis_root ?? GENESIS_STATE_ROOT,
       prevProof: innerProof,
       prevVk: vkAsFields,
       prevKeyHash: vkHash,
-      prevPublicInputs: prevProofData.publicInputs,
+      prevPublicInputs: prevData.publicInputs,
     };
-    console.log(`Previous proof loaded (${prevProofData.proven_blocks} blocks). Recursive chaining enabled.`);
   }
 
-  const prevStateRoot = await fetchPrevStateRoot(nodeBase, blockNumber);
-  const witness = await buildSingleBlockWitness(block, prevStateRoot, opts);
+  const witness = await witnessBuilder.buildWitness(block, blockNumber, recursiveOpts);
 
   const start = performance.now();
-  const { witness: solvedWitness } = await noir.execute(witness as any);
+  const { witness: solvedWitness } = await engine.execute(witness);
 
-  let proof: { proof: Uint8Array; publicInputs: string[] };
-  let vkBytes: Uint8Array | undefined;
-
-  if (useNative && nativeBbAvailable()) {
-    console.log(`Using native bb CLI for proving (${target})...`);
-    proof = nativeBbProve(solvedWitness, target);
-    const vkCachePath = ensureVkCached(target);
-    if (vkCachePath) vkBytes = readFileSync(vkCachePath);
+  let proof: { proof: Uint8Array; publicInputs: string[]; vk?: Uint8Array };
+  if (useNative && engine.nativeBbAvailable()) {
+    proof = engine.nativeProve(solvedWitness, verifierTarget);
   } else {
-    if (useNative) console.warn("Native bb not available, falling back to WASM");
-    proof = await backend.generateProof(solvedWitness);
+    proof = await engine.prove(solvedWitness);
   }
+
+  const artifacts = await engine.generateRecursiveArtifacts({
+    proof: proof.proof,
+    publicInputs: proof.publicInputs,
+  });
 
   const elapsed = ((performance.now() - start) / 1000).toFixed(2);
 
-  // Extract recursive artifacts for this proof so the next block can chain
-  const artifacts = await backend.generateRecursiveProofArtifacts(
-    proof,
-    proof.publicInputs.length,
-  );
+  const stateRoot = (witness as any).new_state_root ?? GENESIS_STATE_ROOT;
+  const genesisRoot = recursiveOpts?.prevGenesisRoot ?? GENESIS_STATE_ROOT;
 
-  const proofData: any = {
+  const proofOutput: ProofOutput = {
     proof: Buffer.from(proof.proof).toString("base64"),
     publicInputs: proof.publicInputs,
-    // Store VK fields and hash directly for the next proof in the chain
     vkAsFields: artifacts.vkAsFields,
     vkHash: artifacts.vkHash,
-    block_number: blockNumber,
-    proven_blocks: prevProofPath ? (opts.prevProvenBlocks + 1) : 1,
-    genesis_root: opts.prevGenesisRoot ?? prevStateRoot,
-    state_root: witness.new_state_root,
-    prover: useNative ? "noir-ultrahonk-native" : "noir-ultrahonk",
+    vk: proof.vk ? Buffer.from(proof.vk).toString("base64") : undefined,
+    blockNumber,
+    provenBlocks: recursiveOpts ? recursiveOpts.prevProvenBlocks + 1 : 1,
+    prover: useNative ? "zkmetal-native" : "zkmetal-wasm",
     timestamp: new Date().toISOString(),
+    meta: {
+      genesis_root: genesisRoot,
+      state_root: stateRoot,
+    },
   };
-
-  if (vkBytes) {
-    proofData.vk = Buffer.from(vkBytes).toString("base64");
-  }
 
   const dir = resolve(outputPath, "..");
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  writeFileSync(outputPath, JSON.stringify(proofData, null, 2));
+  // Write with flat fields for file readability + ProofOutput structure for SDK compatibility
+  writeFileSync(outputPath, JSON.stringify({
+    ...proofOutput,
+    block_number: blockNumber,
+    proven_blocks: proofOutput.provenBlocks,
+    genesis_root: genesisRoot,
+    state_root: stateRoot,
+  }, null, 2));
+  console.log(`Proof written to ${outputPath} (${elapsed}s)`);
 
-  console.log(`Proof generated in ${elapsed}s -> ${outputPath}`);
-  console.log(`  State root: ${witness.new_state_root}`);
-  console.log(`  Proven blocks: ${proofData.proven_blocks}`);
-  console.log(`  Proof size: ${proof.proof.length} bytes`);
-  console.log(`  Recursive: ${prevProofPath ? "yes (chained)" : "no (genesis)"}`);
+  try {
+    await proofSink.submitProof(proofOutput as any);
+    console.log("Proof submitted to node.");
+  } catch (e: any) {
+    console.warn(`Could not submit: ${e.message}`);
+  }
 
-  if (typeof backend.destroy === "function") await backend.destroy();
+  await engine.destroy();
 }
 
-async function cmdVerify(proofPath: string, useNative = false) {
-  console.log(`Verifying proof from ${proofPath}...`);
+async function cmdVerify(proofPath: string) {
+  const data = JSON.parse(readFileSync(proofPath, "utf-8"));
+  const proofBytes = new Uint8Array(Buffer.from(data.proof, "base64"));
+  const engine = createEngine();
 
-  const proofData = JSON.parse(readFileSync(proofPath, "utf-8"));
-  const proofBytes = Buffer.from(proofData.proof, "base64");
+  console.log(`Verifying ${proofPath}...`);
+  const start = performance.now();
 
-  let valid: boolean;
-  let elapsed: string;
-
-  if (useNative && proofData.vk && nativeBbAvailable()) {
-    console.log("Using native bb CLI for verification...");
-    const vkBytes = Buffer.from(proofData.vk, "base64");
-    const start = performance.now();
-    valid = nativeBbVerify(new Uint8Array(proofBytes), proofData.publicInputs, new Uint8Array(vkBytes));
-    elapsed = ((performance.now() - start) / 1000).toFixed(2);
+  let ok: boolean;
+  if (useNative && engine.nativeBbAvailable() && data.vk) {
+    const vkBytes = new Uint8Array(Buffer.from(data.vk, "base64"));
+    ok = engine.nativeVerify(proofBytes, data.publicInputs, vkBytes);
   } else {
-    if (useNative && !proofData.vk) console.warn("No VK in proof file, falling back to WASM");
-    const { backend } = await createProver();
-    const start = performance.now();
-    valid = await backend.verifyProof({ proof: proofBytes, publicInputs: proofData.publicInputs });
-    elapsed = ((performance.now() - start) / 1000).toFixed(2);
-    if (typeof backend.destroy === "function") await backend.destroy();
+    ok = await engine.verify({ proof: proofBytes, publicInputs: data.publicInputs });
   }
 
-  if (valid) {
-    console.log(`Proof VALID (verified in ${elapsed}s)`);
-    console.log(`  Block: ${proofData.block_number}`);
-    console.log(`  State root: ${proofData.state_root}`);
-    console.log(`  Proven blocks: ${proofData.proven_blocks}`);
-    console.log(`  Genesis root: ${proofData.genesis_root}`);
-  } else {
-    console.error("Proof INVALID");
-    process.exit(1);
-  }
-}
-
-async function cmdWatch(
-  nodeBase: string,
-  proofDir: string,
-  intervalSec: number,
-  useNative = false,
-  startBlock?: number,
-) {
-  if (!existsSync(proofDir)) mkdirSync(proofDir, { recursive: true });
-
-  // Default: start from current committed round (skip historical blocks without mutations)
-  let lastProvenBlock = startBlock ?? (await fetchLatestBlock(nodeBase));
-  console.log(`Watching ${nodeBase} (interval=${intervalSec}s, starting after block ${lastProvenBlock})`);
-  let prevProofPath: string | undefined;
-
-  while (true) {
-    try {
-      const latestBlock = await fetchLatestBlock(nodeBase);
-
-      // Catch up to latest committed block (sparse-aware via next_committed)
-      while (latestBlock > lastProvenBlock) {
-        const blockNum = await fetchNextCommitted(nodeBase, lastProvenBlock);
-        if (blockNum === null || blockNum > latestBlock) break;
-
-        const outPath = join(proofDir, `block_${blockNum}.json`);
-        try {
-          // Note: recursive chaining disabled (ENABLE_RECURSIVE=false in circuit)
-          await cmdProve(nodeBase, blockNum, outPath, undefined, useNative);
-          prevProofPath = outPath;
-
-          // Submit to node
-          try {
-            const proofData = JSON.parse(readFileSync(outPath, "utf-8"));
-            await submitProof(nodeBase, proofData);
-            console.log("Proof submitted to node");
-          } catch (e: any) {
-            console.warn(`Submit failed (non-fatal): ${e.message}`);
-          }
-        } catch (e: any) {
-          // Skip blocks that don't exist (pre-deploy blocks without mutations)
-          console.log(`Block ${blockNum} skipped: ${e.message?.substring(0, 120)}`);
-        }
-        lastProvenBlock = blockNum;
-      }
-    } catch (e: any) {
-      console.error(`Error: ${e.message}`);
-    }
-
-    await new Promise((r) => setTimeout(r, intervalSec * 1000));
-  }
+  const elapsed = ((performance.now() - start) / 1000).toFixed(2);
+  console.log(ok ? `VALID (${elapsed}s)` : `INVALID (${elapsed}s)`);
+  await engine.destroy();
+  if (!ok) process.exit(1);
 }
 
 async function cmdBench(nodeBase: string, blockNumber: number) {
-  console.log("=== Noir Circuit Benchmark ===\n");
-  const { noir, backend } = await createProver();
+  const engine = createEngine();
+  const { dataSource, witnessBuilder } = createPersistiaAdapter(nodeBase);
+  const block = await dataSource.fetchBlock(blockNumber);
+  const witness = await witnessBuilder.buildWitness(block, blockNumber);
 
-  const block = await fetchBlock(nodeBase, blockNumber);
-  const prevStateRoot = await fetchPrevStateRoot(nodeBase, blockNumber);
-  const witness = await buildSingleBlockWitness(block, prevStateRoot);
+  console.log(`Benchmarking block ${blockNumber}...`);
 
-  // Warmup
-  console.log("Warming up...");
-  await noir.execute(witness as any);
+  const t0 = performance.now();
+  const { witness: solvedWitness } = await engine.execute(witness);
+  const tExec = performance.now();
 
-  // Benchmark execute (witness solving)
-  console.log("\n--- Execute (witness solving) ---");
-  const execTimes: number[] = [];
-  for (let i = 0; i < 3; i++) {
-    const start = performance.now();
-    await noir.execute(witness as any);
-    execTimes.push(performance.now() - start);
+  const proof = await engine.prove(solvedWitness);
+  const tProve = performance.now();
+
+  const ok = await engine.verify(proof);
+  const tVerify = performance.now();
+
+  console.log(`Execute: ${((tExec - t0) / 1000).toFixed(2)}s`);
+  console.log(`Prove:   ${((tProve - tExec) / 1000).toFixed(2)}s`);
+  console.log(`Verify:  ${((tVerify - tProve) / 1000).toFixed(2)}s`);
+  console.log(`Total:   ${((tVerify - t0) / 1000).toFixed(2)}s`);
+  console.log(`Valid:   ${ok}`);
+
+  if (useNative && engine.nativeBbAvailable()) {
+    const { witness: sw2 } = await engine.execute(witness);
+    const tN0 = performance.now();
+    engine.nativeProve(sw2, verifierTarget);
+    const tN1 = performance.now();
+    console.log(`Native:  ${((tN1 - tN0) / 1000).toFixed(2)}s`);
   }
-  const avgExec = execTimes.reduce((a, b) => a + b) / execTimes.length;
-  console.log(`  Avg: ${(avgExec / 1000).toFixed(3)}s`);
 
-  // Benchmark proof generation
-  console.log("\n--- Prove (full proof generation) ---");
-  const start = performance.now();
-  const { witness: solved } = await noir.execute(witness as any);
-  const proof = await backend.generateProof(solved);
-  const proveTime = performance.now() - start;
-  console.log(`  Time: ${(proveTime / 1000).toFixed(3)}s`);
-  console.log(`  Proof size: ${proof.proof.length} bytes`);
-
-  // Benchmark verification
-  console.log("\n--- Verify ---");
-  const verifyStart = performance.now();
-  const valid = await backend.verifyProof(proof);
-  const verifyTime = performance.now() - verifyStart;
-  console.log(`  Time: ${(verifyTime / 1000).toFixed(3)}s`);
-  console.log(`  Valid: ${valid}`);
-
-  console.log("\n=== Summary ===");
-  console.log(`  Execute:  ${(avgExec / 1000).toFixed(3)}s`);
-  console.log(`  Prove:    ${(proveTime / 1000).toFixed(3)}s`);
-  console.log(`  Verify:   ${(verifyTime / 1000).toFixed(3)}s`);
-  console.log(`  Proof:    ${proof.proof.length} bytes`);
-  console.log(`  Speedup vs SP1 (~70s): ~${(70000 / proveTime).toFixed(1)}x`);
-
-  if (typeof backend.destroy === "function") await backend.destroy();
+  await engine.destroy();
 }
 
-// --- Parallel Prover ---
-// When catching up, proves multiple blocks concurrently using separate bb processes.
-// Each block gets its own worker with limited threads to avoid CPU contention.
+// --- Watch commands (delegated to zkMetal SDK watch loops) ---
 
-async function cmdWatchParallel(
-  nodeBase: string,
-  proofDir: string,
-  intervalSec: number,
-  workers: number,
-) {
-  // Optimal: 2 threads per worker gives best throughput (803 blocks/min at 6 workers)
-  // More threads per worker has diminishing returns above 6 threads.
-  const threadsPerWorker = Math.max(2, Math.floor(12 / workers));
-  console.log(`Parallel prover: ${workers} workers, ${threadsPerWorker} threads each`);
-  console.log(`Watching ${nodeBase} (interval=${intervalSec}s)\n`);
-  if (!existsSync(proofDir)) mkdirSync(proofDir, { recursive: true });
-
-  let lastProvenBlock = 0;
-
-  // Check what's already proven
-  try {
-    const statusRes = await fetch(nodeUrl(nodeBase, "/proof/zk/latest"));
-    if (statusRes.ok) {
-      const status = await statusRes.json() as any;
-      lastProvenBlock = status.block_number ?? 0;
-      console.log(`Resuming from block ${lastProvenBlock}`);
-    }
-  } catch {}
-
-  while (true) {
-    try {
-      const latestBlock = await fetchLatestBlock(nodeBase);
-      const gap = latestBlock - lastProvenBlock;
-
-      if (gap <= 0) {
-        await new Promise((r) => setTimeout(r, intervalSec * 1000));
-        continue;
-      }
-
-      // Determine how many blocks to prove in parallel
-      const batchSize = Math.min(gap, workers);
-      const blockNumbers = Array.from(
-        { length: batchSize },
-        (_, i) => lastProvenBlock + 1 + i,
-      );
-
-      console.log(`\n--- Proving blocks ${blockNumbers.join(", ")} in parallel (gap=${gap}) ---`);
-      const batchStart = performance.now();
-
-      // Spawn parallel prove processes
-      const results = await Promise.allSettled(
-        blockNumbers.map(async (blockNum) => {
-          const outPath = join(proofDir, `block_${blockNum}.json`);
-          await proveBlockNative(nodeBase, blockNum, outPath, threadsPerWorker);
-          return { blockNum, outPath };
-        }),
-      );
-
-      const batchElapsed = ((performance.now() - batchStart) / 1000).toFixed(2);
-      let proved = 0;
-
-      for (const result of results) {
-        if (result.status === "fulfilled") {
-          const { blockNum, outPath } = result.value;
-          proved++;
-          // Submit to node
-          try {
-            const proofData = JSON.parse(readFileSync(outPath, "utf-8"));
-            await submitProof(nodeBase, proofData);
-            console.log(`  Block ${blockNum}: submitted`);
-          } catch (e: any) {
-            console.warn(`  Block ${blockNum}: submit failed (${e.message})`);
-          }
-        } else {
-          console.error(`  Block prove failed: ${result.reason}`);
-        }
-      }
-
-      lastProvenBlock += proved;
-      const throughput = (proved / parseFloat(batchElapsed) * 60).toFixed(1);
-      console.log(`Batch done: ${proved}/${batchSize} blocks in ${batchElapsed}s (${throughput} blocks/min)`);
-
-    } catch (e: any) {
-      console.error(`Error: ${e.message}`);
-    }
-
-    await new Promise((r) => setTimeout(r, intervalSec * 1000));
-  }
+async function cmdWatch(nodeBase: string, opts: WatchOptions) {
+  const engine = createEngine();
+  const { dataSource, witnessBuilder, proofSink } = createPersistiaAdapter(nodeBase);
+  console.log(`[Persistia] Starting sequential watch on ${nodeBase}`);
+  await watchSequential(engine, dataSource, witnessBuilder, proofSink, opts);
 }
 
-/** Prove a single block using native bb CLI with limited threads. */
-async function proveBlockNative(
-  nodeBase: string,
-  blockNumber: number,
-  outputPath: string,
-  threads: number,
-): Promise<void> {
-  const block = await fetchBlock(nodeBase, blockNumber);
-  const prevStateRoot = await fetchPrevStateRoot(nodeBase, blockNumber);
-  const circuit = loadCircuit();
-  const noir = new Noir(circuit);
-
-  const witness = await buildSingleBlockWitness(block, prevStateRoot);
-  const { witness: solvedWitness } = await noir.execute(witness as any);
-
-  // Write witness to a unique temp file
-  const witnessPath = `/tmp/persistia_bb_witness_${blockNumber}.gz`;
-  const outDir = `/tmp/persistia_bb_prove_${blockNumber}`;
-  writeFileSync(witnessPath, solvedWitness);
-  rmSync(outDir, { recursive: true, force: true });
-
-  // Use precomputed VK (saves ~700ms per prove)
-  const vkPath = ensureVkCached();
-  const vkFlag = vkPath ? ` -k ${vkPath}` : " --write_vk";
-
-  // Prove with limited threads via OMP_NUM_THREADS
-  execSync(
-    `${BB_PATH} prove -b ${CIRCUIT_PATH} -w ${witnessPath} -o ${outDir}${vkFlag} -t noir-recursive-no-zk`,
-    {
-      stdio: "pipe",
-      env: { ...process.env, OMP_NUM_THREADS: String(threads) },
-    },
-  );
-
-  const proof = readFileSync(join(outDir, "proof"));
-  const piRaw = readFileSync(join(outDir, "public_inputs"));
-  const vk = readFileSync(join(outDir, "vk"));
-
-  const publicInputs: string[] = [];
-  for (let i = 0; i < piRaw.length; i += 32) {
-    const hex = "0x" + Array.from(piRaw.subarray(i, i + 32)).map(b => b.toString(16).padStart(2, "0")).join("");
-    publicInputs.push(hex);
-  }
-
-  const proofData = {
-    proof: Buffer.from(proof).toString("base64"),
-    publicInputs,
-    vk: Buffer.from(vk).toString("base64"),
-    block_number: blockNumber,
-    proven_blocks: 1,
-    genesis_root: prevStateRoot,
-    state_root: witness.new_state_root,
-    prover: "noir-ultrahonk-native-parallel",
-    timestamp: new Date().toISOString(),
-  };
-
-  const dir = resolve(outputPath, "..");
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  writeFileSync(outputPath, JSON.stringify(proofData, null, 2));
-
-  // Cleanup temp files
-  rmSync(witnessPath, { force: true });
-  rmSync(outDir, { recursive: true, force: true });
+async function cmdWatchPipelined(nodeBase: string, opts: WatchOptions) {
+  const engine = createEngine();
+  const { dataSource, witnessBuilder, proofSink } = createPersistiaAdapter(nodeBase);
+  console.log(`[Persistia] Starting pipelined watch on ${nodeBase}`);
+  await watchPipelined(engine, dataSource, witnessBuilder, proofSink, opts);
 }
 
-// --- Pipelined Watch ---
-// Overlaps witness solving (JS, ~200ms) with native bb proving (~3.5s).
-// While bb proves block N, we fetch + solve witness for block N+1.
-
-async function cmdWatchPipelined(
-  nodeBase: string,
-  proofDir: string,
-  intervalSec: number,
-) {
-  if (!nativeBbAvailable()) {
-    console.error("Pipelined mode requires native bb CLI. Install with: bbup -v 4.1.2");
-    process.exit(1);
-  }
-
-  console.log(`Pipelined prover watching ${nodeBase} (interval=${intervalSec}s)`);
-  if (!existsSync(proofDir)) mkdirSync(proofDir, { recursive: true });
-
-  const circuit = loadCircuit();
-  const noir = new Noir(circuit);
-
-  // Ensure VK is cached before the loop (one-time ~700ms cost)
-  ensureVkCached();
-
-  let lastProvenBlock = 0;
-  let prevProofPath: string | undefined;
-
-  // Pre-solved witness for the next block (pipelining buffer)
-  let prefetchedWitness: { blockNum: number; solved: Uint8Array; block: any; prevStateRoot: string; stateRoot: string } | null = null;
-
-  while (true) {
-    try {
-      const latestBlock = await fetchLatestBlock(nodeBase);
-
-      if (latestBlock <= lastProvenBlock) {
-        // No new blocks — speculatively prefetch if we don't already have one
-        await new Promise((r) => setTimeout(r, intervalSec * 1000));
-        continue;
-      }
-
-      const blockNum = lastProvenBlock + 1;
-
-      // --- Phase 1: Get solved witness (from prefetch or solve now) ---
-      let solvedWitness: Uint8Array;
-      let block: any;
-      let blockPrevStateRoot: string;
-      let blockStateRoot: string;
-
-      if (prefetchedWitness && prefetchedWitness.blockNum === blockNum) {
-        solvedWitness = prefetchedWitness.solved;
-        block = prefetchedWitness.block;
-        blockPrevStateRoot = prefetchedWitness.prevStateRoot;
-        blockStateRoot = prefetchedWitness.stateRoot;
-        console.log(`  Block ${blockNum}: using prefetched witness`);
-        prefetchedWitness = null;
-      } else {
-        block = await fetchBlock(nodeBase, blockNum);
-        blockPrevStateRoot = await fetchPrevStateRoot(nodeBase, blockNum);
-        const witness = await buildSingleBlockWitness(block, blockPrevStateRoot);
-        blockStateRoot = witness.new_state_root;
-        const result = await noir.execute(witness as any);
-        solvedWitness = result.witness;
-      }
-
-      // --- Phase 2: Prove block N AND prefetch witness for block N+1 ---
-      const witnessPath = `/tmp/persistia_bb_witness_${blockNum}.gz`;
-      const outDir = `/tmp/persistia_bb_prove_${blockNum}`;
-      writeFileSync(witnessPath, solvedWitness);
-      rmSync(outDir, { recursive: true, force: true });
-
-      const vkPath = ensureVkCached();
-      const vkFlag = vkPath ? ` -k ${vkPath}` : " --write_vk";
-
-      const proveStart = performance.now();
-
-      // Start native proving as a child process (non-blocking)
-      const provePromise = new Promise<void>((resolve, reject) => {
-        exec(
-          `${BB_PATH} prove -b ${CIRCUIT_PATH} -w ${witnessPath} -o ${outDir}${vkFlag} -t noir-recursive-no-zk`,
-          { env: process.env },
-          (err) => { if (err) reject(err); else resolve(); },
-        );
-      });
-
-      // Simultaneously prefetch next block's witness if available
-      const nextBlockNum = blockNum + 1;
-      let prefetchPromise: Promise<void> = Promise.resolve();
-      if (nextBlockNum <= latestBlock) {
-        prefetchPromise = (async () => {
-          try {
-            const nextBlock = await fetchBlock(nodeBase, nextBlockNum);
-            const nextPrevSR = await fetchPrevStateRoot(nodeBase, nextBlockNum);
-            const nextWitness = await buildSingleBlockWitness(nextBlock, nextPrevSR);
-            const result = await noir.execute(nextWitness as any);
-            prefetchedWitness = { blockNum: nextBlockNum, solved: result.witness, block: nextBlock, prevStateRoot: nextPrevSR, stateRoot: nextWitness.new_state_root };
-            console.log(`  Block ${nextBlockNum}: witness prefetched`);
-          } catch (e: any) {
-            // Prefetch failure is non-fatal — we'll solve on demand
-            prefetchedWitness = null;
-          }
-        })();
-      }
-
-      // Wait for prove to complete (prefetch runs concurrently)
-      await Promise.all([provePromise, prefetchPromise]);
-      const proveElapsed = ((performance.now() - proveStart) / 1000).toFixed(2);
-
-      // Read and package proof
-      const proof = readFileSync(join(outDir, "proof"));
-      const piRaw = readFileSync(join(outDir, "public_inputs"));
-      const vk = existsSync(join(outDir, "vk")) ? readFileSync(join(outDir, "vk")) : null;
-
-      const publicInputs: string[] = [];
-      for (let i = 0; i < piRaw.length; i += 32) {
-        const hex = "0x" + Array.from(piRaw.subarray(i, i + 32)).map(b => b.toString(16).padStart(2, "0")).join("");
-        publicInputs.push(hex);
-      }
-
-      const outPath = join(proofDir, `block_${blockNum}.json`);
-      const proofData = {
-        proof: Buffer.from(proof).toString("base64"),
-        publicInputs,
-        vk: vk ? Buffer.from(vk).toString("base64") : undefined,
-        block_number: blockNum,
-        proven_blocks: 1,
-        genesis_root: blockPrevStateRoot,
-        state_root: blockStateRoot,
-        prover: "noir-ultrahonk-native-pipelined",
-        timestamp: new Date().toISOString(),
-      };
-
-      writeFileSync(outPath, JSON.stringify(proofData, null, 2));
-      lastProvenBlock = blockNum;
-      prevProofPath = outPath;
-
-      console.log(`Block ${blockNum}: proved in ${proveElapsed}s -> ${outPath}`);
-
-      // Submit to node
-      try {
-        await submitProof(nodeBase, proofData);
-        console.log("  Proof submitted to node");
-      } catch (e: any) {
-        console.warn(`  Submit failed (non-fatal): ${e.message}`);
-      }
-
-      // Cleanup temp files
-      rmSync(witnessPath, { force: true });
-      rmSync(outDir, { recursive: true, force: true });
-
-    } catch (e: any) {
-      console.error(`Error: ${e.message}`);
-      await new Promise((r) => setTimeout(r, intervalSec * 1000));
-    }
-  }
+async function cmdWatchParallel(nodeBase: string, opts: WatchOptions & { workers?: number }) {
+  const engine = createEngine();
+  const { dataSource, witnessBuilder, proofSink } = createPersistiaAdapter(nodeBase);
+  console.log(`[Persistia] Starting parallel watch on ${nodeBase} (${opts.workers ?? 6} workers)`);
+  await watchParallelMsgpack(engine, dataSource, witnessBuilder, proofSink, opts as any);
 }
 
-// --- Persistent bb Msgpack API ---
-// Keeps bb processes resident across proves, eliminating ~40ms startup overhead per prove.
-
-const msgpackEncoder = new Encoder({ useRecords: false });
-const msgpackDecoder = new Decoder({ useRecords: false });
-
-class PersistentBb {
-  private proc: ChildProcess;
-  private pendingResolves: Array<{ resolve: (v: any) => void; reject: (e: Error) => void }> = [];
-  private buffer = Buffer.alloc(0);
-  private readingLength = true;
-  private expectedLength = 0;
-
-  constructor(threads: number) {
-    this.proc = spawn(BB_PATH, ["msgpack", "run"], {
-      stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, OMP_NUM_THREADS: String(threads) },
-    });
-    this.proc.stdout!.on("data", (d: Buffer) => this.handleData(d));
-    this.proc.on("error", (e) => {
-      if (this.pendingResolves.length > 0) this.pendingResolves.shift()!.reject(e);
-    });
-  }
-
-  private handleData(data: Buffer) {
-    this.buffer = Buffer.concat([this.buffer, data]);
-    while (true) {
-      if (this.readingLength) {
-        if (this.buffer.length >= 4) {
-          this.expectedLength = this.buffer.readUInt32LE(0);
-          this.buffer = this.buffer.subarray(4);
-          this.readingLength = false;
-        } else break;
-      } else {
-        if (this.buffer.length >= this.expectedLength) {
-          const payload = this.buffer.subarray(0, this.expectedLength);
-          this.buffer = this.buffer.subarray(this.expectedLength);
-          this.readingLength = true;
-          const resp = msgpackDecoder.unpack(payload);
-          if (this.pendingResolves.length > 0) this.pendingResolves.shift()!.resolve(resp);
-        } else break;
-      }
-    }
-  }
-
-  prove(bytecode: Buffer, vk: Buffer, witness: Buffer): Promise<any> {
-    return new Promise((resolve, reject) => {
-      this.pendingResolves.push({ resolve, reject });
-      const cmd = [["CircuitProve", {
-        circuit: { name: "persistia_state_proof", bytecode, verification_key: vk },
-        witness,
-        settings: {
-          ipa_accumulation: false,
-          oracle_hash_type: "poseidon2",
-          disable_zk: true,
-          optimized_solidity_verifier: false,
-        },
-      }]];
-      const packed = msgpackEncoder.pack(cmd);
-      const lenBuf = Buffer.alloc(4);
-      lenBuf.writeUInt32LE(packed.length, 0);
-      this.proc.stdin!.write(lenBuf);
-      this.proc.stdin!.write(packed);
-    });
-  }
-
-  shutdown(): Promise<void> {
-    const packed = msgpackEncoder.pack([["Shutdown", {}]]);
-    const lenBuf = Buffer.alloc(4);
-    lenBuf.writeUInt32LE(packed.length, 0);
-    this.proc.stdin!.write(lenBuf);
-    this.proc.stdin!.write(packed);
-    this.proc.stdin!.end();
-    return new Promise((r) => this.proc.on("close", r));
-  }
-}
-
-async function cmdWatchParallelMsgpack(
-  nodeBase: string,
-  proofDir: string,
-  intervalSec: number,
-  workers: number,
-) {
-  if (!nativeBbAvailable()) {
-    console.error("Msgpack mode requires native bb CLI. Install with: bbup -v 4.1.2");
-    process.exit(1);
-  }
-
-  const threadsPerWorker = Math.max(2, Math.floor(12 / workers));
-  console.log(`Msgpack parallel prover: ${workers} persistent bb workers, ${threadsPerWorker} threads each`);
-  console.log(`Watching ${nodeBase} (interval=${intervalSec}s)\n`);
-  if (!existsSync(proofDir)) mkdirSync(proofDir, { recursive: true });
-
-  // Load circuit and prepare bytecode/VK
-  const circuit = loadCircuit();
-  const noir = new Noir(circuit);
-  const bytecode = gunzipSync(Buffer.from(circuit.bytecode, "base64"));
-  const vkPath = ensureVkCached();
-  if (!vkPath) {
-    console.error("Failed to compute VK");
-    process.exit(1);
-  }
-  const vkBytes = readFileSync(vkPath);
-
-  // Spawn persistent bb workers
-  const bbs = Array.from({ length: workers }, () => new PersistentBb(threadsPerWorker));
-
-  // Warmup each worker
-  console.log("Warming up workers...");
-  const testWitness = await (async () => {
-    const { buildTestWitness } = await import("./witness.js");
-    const tw = await buildTestWitness();
-    const { witness: sw } = await noir.execute(tw as any);
-    let decompressed: Buffer;
-    try { decompressed = gunzipSync(Buffer.from(sw)); } catch { decompressed = Buffer.from(sw); }
-    return decompressed;
-  })();
-
-  await Promise.all(bbs.map((bb) => bb.prove(bytecode, vkBytes, testWitness)));
-  console.log("Workers ready.\n");
-
-  let lastProvenBlock = 0;
-
-  // Check what's already proven
-  try {
-    const statusRes = await fetch(nodeUrl(nodeBase, "/proof/zk/latest"));
-    if (statusRes.ok) {
-      const status = (await statusRes.json()) as any;
-      lastProvenBlock = status.block_number ?? 0;
-      console.log(`Resuming from block ${lastProvenBlock}`);
-    }
-  } catch {}
-
-  while (true) {
-    try {
-      const latestBlock = await fetchLatestBlock(nodeBase);
-      const gap = latestBlock - lastProvenBlock;
-
-      if (gap <= 0) {
-        await new Promise((r) => setTimeout(r, intervalSec * 1000));
-        continue;
-      }
-
-      const batchSize = Math.min(gap, workers);
-      const blockNumbers = Array.from({ length: batchSize }, (_, i) => lastProvenBlock + 1 + i);
-      console.log(`\n--- Proving blocks ${blockNumbers.join(", ")} via msgpack (gap=${gap}) ---`);
-      const batchStart = performance.now();
-
-      // Solve witnesses in parallel
-      const witnessPromises = blockNumbers.map(async (blockNum) => {
-        const block = await fetchBlock(nodeBase, blockNum);
-        const prevSR = await fetchPrevStateRoot(nodeBase, blockNum);
-        const witness = await buildSingleBlockWitness(block, prevSR);
-        const stateRoot = witness.new_state_root;
-        const { witness: sw } = await noir.execute(witness as any);
-        let decompressed: Buffer;
-        try { decompressed = gunzipSync(Buffer.from(sw)); } catch { decompressed = Buffer.from(sw); }
-        return { blockNum, block, witness: decompressed, prevSR, stateRoot };
-      });
-
-      const witnessResults = await Promise.all(witnessPromises);
-
-      // Prove via persistent bb workers
-      const proveResults = await Promise.allSettled(
-        witnessResults.map(({ blockNum, block, witness, prevSR, stateRoot }, i) =>
-          (async () => {
-            const resp = await bbs[i % bbs.length].prove(bytecode, vkBytes, witness);
-            const [tag, data] = resp;
-            if (tag === "ErrorResponse") throw new Error(data.message);
-
-            // Extract proof and public inputs from msgpack response
-            const publicInputs: string[] = data.public_inputs.map((pi: Buffer) =>
-              "0x" + Array.from(pi).map((b: number) => b.toString(16).padStart(2, "0")).join(""),
-            );
-            const proofFields = data.proof.map((f: Buffer) =>
-              "0x" + Array.from(f).map((b: number) => b.toString(16).padStart(2, "0")).join(""),
-            );
-            // Convert proof fields back to concatenated bytes
-            const proofBytes = Buffer.alloc(proofFields.length * 32);
-            for (let j = 0; j < proofFields.length; j++) {
-              const val = BigInt(proofFields[j]);
-              const hex = val.toString(16).padStart(64, "0");
-              for (let k = 0; k < 32; k++) {
-                proofBytes[j * 32 + k] = parseInt(hex.substring(k * 2, k * 2 + 2), 16);
-              }
-            }
-
-            const outPath = join(proofDir, `block_${blockNum}.json`);
-            const proofData = {
-              proof: proofBytes.toString("base64"),
-              publicInputs,
-              block_number: blockNum,
-              proven_blocks: 1,
-              genesis_root: prevSR,
-              state_root: stateRoot,
-              prover: "noir-ultrahonk-native-msgpack",
-              timestamp: new Date().toISOString(),
-            };
-
-            const dir = resolve(outPath, "..");
-            if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-            writeFileSync(outPath, JSON.stringify(proofData, null, 2));
-            return { blockNum, outPath };
-          })(),
-        ),
-      );
-
-      const batchElapsed = ((performance.now() - batchStart) / 1000).toFixed(2);
-      let proved = 0;
-
-      for (const result of proveResults) {
-        if (result.status === "fulfilled") {
-          const { blockNum, outPath } = result.value;
-          proved++;
-          try {
-            const proofData = JSON.parse(readFileSync(outPath, "utf-8"));
-            await submitProof(nodeBase, proofData);
-            console.log(`  Block ${blockNum}: submitted`);
-          } catch (e: any) {
-            console.warn(`  Block ${blockNum}: submit failed (${e.message})`);
-          }
-        } else {
-          console.error(`  Block prove failed: ${result.reason}`);
-        }
-      }
-
-      lastProvenBlock += proved;
-      const throughput = (proved / parseFloat(batchElapsed) * 60).toFixed(1);
-      console.log(`Batch done: ${proved}/${batchSize} blocks in ${batchElapsed}s (${throughput} blocks/min)`);
-    } catch (e: any) {
-      console.error(`Error: ${e.message}`);
-    }
-
-    await new Promise((r) => setTimeout(r, intervalSec * 1000));
-  }
-}
-
-// --- SnarkFold Epoch Proof Aggregation ---
-// Folds N block proofs into a single compact epoch proof via recursive verification.
-// Each block proof is verified inside the circuit, producing one proof covering [start, end].
-// This reduces on-chain/light-client verification from N proofs to 1.
+// --- SnarkFold Epoch Proof Aggregation (Persistia-specific) ---
 
 async function cmdAggregate(
   nodeBase: string,
@@ -1061,7 +280,6 @@ async function cmdAggregate(
   blockStart: number,
   blockEnd: number,
   outputPath: string,
-  useNative = false,
 ) {
   if (blockEnd < blockStart) {
     console.error("block-end must be >= block-start");
@@ -1071,7 +289,7 @@ async function cmdAggregate(
   const blockCount = blockEnd - blockStart + 1;
   console.log(`SnarkFold: aggregating ${blockCount} proofs (blocks ${blockStart}-${blockEnd})`);
 
-  // Step 1: Collect all block proofs (from local dir or fetch from node)
+  // Collect all block proofs (from local dir or fetch from node)
   const proofs: any[] = [];
   for (let b = blockStart; b <= blockEnd; b++) {
     const localPath = join(proofDir, `block_${b}.json`);
@@ -1079,9 +297,9 @@ async function cmdAggregate(
       proofs.push(JSON.parse(readFileSync(localPath, "utf-8")));
       continue;
     }
-    // Try fetching from node
     try {
-      const url = nodeUrl(nodeBase, `/proof/zk/get?block=${b}`);
+      const ds = new PersistiaDataSource(nodeBase);
+      const url = nodeBase.replace(/\/$/, "") + `/proof/zk/get?block=${b}`;
       const res = await fetch(url);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json() as any;
@@ -1095,13 +313,10 @@ async function cmdAggregate(
 
   console.log(`Collected ${proofs.length} proofs. Starting recursive fold...`);
 
-  // Step 2: Recursive fold — chain proofs pairwise until one remains
-  // Uses the existing UltraHonk recursive verification: each step verifies
-  // the previous aggregate + next block proof, producing a new proof.
-  const { backend, noir } = await createProver();
+  const engine = createEngine();
+  await engine.init();
   const startTime = performance.now();
 
-  // Build the aggregate by chaining: start with first proof, fold in each subsequent
   let currentAggregate = proofs[0];
   let aggregatedBlocks = 1;
 
@@ -1109,42 +324,29 @@ async function cmdAggregate(
     const nextProof = proofs[i];
     const stepStart = performance.now();
 
-    // The fold witness: verify previous aggregate inside circuit, combine with next block
+    // Build fold witness: verify previous aggregate inside circuit, combine with next block
     const foldWitness: any = {
-      // Previous aggregate as inner proof
       prev_state_root: currentAggregate.state_root || GENESIS_STATE_ROOT,
       new_state_root: nextProof.state_root || GENESIS_STATE_ROOT,
       block_number: nextProof.block_number,
       active_nodes: nextProof.active_nodes || 1,
-      mutations: [],
+      mutations: Array.from({ length: 512 }, () => ({ key: "0", new_value: "0", is_delete: 0, enabled: 0 })),
       mutation_count: 0,
-      signatures: [],
+      signatures: Array.from({ length: 4 }, () => ({
+        pubkey_x: "0", pubkey_y: "0",
+        signature: Array(64).fill(0),
+        msg: Array(32).fill(0),
+        enabled: 0,
+      })),
       sig_count: 0,
       prev_proven_blocks: aggregatedBlocks,
       prev_genesis_root: currentAggregate.genesis_root || GENESIS_STATE_ROOT,
     };
 
-    // Pad mutations/signatures to circuit size
-    while (foldWitness.mutations.length < 512) {
-      foldWitness.mutations.push({ key: "0", new_value: "0", is_delete: 0, enabled: 0 });
-    }
-    while (foldWitness.signatures.length < 4) {
-      foldWitness.signatures.push({
-        pubkey_x: "0", pubkey_y: "0",
-        signature: Array(64).fill(0),
-        msg: Array(32).fill(0),
-        enabled: 0,
-      });
-    }
-
     // Add recursive proof fields from previous aggregate
     if (currentAggregate.publicInputs && currentAggregate.vkAsFields) {
-      const proofBytes = Buffer.from(currentAggregate.proof, "base64");
-      const innerFields: string[] = [];
-      for (let j = 51 * 32; j < proofBytes.length; j += 32) {
-        const hex = "0x" + Array.from(proofBytes.subarray(j, j + 32)).map(b => b.toString(16).padStart(2, "0")).join("");
-        innerFields.push(hex);
-      }
+      const proofBytes = new Uint8Array(Buffer.from(currentAggregate.proof, "base64"));
+      const innerFields = extractInnerProof(proofBytes);
       while (innerFields.length < 449) innerFields.push("0x00");
 
       foldWitness.prev_proof = innerFields.slice(0, 449);
@@ -1152,7 +354,6 @@ async function cmdAggregate(
       foldWitness.prev_key_hash = currentAggregate.vkHash || "0x00";
       foldWitness.prev_public_inputs = currentAggregate.publicInputs.slice(0, 8);
     } else {
-      // No recursive data — first proof may not have it; use zeroed fields
       foldWitness.prev_proof = Array(449).fill("0x00");
       foldWitness.prev_vk = Array(115).fill("0x00");
       foldWitness.prev_key_hash = "0x00";
@@ -1160,47 +361,33 @@ async function cmdAggregate(
     }
 
     try {
-      // Generate fold proof
-      if (useNative && nativeBbAvailable()) {
-        const { witness } = await noir.execute(foldWitness);
-        const compressed = noir.getWitnessCompressed(witness);
-        const vkPath = ensureVkCached();
-        const result = nativeBbProve(compressed, vkPath);
-        const artifacts = await backend.generateProofArtifacts(
-          { proof: result.proof, publicInputs: result.publicInputs },
-        );
-        currentAggregate = {
-          proof: Buffer.from(result.proof).toString("base64"),
-          publicInputs: result.publicInputs,
-          vkAsFields: artifacts.vkAsFields,
-          vkHash: artifacts.vkHash,
-          block_number: nextProof.block_number,
-          proven_blocks: aggregatedBlocks + 1,
-          genesis_root: currentAggregate.genesis_root || GENESIS_STATE_ROOT,
-          state_root: nextProof.state_root,
-        };
+      const { witness: solvedWitness } = await engine.execute(foldWitness);
+
+      let proof: { proof: Uint8Array; publicInputs: string[] };
+      if (useNative && engine.nativeBbAvailable()) {
+        proof = engine.nativeProve(solvedWitness, verifierTarget);
       } else {
-        const proof = await noir.execute(foldWitness).then(({ witness }) =>
-          backend.generateProof(witness),
-        );
-        const artifacts = await backend.generateProofArtifacts(proof);
-        currentAggregate = {
-          proof: Buffer.from(proof.proof).toString("base64"),
-          publicInputs: proof.publicInputs,
-          vkAsFields: artifacts.vkAsFields,
-          vkHash: artifacts.vkHash,
-          block_number: nextProof.block_number,
-          proven_blocks: aggregatedBlocks + 1,
-          genesis_root: currentAggregate.genesis_root || GENESIS_STATE_ROOT,
-          state_root: nextProof.state_root,
-        };
+        proof = await engine.prove(solvedWitness);
       }
+
+      const artifacts = await engine.generateRecursiveArtifacts(proof);
+
+      currentAggregate = {
+        proof: Buffer.from(proof.proof).toString("base64"),
+        publicInputs: proof.publicInputs,
+        vkAsFields: artifacts.vkAsFields,
+        vkHash: artifacts.vkHash,
+        block_number: nextProof.block_number,
+        proven_blocks: aggregatedBlocks + 1,
+        genesis_root: currentAggregate.genesis_root || GENESIS_STATE_ROOT,
+        state_root: nextProof.state_root,
+      };
+
       aggregatedBlocks++;
       const stepMs = (performance.now() - stepStart).toFixed(0);
       console.log(`  Fold step ${i}/${proofs.length - 1}: block ${nextProof.block_number} (${stepMs}ms, ${aggregatedBlocks} blocks aggregated)`);
     } catch (e: any) {
       console.error(`Fold step ${i} failed at block ${nextProof.block_number}: ${e.message}`);
-      // Continue with what we have
       break;
     }
   }
@@ -1208,8 +395,8 @@ async function cmdAggregate(
   const totalSec = ((performance.now() - startTime) / 1000).toFixed(2);
   console.log(`\nSnarkFold complete: ${aggregatedBlocks} blocks in ${totalSec}s`);
 
-  // Step 3: Write epoch proof
-  const epoch = Math.floor(blockStart / blockCount); // epoch number
+  // Write epoch proof
+  const epoch = Math.floor(blockStart / blockCount);
   const epochProof = {
     epoch,
     block_start: blockStart,
@@ -1230,10 +417,9 @@ async function cmdAggregate(
   writeFileSync(outputPath, JSON.stringify(epochProof, null, 2));
   console.log(`Epoch proof written to ${outputPath}`);
 
-  // Step 4: Submit to node
+  // Submit to node
   try {
-    const url = nodeUrl(nodeBase, "/proof/epoch/submit");
-    const res = await fetch(url, {
+    const res = await fetch(nodeBase.replace(/\/$/, "") + "/proof/epoch/submit", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1247,193 +433,83 @@ async function cmdAggregate(
         genesis_root: currentAggregate.genesis_root,
       }),
     });
-    if (res.ok) {
-      console.log("Epoch proof submitted to node.");
-    } else {
-      console.warn(`Submit failed: ${res.status}`);
-    }
+    if (res.ok) console.log("Epoch proof submitted to node.");
+    else console.warn(`Submit failed: ${res.status}`);
   } catch (e: any) {
     console.warn(`Could not submit epoch proof: ${e.message}`);
   }
+
+  await engine.destroy();
 }
 
-// --- bb Version Manager ---
-
-function cmdBbVersion() {
-  try {
-    const current = execSync(`${BB_PATH} --version`, { encoding: "utf-8" }).trim();
-    console.log(`bb version: ${current}`);
-    console.log(`bb path:    ${BB_PATH}`);
-
-    // Check latest available
-    try {
-      const latest = execSync(
-        `npm view @aztec/bb.js version 2>/dev/null`,
-        { encoding: "utf-8" },
-      ).trim();
-      console.log(`Latest bb.js: ${latest}`);
-      if (latest !== current) {
-        console.log(`\nUpdate available! Run:`);
-        console.log(`  ~/.bb/bbup -v ${latest}`);
-        console.log(`  npm install @aztec/bb.js@${latest}`);
-      } else {
-        console.log("Up to date.");
-      }
-    } catch {
-      console.log("Could not check latest version.");
-    }
-  } catch {
-    console.log("bb CLI not found. Install with:");
-    console.log("  curl -L https://raw.githubusercontent.com/AztecProtocol/aztec-packages/master/barretenberg/bbup/install | bash");
-    console.log("  bbup -v 4.1.2");
-  }
-}
-
-function cmdBbUpgrade() {
-  try {
-    const latest = execSync(`npm view @aztec/bb.js version 2>/dev/null`, { encoding: "utf-8" }).trim();
-    const current = execSync(`${BB_PATH} --version`, { encoding: "utf-8" }).trim();
-
-    if (latest === current) {
-      console.log(`Already on latest: ${current}`);
-      return;
-    }
-
-    console.log(`Upgrading bb: ${current} -> ${latest}`);
-    execSync(`${BB_PATH}up -v ${latest}`, { stdio: "inherit" });
-    execSync(`npm install @aztec/bb.js@${latest}`, { stdio: "inherit", cwd: resolve(import.meta.dirname ?? ".", "..") });
-    console.log("Done. Re-compile circuit if needed: cd contracts/zk-noir && nargo compile");
-  } catch (e: any) {
-    console.error(`Upgrade failed: ${e.message}`);
-  }
-}
-
-// --- Incremental Circuit Prover ---
-// Uses the sparse Merkle tree circuit (428K gates vs 9.1M) for much faster proving.
-// Maintains a persistent Poseidon2 sparse Merkle tree locally.
-
-function createIncrementalProver() {
-  if (!existsSync(INCREMENTAL_CIRCUIT_PATH)) {
-    console.error(`Incremental circuit not found at ${INCREMENTAL_CIRCUIT_PATH}`);
-    console.error("Run 'nargo compile --package persistia_incremental_proof' first.");
-    process.exit(1);
-  }
-  const circuit = JSON.parse(readFileSync(INCREMENTAL_CIRCUIT_PATH, "utf-8"));
-  return circuit;
-}
-
-const INCREMENTAL_VK_CACHE = resolve(import.meta.dirname ?? ".", "../../target/bb_vk_incremental");
-
-function ensureIncrementalVkCached(): string | null {
-  const cacheFile = join(INCREMENTAL_VK_CACHE, "vk");
-  if (existsSync(cacheFile)) return cacheFile;
-  try {
-    mkdirSync(INCREMENTAL_VK_CACHE, { recursive: true });
-    execSync(
-      `${BB_PATH} write_vk -b ${INCREMENTAL_CIRCUIT_PATH} -o ${INCREMENTAL_VK_CACHE} -t noir-recursive-no-zk`,
-      { stdio: "pipe" },
-    );
-    if (existsSync(cacheFile)) return cacheFile;
-  } catch {}
-  return null;
-}
-
-function nativeBbProveIncremental(
-  witnessBytes: Uint8Array,
-): { proof: Uint8Array; publicInputs: string[] } {
-  const tmpDir = "/tmp/persistia_bb_prove_inc";
-  rmSync(tmpDir, { recursive: true, force: true });
-
-  const vkPath = ensureIncrementalVkCached();
-  const vkFlag = vkPath ? ` -k ${vkPath}` : " --write_vk";
-
-  writeFileSync("/tmp/persistia_bb_witness_inc.gz", witnessBytes);
-  execSync(
-    `${BB_PATH} prove -b ${INCREMENTAL_CIRCUIT_PATH} -w /tmp/persistia_bb_witness_inc.gz -o ${tmpDir}${vkFlag} -t noir-recursive-no-zk`,
-    { stdio: "pipe" },
-  );
-
-  const proof = readFileSync(join(tmpDir, "proof"));
-  const piRaw = readFileSync(join(tmpDir, "public_inputs"));
-
-  const publicInputs: string[] = [];
-  for (let i = 0; i < piRaw.length; i += 32) {
-    const hex = "0x" + Array.from(piRaw.subarray(i, i + 32)).map(b => b.toString(16).padStart(2, "0")).join("");
-    publicInputs.push(hex);
-  }
-
-  return { proof: new Uint8Array(proof), publicInputs };
-}
+// --- Incremental Circuit Prover (Persistia-specific, uses sparse Merkle tree) ---
 
 async function cmdWatchIncremental(
   nodeBase: string,
   proofDir: string,
   intervalSec: number,
-  useNative = false,
   startBlock?: number,
   treePath?: string,
 ) {
+  if (!existsSync(INCREMENTAL_CIRCUIT_PATH)) {
+    console.error(`Incremental circuit not found at ${INCREMENTAL_CIRCUIT_PATH}`);
+    console.error("Run 'nargo compile --package persistia_incremental_proof' first.");
+    process.exit(1);
+  }
+
   if (!existsSync(proofDir)) mkdirSync(proofDir, { recursive: true });
 
-  const circuit = createIncrementalProver();
-  const api = await Barretenberg.new({ threads: 8 });
-  const backend = new UltraHonkBackend(circuit.bytecode, api);
-  const noir = new Noir(circuit);
+  const engine = createEngine(INCREMENTAL_CIRCUIT_PATH);
+  await engine.init();
+
+  const ds = new PersistiaDataSource(nodeBase);
+  const sink = new PersistiaProofSink(nodeBase);
 
   // Initialize sparse Merkle tree (persisted to disk)
   const smtPath = treePath ?? join(proofDir, "sparse_merkle_tree.json");
   const smt = new SparseMerkleTree(smtPath);
   await smt.init();
 
-  let lastProvenBlock = startBlock ?? (await fetchLatestBlock(nodeBase));
+  let lastProvenBlock = startBlock ?? (await ds.fetchLatestBlockNumber());
   console.log(`Incremental prover watching ${nodeBase} (interval=${intervalSec}s, starting after block ${lastProvenBlock})`);
   console.log(`Sparse Merkle tree: ${smt.size} leaves, root=${smt.getRoot().substring(0, 18)}...`);
   console.log(`Circuit: ${INCREMENTAL_CIRCUIT_PATH}`);
-  console.log(`Native bb: ${useNative && nativeBbAvailable() ? "yes" : "no (WASM)"}`);
+  console.log(`Native bb: ${useNative && engine.nativeBbAvailable() ? "yes" : "no (WASM)"}`);
 
   while (true) {
     try {
-      const latestBlock = await fetchLatestBlock(nodeBase);
+      const latestBlock = await ds.fetchLatestBlockNumber();
 
       while (latestBlock > lastProvenBlock) {
-        const blockNum = await fetchNextCommitted(nodeBase, lastProvenBlock);
+        const blockNum = await ds.fetchNextBlockNumber(lastProvenBlock);
         if (blockNum === null || blockNum > latestBlock) break;
 
-        const outPath = join(proofDir, `block_${blockNum}.json`);
         try {
-          const block = await fetchBlock(nodeBase, blockNum);
+          const block = await ds.fetchBlock(blockNum);
           const allMutations = (block.mutations ?? []).map((m: any) => {
             const w = buildIncrementalMutationWitness(m);
-            return {
-              keyHex: w.key,
-              newValueHex: w.new_value,
-              isDelete: w.is_delete,
-            };
+            return { keyHex: w.key, newValueHex: w.new_value, isDelete: w.is_delete };
           });
-          // Incremental circuit supports max 64 mutations per proof
           const mutations = allMutations.slice(0, 64);
           if (allMutations.length > 64) {
             console.log(`  Block ${blockNum}: truncated ${allMutations.length} mutations to 64`);
           }
 
-          // Apply mutations to sparse Merkle tree and get sibling paths
           const { updates, prevRoot, newRoot } = await smt.applyMutations(mutations);
-
-          // Build witness for incremental circuit
           const witness = await buildIncrementalWitness(block, updates, prevRoot, newRoot);
 
           const start = performance.now();
-          const { witness: solvedWitness } = await noir.execute(witness as any);
+          const { witness: solvedWitness } = await engine.execute(witness as any);
 
           let proof: { proof: Uint8Array; publicInputs: string[] };
-          if (useNative && nativeBbAvailable()) {
-            proof = nativeBbProveIncremental(solvedWitness);
+          if (useNative && engine.nativeBbAvailable()) {
+            proof = engine.nativeProve(solvedWitness);
           } else {
-            proof = await backend.generateProof(solvedWitness);
+            proof = await engine.prove(solvedWitness);
           }
           const elapsed = ((performance.now() - start) / 1000).toFixed(2);
 
-          const proofOutput = {
+          const proofOutput: ProofOutput = {
             proof: Buffer.from(proof.proof).toString("base64"),
             publicInputs: proof.publicInputs,
             blockNumber: blockNum,
@@ -1448,15 +524,11 @@ async function cmdWatchIncremental(
             },
           };
 
+          const outPath = join(proofDir, `block_${blockNum}.json`);
           writeFileSync(outPath, JSON.stringify(proofOutput, null, 2));
           console.log(`Block ${blockNum}: proof in ${elapsed}s (${mutations.length} mutations, tree=${smt.size} leaves)`);
 
-          // Submit to node
-          try {
-            await submitProof(nodeBase, proofOutput);
-          } catch (e: any) {
-            // non-fatal
-          }
+          try { await sink.submitProof(proofOutput); } catch {}
         } catch (e: any) {
           console.log(`Block ${blockNum} skipped: ${e.message?.substring(0, 150)}`);
         }
@@ -1470,120 +542,142 @@ async function cmdWatchIncremental(
   }
 }
 
-// --- CLI ---
+// --- bb utilities ---
 
-const args = process.argv.slice(2);
-const command = args[0];
-
-function getArg(name: string, defaultVal?: string): string {
-  const idx = args.indexOf(`--${name}`);
-  if (idx >= 0 && idx + 1 < args.length) return args[idx + 1];
-  if (defaultVal !== undefined) return defaultVal;
-  throw new Error(`Missing required argument: --${name}`);
+function cmdBbVersion() {
+  const engine = createEngine();
+  const cfg = engine.getConfig();
+  try {
+    const version = execSync(`${cfg.bbPath} --version`, { encoding: "utf-8" }).trim();
+    console.log(`bb version: ${version}`);
+    console.log(`bb path:    ${cfg.bbPath}`);
+    try {
+      const latest = execSync(`npm view @aztec/bb.js version 2>/dev/null`, { encoding: "utf-8" }).trim();
+      console.log(`Latest bb.js: ${latest}`);
+      if (latest !== version) {
+        console.log(`\nUpdate available! Run:\n  ~/.bb/bbup -v ${latest}\n  npm install @aztec/bb.js@${latest}`);
+      } else {
+        console.log("Up to date.");
+      }
+    } catch {}
+  } catch {
+    console.log("bb CLI not found. Install with:");
+    console.log("  curl -L https://raw.githubusercontent.com/AztecProtocol/aztec-packages/master/barretenberg/bbup/install | bash");
+    console.log("  bbup -v 4.1.2");
+  }
 }
 
-const useNative = args.includes("--native");
-const verifierTarget: VerifierTarget = args.includes("--evm") ? "evm-no-zk" : "noir-recursive-no-zk";
-if (args.includes("--shard")) _globalShard = getArg("shard");
+function cmdGpuInfo() {
+  const engine = createEngine();
+  const info = engine.metalGpuInfo();
+  if (info) {
+    console.log(`GPU: ${info.gpu}`);
+    console.log(`Unified memory: ${info.unified_memory}`);
+    console.log(`Metal MSM: available`);
+  } else {
+    console.log("Metal GPU MSM: not available");
+  }
+}
+
+// --- CLI dispatch ---
+
+const nodeBase = withShard(getArg("node", "http://localhost:8787"));
+const proofDir = getArg("proof-dir", "./proofs");
+const intervalSec = parseInt(getArg("interval", "10"));
 
 switch (command) {
   case "execute":
-    cmdExecute(getArg("node", "http://localhost:8787"), parseInt(getArg("block")));
+    cmdExecute(nodeBase, parseInt(getArg("block")));
     break;
   case "prove":
     cmdProve(
-      getArg("node", "http://localhost:8787"),
+      nodeBase,
       parseInt(getArg("block")),
       getArg("output", "proof.json"),
       args.includes("--prev-proof") ? getArg("prev-proof") : undefined,
-      useNative,
-      verifierTarget,
     );
     break;
   case "verify":
-    cmdVerify(getArg("proof"), useNative);
+    cmdVerify(getArg("proof"));
     break;
   case "watch":
-    cmdWatch(
-      getArg("node", "http://localhost:8787"),
-      getArg("proof-dir", "./proofs"),
-      parseInt(getArg("interval", "10")),
+    cmdWatch(nodeBase, {
+      proofDir,
+      intervalSec,
       useNative,
-      args.includes("--start") ? parseInt(getArg("start")) : undefined,
-    );
-    break;
-  case "bench":
-    cmdBench(getArg("node", "http://localhost:8787"), parseInt(getArg("block")));
-    break;
-  case "watch-parallel":
-    cmdWatchParallel(
-      getArg("node", "http://localhost:8787"),
-      getArg("proof-dir", "./proofs"),
-      parseInt(getArg("interval", "5")),
-      parseInt(getArg("workers", "6")),
-    );
+      recursive: args.includes("--recursive"),
+      startBlock: args.includes("--start") ? parseInt(getArg("start")) : undefined,
+    });
     break;
   case "watch-pipelined":
-    cmdWatchPipelined(
-      getArg("node", "http://localhost:8787"),
-      getArg("proof-dir", "./proofs"),
-      parseInt(getArg("interval", "5")),
-    );
+    cmdWatchPipelined(nodeBase, {
+      proofDir,
+      intervalSec: parseInt(getArg("interval", "5")),
+      useNative,
+      recursive: args.includes("--recursive"),
+      startBlock: args.includes("--start") ? parseInt(getArg("start")) : undefined,
+    });
     break;
+  case "watch-parallel":
   case "watch-parallel-msgpack":
-    cmdWatchParallelMsgpack(
-      getArg("node", "http://localhost:8787"),
-      getArg("proof-dir", "./proofs"),
-      parseInt(getArg("interval", "5")),
-      parseInt(getArg("workers", "6")),
-    );
+    cmdWatchParallel(nodeBase, {
+      proofDir,
+      intervalSec: parseInt(getArg("interval", "5")),
+      useNative,
+      startBlock: args.includes("--start") ? parseInt(getArg("start")) : undefined,
+      workers: parseInt(getArg("workers", "6")),
+    } as any);
     break;
   case "watch-incremental":
     cmdWatchIncremental(
-      getArg("node", "http://localhost:8787"),
-      getArg("proof-dir", "./proofs"),
-      parseInt(getArg("interval", "10")),
-      useNative,
+      nodeBase,
+      proofDir,
+      intervalSec,
       args.includes("--start") ? parseInt(getArg("start")) : undefined,
       args.includes("--tree") ? getArg("tree") : undefined,
     );
     break;
   case "aggregate":
     cmdAggregate(
-      getArg("node", "http://localhost:8787"),
-      getArg("proof-dir", "./proofs"),
+      nodeBase,
+      proofDir,
       parseInt(getArg("block-start")),
       parseInt(getArg("block-end")),
       getArg("output", "./proofs/epoch_latest.json"),
-      useNative,
     );
+    break;
+  case "bench":
+    cmdBench(nodeBase, parseInt(getArg("block")));
     break;
   case "bb-version":
     cmdBbVersion();
     break;
-  case "bb-upgrade":
-    cmdBbUpgrade();
+  case "gpu-info":
+    cmdGpuInfo();
     break;
   default:
-    console.log(`Persistia Noir Prover
+    console.log(`Persistia Noir Prover (powered by zkMetal SDK)
 
 Usage:
   tsx prover.ts execute  --node <url> --block <n>      Execute without proof (test)
   tsx prover.ts prove    --node <url> --block <n>      Generate proof
   tsx prover.ts verify   --proof <path>                Verify a proof file
-  tsx prover.ts watch    --node <url>                  Watch and prove (full-tree circuit)
-  tsx prover.ts watch-incremental --node <url>         Watch and prove (incremental circuit, 21x faster)
-  tsx prover.ts watch-parallel --node <url>            Parallel proving (catch-up mode)
-  tsx prover.ts watch-pipelined --node <url>           Pipelined proving (overlaps witness + prove)
-  tsx prover.ts watch-parallel-msgpack --node <url>    Persistent bb workers (6-9% faster parallel)
-  tsx prover.ts aggregate --block-start N --block-end M  SnarkFold: aggregate N proofs into one epoch proof
+  tsx prover.ts watch    --node <url>                  Watch and prove (sequential)
+  tsx prover.ts watch-pipelined --node <url>           Pipelined proving
+  tsx prover.ts watch-parallel --node <url>            Parallel msgpack workers
+  tsx prover.ts watch-incremental --node <url>         Incremental circuit (21x faster)
+  tsx prover.ts aggregate --block-start N --block-end M  SnarkFold epoch aggregation
   tsx prover.ts bench    --node <url> --block <n>      Benchmark proving times
   tsx prover.ts bb-version                             Check bb CLI version
-  tsx prover.ts bb-upgrade                             Upgrade bb CLI + bb.js
+  tsx prover.ts gpu-info                               Metal GPU info
 
 Options:
-  --native     Use native bb CLI instead of WASM (faster, requires bb installed)
-  --evm        Generate EVM-optimized proofs (7.8KB, 1.7M gas vs 14KB, 3.3M gas)
-  --workers N  Number of parallel workers (default: 6, for watch-parallel)
-  --interval N Poll interval in seconds (default: 5 for parallel, 10 for sequential)`);
+  --native       Use native bb CLI instead of WASM
+  --evm          EVM-optimized proofs
+  --recursive    Enable IVC chaining (watch modes)
+  --workers N    Parallel workers (default: 6)
+  --interval N   Poll interval in seconds
+  --shard <id>   Shard parameter for node routing
+  --start <n>    Resume from block number
+  --tree <path>  Sparse Merkle tree path (incremental)`);
 }

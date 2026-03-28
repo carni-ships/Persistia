@@ -21,6 +21,12 @@ export interface DAGVertex {
   refs: string[];          // hashes of parent vertices (round r-1)
   timestamp: number;
   signature: string;       // Ed25519 over canonical vertex content
+  schnorr_sig?: {          // Schnorr-on-Grumpkin signature for ZK proving
+    schnorr_s: string;     // hex-encoded 32 bytes
+    schnorr_e: string;     // hex-encoded 32 bytes
+    grumpkin_x: string;    // hex-encoded Grumpkin pubkey x
+    grumpkin_y: string;    // hex-encoded Grumpkin pubkey y
+  };
 }
 
 export interface StoredVertex extends DAGVertex {
