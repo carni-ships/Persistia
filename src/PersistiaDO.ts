@@ -455,6 +455,10 @@ export class PersistiaWorldV4 implements DurableObject {
     const rootRows = [...sql.exec("SELECT root FROM roots ORDER BY id DESC LIMIT 1")];
     this.currentRoot = rootRows[0]?.root ?? await sha256("");
 
+    // Restore persisted shard name (survives hibernation)
+    const savedShard = this.getKV("shard_name");
+    if (savedShard) this.shardName = savedShard;
+
     // Consensus state
     this.currentRound = parseInt(this.getKV("current_round") || "0");
     this.finalizedSeq = parseInt(this.getKV("finalized_seq") || "0");
@@ -521,6 +525,46 @@ export class PersistiaWorldV4 implements DurableObject {
     // Node identity
     if (CONSENSUS_ENABLED) {
       this.nodeIdentity = await loadOrCreateNodeIdentity(sql, this.nodeUrl);
+
+      // Fix shard-qualified URL: ensure identity URL includes ?shard= when shard is known
+      if (this.shardName !== "global-world" && !this.env.NODE_URL && this.nodeIdentity.url) {
+        try {
+          const base = new URL(this.nodeIdentity.url);
+          const expectedUrl = `${base.origin}/?shard=${this.shardName}`;
+          if (this.nodeIdentity.url !== expectedUrl) {
+            this.nodeIdentity.url = expectedUrl;
+            this.nodeUrl = expectedUrl;
+            sql.exec("UPDATE node_identity SET node_url = ?", expectedUrl);
+            sql.exec("UPDATE active_nodes SET url = ? WHERE pubkey = ? AND is_self = 1",
+              expectedUrl, this.nodeIdentity.pubkey);
+          }
+        } catch {}
+      }
+
+      // One-time: fix stale peer URLs that point to base origin without shard params
+      // (cleanup for pre-shard-routing peer records from same deployment)
+      if (this.shardName !== "global-world" && !this.env.NODE_URL) {
+        const selfOrigin = (() => { try { return new URL(this.nodeIdentity.url).origin; } catch { return ""; } })();
+        if (selfOrigin) {
+          const stalePeers = [...sql.exec(
+            "SELECT pubkey, url FROM gossip_peers WHERE url = ? AND pubkey != ?",
+            selfOrigin, this.nodeIdentity.pubkey,
+          )] as any[];
+          if (stalePeers.length > 0) {
+            // Remove stale peers — they'll be re-discovered via sibling seeding
+            for (const p of stalePeers) {
+              sql.exec("DELETE FROM gossip_peers WHERE pubkey = ?", p.pubkey);
+            }
+            console.log(`Removed ${stalePeers.length} stale same-origin peers without shard params`);
+            // Re-seed siblings
+            const siblingShards = (this.env.SHARD_NAMES || "node-1,node-2,node-3")
+              .split(",").map((s: string) => s.trim()).filter((s: string) => s && s !== this.shardName);
+            const siblingUrls = siblingShards.map((s: string) => `${selfOrigin}/?shard=${s}`);
+            this.gossipManager.bootstrapFromSeeds(siblingUrls).catch(() => {});
+          }
+        }
+      }
+
       this.gossipManager.setIdentity(this.nodeIdentity);
 
       // Service attestation manager (needs node identity for signing)
@@ -597,9 +641,10 @@ export class PersistiaWorldV4 implements DurableObject {
       this.invalidateActiveCache();
     }
 
-    // Always ensure alarm is scheduled on startup
+    // Ensure alarm is scheduled — but don't override an existing pending alarm
     if (CONSENSUS_ENABLED) {
-      this.scheduleAlarm();
+      const existingAlarm = await this.state.storage.getAlarm();
+      if (!existingAlarm) this.scheduleAlarm();
     }
   }
 
@@ -876,6 +921,7 @@ export class PersistiaWorldV4 implements DurableObject {
     if (shardHeader && shardHeader !== this.shardName) {
       const firstDiscovery = this.shardName === "global-world";
       this.shardName = shardHeader;
+      this.setKV("shard_name", shardHeader);
       if (firstDiscovery && this.nodeIdentity) {
         // Now we know our shard — fix the node URL to include shard routing
         this.updateShardAwareUrl(url);
@@ -1552,6 +1598,13 @@ export class PersistiaWorldV4 implements DurableObject {
   // ─── DO Alarm (round timer) ─────────────────────────────────────────────
 
   async alarm() {
+    // Ensure state is loaded — critical when waking from hibernation
+    try { await this.ensureInitialized(); } catch (e: any) {
+      console.error(`Alarm init error: ${e.message}`);
+      this.scheduleAlarm();
+      return;
+    }
+
     this._alarmCycle++;
     const cycle = this._alarmCycle;
     let needsRapidFollowUp = false;
@@ -4814,10 +4867,11 @@ export class PersistiaWorldV4 implements DurableObject {
     if (authorStatus === "stale") {
       return { ok: false, error: "Vertex author must re-register (inactive too long)" };
     }
-    // Allow 'unknown' authors only during genesis bootstrapping (< MIN_NODES_FOR_CONSENSUS active)
+    // Allow 'unknown' authors during bootstrap: either < MIN_NODES active, or no validators registered yet
     if (authorStatus === "unknown") {
       const activeCount = this.getActiveNodeCount();
-      if (activeCount >= MIN_NODES_FOR_CONSENSUS) {
+      const registeredCount = this.validatorRegistry.getActiveCount();
+      if (activeCount >= MIN_NODES_FOR_CONSENSUS && registeredCount > 0) {
         return { ok: false, error: "Vertex author is not a registered validator" };
       }
     }
