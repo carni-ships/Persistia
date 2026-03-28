@@ -1662,26 +1662,26 @@ export class PersistiaWorldV4 implements DurableObject {
     const sql = this.state.storage.sql;
     const oneHourAgo = Date.now() - 3_600_000;
     const oneDayAgo = Date.now() - 86_400_000;
+    const sevenDaysAgo = Date.now() - 7 * 86_400_000;
     const thirtyDaysAgo = Date.now() - 30 * 86_400_000;
-    const ninetyDaysAgo = Date.now() - 90 * 86_400_000;
 
-    // DAG data — keep last 100 committed rounds
-    if (this.currentRound > 150) {
-      const pruneBelow = Math.min(this.currentRound - 100, this.lastCommittedRound);
-      sql.exec("DELETE FROM dag_vertices WHERE rowid IN (SELECT rowid FROM dag_vertices WHERE round < ? LIMIT 200)", pruneBelow);
-      sql.exec("DELETE FROM consensus_events WHERE rowid IN (SELECT rowid FROM consensus_events WHERE round < ? LIMIT 200)", pruneBelow);
+    // DAG data — keep last 50 committed rounds (reduced from 100 to lower storage)
+    if (this.currentRound > 80) {
+      const pruneBelow = Math.min(this.currentRound - 50, this.lastCommittedRound);
+      sql.exec("DELETE FROM dag_vertices WHERE rowid IN (SELECT rowid FROM dag_vertices WHERE round < ? LIMIT 500)", pruneBelow);
+      sql.exec("DELETE FROM consensus_events WHERE rowid IN (SELECT rowid FROM consensus_events WHERE round < ? LIMIT 500)", pruneBelow);
     }
 
     // Oracle requests/responses
-    sql.exec("DELETE FROM oracle_requests WHERE status = 'delivered' AND delivered_at < ? LIMIT 50", oneHourAgo);
-    sql.exec("DELETE FROM oracle_responses WHERE request_id NOT IN (SELECT id FROM oracle_requests) LIMIT 50");
+    sql.exec("DELETE FROM oracle_requests WHERE status = 'delivered' AND delivered_at < ? LIMIT 100", oneHourAgo);
+    sql.exec("DELETE FROM oracle_responses WHERE request_id NOT IN (SELECT id FROM oracle_requests) LIMIT 100");
 
-    // ZK proofs — IVC means latest subsumes previous
-    sql.exec(`DELETE FROM zk_proofs WHERE block_number NOT IN (SELECT block_number FROM zk_proofs ORDER BY block_number DESC LIMIT 5)`);
+    // ZK proofs — IVC means latest subsumes previous; keep 3
+    sql.exec(`DELETE FROM zk_proofs WHERE block_number NOT IN (SELECT block_number FROM zk_proofs ORDER BY block_number DESC LIMIT 3)`);
 
-    // Block headers
-    if (this.currentRound > 1200) {
-      sql.exec("DELETE FROM block_headers WHERE block_number < ? LIMIT 200", this.currentRound - 1000);
+    // Block headers — keep last 500 (reduced from 1000)
+    if (this.currentRound > 600) {
+      sql.exec("DELETE FROM block_headers WHERE block_number < ? LIMIT 500", this.currentRound - 500);
     }
 
     // Cross-shard messages
@@ -1689,47 +1689,54 @@ export class PersistiaWorldV4 implements DurableObject {
       "UPDATE xshard_outbox SET status = 'expired' WHERE status = 'pending' AND created_at < ?",
       Date.now() - 100 * this.getNetworkParam("round_interval_ms", ROUND_INTERVAL_MS),
     );
-    sql.exec("DELETE FROM xshard_outbox WHERE status IN ('delivered', 'expired') AND created_at < ? LIMIT 100", oneHourAgo);
-    sql.exec("DELETE FROM xshard_inbox WHERE status IN ('processed', 'failed') AND processed_at < ? LIMIT 100", oneHourAgo);
+    sql.exec("DELETE FROM xshard_outbox WHERE status IN ('delivered', 'expired') AND created_at < ? LIMIT 200", oneHourAgo);
+    sql.exec("DELETE FROM xshard_inbox WHERE status IN ('processed', 'failed') AND processed_at < ? LIMIT 200", oneHourAgo);
 
     // Consumed notes
-    if (this.currentRound > 1200) {
-      sql.exec("DELETE FROM notes WHERE consumed = 1 AND created_round < ? LIMIT 100", this.currentRound - 1000);
+    if (this.currentRound > 600) {
+      sql.exec("DELETE FROM notes WHERE consumed = 1 AND created_round < ? LIMIT 200", this.currentRound - 500);
     }
 
     // MPP challenges, governance, equivocation, private state, proof claims
-    sql.exec("DELETE FROM mpp_challenges WHERE consumed = 0 AND expires_at < ? LIMIT 100", Date.now());
-    sql.exec("DELETE FROM governance_votes WHERE created_at < ? LIMIT 50", ninetyDaysAgo);
-    sql.exec("DELETE FROM equivocation_evidence WHERE detected_at < ? LIMIT 50", thirtyDaysAgo);
-    sql.exec("DELETE FROM private_state WHERE updated_at < ? LIMIT 50", ninetyDaysAgo);
-    sql.exec("DELETE FROM proof_claims WHERE status IN ('completed', 'expired') AND claimed_at < ? LIMIT 50", oneDayAgo);
+    sql.exec("DELETE FROM mpp_challenges WHERE consumed = 0 AND expires_at < ? LIMIT 200", Date.now());
+    sql.exec("DELETE FROM governance_votes WHERE created_at < ? LIMIT 100", thirtyDaysAgo);
+    sql.exec("DELETE FROM equivocation_evidence WHERE detected_at < ? LIMIT 100", sevenDaysAgo);
+    sql.exec("DELETE FROM private_state WHERE updated_at < ? LIMIT 100", thirtyDaysAgo);
+    sql.exec("DELETE FROM proof_claims WHERE status IN ('completed', 'expired') AND claimed_at < ? LIMIT 100", oneDayAgo);
 
-    // dag_commits older than ZK-proven block
-    const latestProvenRows = [...sql.exec("SELECT MAX(block_number) as b FROM zk_proofs")];
-    const latestProven = (latestProvenRows[0]?.b ?? 0) as number;
-    if (latestProven > 100) {
-      sql.exec("DELETE FROM dag_commits WHERE round < ? LIMIT 200", latestProven - 50);
+    // dag_commits — keep last 200 rounds regardless of prover progress (reduced from 50-below-proven)
+    if (this.lastCommittedRound > 250) {
+      sql.exec("DELETE FROM dag_commits WHERE round < ? LIMIT 500", this.lastCommittedRound - 200);
     }
 
-    // Merkle roots — keep last 2000
+    // Merkle roots — keep last 1000 (reduced from 2000)
     const maxRootSeq = [...sql.exec("SELECT MAX(seq) as s FROM roots")];
     const latestRootSeq = (maxRootSeq[0]?.s ?? 0) as number;
-    if (latestRootSeq > 2500) {
-      sql.exec("DELETE FROM roots WHERE seq < ? LIMIT 200", latestRootSeq - 2000);
+    if (latestRootSeq > 1200) {
+      sql.exec("DELETE FROM roots WHERE seq < ? LIMIT 500", latestRootSeq - 1000);
     }
 
-    // Events — keep last 5000
+    // Events — keep last 2000 (reduced from 5000)
     const lastAnchorRows = [...sql.exec("SELECT MAX(finalized_seq) as max_seq FROM anchors WHERE status IN ('submitted','confirmed')")];
     const lastAnchoredSeq = (lastAnchorRows[0]?.max_seq ?? 0) as number;
     const maxEvtSeq = [...sql.exec("SELECT MAX(seq) as s FROM events")];
     const latestEvtSeq = (maxEvtSeq[0]?.s ?? 0) as number;
-    if (latestEvtSeq > 6000) {
+    if (latestEvtSeq > 2500) {
       const evtPruneSeq = Math.min(
-        latestEvtSeq - 5000,
-        lastAnchoredSeq > 0 ? lastAnchoredSeq - 1000 : latestEvtSeq - 5000,
+        latestEvtSeq - 2000,
+        lastAnchoredSeq > 0 ? lastAnchoredSeq - 500 : latestEvtSeq - 2000,
       );
-      sql.exec("DELETE FROM events WHERE seq < ? LIMIT 200", evtPruneSeq);
+      sql.exec("DELETE FROM events WHERE seq < ? LIMIT 500", evtPruneSeq);
     }
+
+    // Anchors — keep last 100 (new: previously unbounded)
+    sql.exec("DELETE FROM anchors WHERE rowid IN (SELECT rowid FROM anchors ORDER BY created_at DESC LIMIT -1 OFFSET 100)");
+
+    // Rate limit log — prune older than 1 hour (new: explicit cleanup)
+    sql.exec("DELETE FROM rate_limit_log WHERE timestamp < ? LIMIT 500", oneHourAgo);
+
+    // Pending events — TTL enforcement (safety net for stale pending events)
+    sql.exec("DELETE FROM pending_events WHERE timestamp < ? LIMIT 200", Date.now() - 300_000);
   }
 
   private scheduleAlarm() {
