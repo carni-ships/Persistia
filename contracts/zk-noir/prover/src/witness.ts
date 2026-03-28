@@ -1,51 +1,73 @@
-// Witness generation for the Persistia Noir circuit.
+// Incremental circuit witness generation for Persistia.
 //
-// Transforms Persistia node API responses into the fixed-size witness
-// format that the Noir circuit expects. All arrays are padded to their
-// compile-time maximums with disabled sentinel entries.
-//
-// Schnorr signatures on Grumpkin curve via @aztec/bb.js.
-// Poseidon2 Merkle tree with Field-typed keys/values.
+// Shared logic (Schnorr signing, Poseidon2, full-tree witness, test witness)
+// is imported from zkMetal SDK. This file only contains incremental-circuit-
+// specific code: sparse Merkle tree witness building with sibling paths.
 
 import { createHash } from "crypto";
-import { Barretenberg } from "@aztec/bb.js";
+
+// Re-export shared types and functions from zkMetal SDK
+export {
+  buildMutationWitness,
+  buildSingleBlockWitness,
+  buildTestWitness,
+  computePoseidon2MerkleRoot,
+  emptyMutation,
+  schnorrSign,
+  destroyBb,
+  setMaxMutations,
+  getMaxMutations,
+} from "zkmetal/witness";
+export type { CircuitWitness } from "zkmetal/witness";
+
+// =============================================================================
+// Incremental Circuit Witness (sparse Merkle tree with sibling paths)
+// =============================================================================
 
 const MAX_VALIDATORS = 4;
-const MAX_MUTATIONS = 512;
+const INCREMENTAL_MAX_MUTATIONS = 64;
+const TREE_DEPTH = 20;
 const VK_SIZE = 115;
 const PROOF_SIZE = 449;
 const PUBLIC_INPUTS_SIZE = 8;
 
-// --- Types matching the Noir circuit structs ---
+// --- Types ---
 
 interface NodeSignatureWitness {
-  pubkey_x: string;      // Field as hex string
-  pubkey_y: string;      // Field as hex string
-  signature: number[];   // [u8; 64] -- [s(32) || e(32)]
-  msg: number[];         // [u8; 32] -- SHA-256 hash of block data
+  pubkey_x: string;
+  pubkey_y: string;
+  signature: number[];
+  msg: number[];
   enabled: boolean;
 }
 
 interface StateMutationWitness {
-  key: string;           // Field as hex/decimal string
-  new_value: string;     // Field as hex/decimal string
+  key: string;
+  new_value: string;
   is_delete: boolean;
   enabled: boolean;
 }
 
-export interface CircuitWitness {
-  mutations: StateMutationWitness[];
+interface MerkleUpdateWitness {
+  key: string;
+  old_value: string;
+  new_value: string;
+  siblings: string[];   // [Field; TREE_DEPTH]
+  is_delete: boolean;
+  enabled: boolean;
+}
+
+export interface IncrementalCircuitWitness {
+  updates: MerkleUpdateWitness[];
   mutation_count: number;
   signatures: NodeSignatureWitness[];
   sig_count: number;
   prev_proven_blocks: number;
   prev_genesis_root: string;
-  // Recursive proof inputs (zeroed when ENABLE_RECURSIVE=false in circuit)
   prev_proof: string[];
   prev_vk: string[];
   prev_key_hash: string;
   prev_public_inputs: string[];
-  // Public inputs
   prev_state_root: string;
   new_state_root: string;
   block_number: number;
@@ -77,84 +99,18 @@ function padArray(arr: number[], targetLen: number): number[] {
   return result.slice(0, targetLen);
 }
 
-// --- Poseidon2 Merkle Root (matches Noir circuit) ---
+// --- Schnorr Signing (for incremental witness) ---
+// Import from bb.js directly since we need the internal getBb/dummy sig pattern
 
-function fieldToBytes(field: string | bigint): Uint8Array {
-  const n = typeof field === "string" ? BigInt(field) : field;
-  const hex = n.toString(16).padStart(64, "0");
-  const bytes = new Uint8Array(32);
-  for (let i = 0; i < 32; i++) {
-    bytes[i] = parseInt(hex.substring(i * 2, i * 2 + 2), 16);
-  }
-  return bytes;
-}
-
-async function poseidon2Hash(inputs: (string | bigint)[]): Promise<string> {
-  const bb = await getBb();
-  const fieldInputs = inputs.map(fieldToBytes);
-  const { hash } = await bb.poseidon2Hash({ inputs: fieldInputs });
-  return bytesToHex(hash);
-}
-
-async function poseidon2LeafHash(key: string, value: string): Promise<string> {
-  return poseidon2Hash(["1", key, value]);
-}
-
-async function poseidon2NodeHash(left: string, right: string): Promise<string> {
-  return poseidon2Hash(["2", left, right]);
-}
-
-/** Compute Poseidon2 Merkle root matching the Noir circuit's compute_merkle_root(). */
-export async function computePoseidon2MerkleRoot(
-  mutations: StateMutationWitness[],
-): Promise<string> {
-  const hashes: string[] = [];
-
-  for (const mut of mutations) {
-    if (mut.enabled && !mut.is_delete) {
-      hashes.push(await poseidon2LeafHash(mut.key, mut.new_value));
-    }
-  }
-
-  if (hashes.length === 0) {
-    return poseidon2Hash(["0"]);
-  }
-  if (hashes.length === 1) {
-    return hashes[0];
-  }
-
-  // Pad to next power of 2 with last hash (matches Noir circuit)
-  let p2 = 1;
-  while (p2 < hashes.length) p2 *= 2;
-  const lastHash = hashes[hashes.length - 1];
-  while (hashes.length < p2) hashes.push(lastHash);
-
-  // Binary tree reduction
-  let sz = p2;
-  while (sz > 1) {
-    const half = sz / 2;
-    for (let j = 0; j < half; j++) {
-      hashes[j] = await poseidon2NodeHash(hashes[j * 2], hashes[j * 2 + 1]);
-    }
-    sz = half;
-  }
-
-  return hashes[0];
-}
-
-// --- Schnorr Signing ---
+import { Barretenberg } from "@aztec/bb.js";
 
 let _bb: Barretenberg | null = null;
 
 async function getBb(): Promise<Barretenberg> {
-  if (!_bb) {
-    _bb = await Barretenberg.new();
-  }
+  if (!_bb) _bb = await Barretenberg.new();
   return _bb;
 }
 
-// Noir evaluates all branches at the circuit level. Disabled signature slots
-// still run through schnorr::verify_signature, so we need valid dummy sigs.
 let _dummySig: NodeSignatureWitness | null = null;
 
 async function getDummySignature(): Promise<NodeSignatureWitness> {
@@ -175,27 +131,7 @@ async function getDummySignature(): Promise<NodeSignatureWitness> {
   return _dummySig;
 }
 
-export function emptyMutation(): StateMutationWitness {
-  return {
-    key: "0",
-    new_value: "0",
-    is_delete: false,
-    enabled: false,
-  };
-}
-
-/** Sign a message with a Grumpkin private key using Barretenberg's Schnorr. */
-export async function schnorrSign(
-  privateKey: Uint8Array,
-  message: Uint8Array,
-): Promise<{ s: Uint8Array; e: Uint8Array; pubkey: { x: Uint8Array; y: Uint8Array } }> {
-  const bb = await getBb();
-  const { publicKey } = await bb.schnorrComputePublicKey({ privateKey });
-  const { s, e } = await bb.schnorrConstructSignature({ message, privateKey });
-  return { s, e, pubkey: publicKey };
-}
-
-// --- API Types (from Persistia node) ---
+// --- API Types ---
 
 interface ApiSignature {
   pubkey: string;
@@ -221,7 +157,7 @@ interface ApiBlock {
   active_nodes: number;
 }
 
-// --- Witness Builders ---
+// --- Incremental Witness Builders ---
 
 async function buildSignatureWitness(sig: ApiSignature): Promise<NodeSignatureWitness> {
   const msgBytes = Buffer.from(sig.message, "utf-8");
@@ -245,32 +181,12 @@ async function buildSignatureWitness(sig: ApiSignature): Promise<NodeSignatureWi
   );
 }
 
-export function buildMutationWitness(mut: ApiMutation): StateMutationWitness {
-  // Convert string key/value to Field by hashing with SHA-256 and interpreting
-  // the first 31 bytes as a BN254 field element (to stay within field range)
-  const keyHash = createHash("sha256").update(mut.key).digest();
-  const keyField = "0x00" + keyHash.subarray(0, 31).toString("hex");
-
-  const isDelete = mut.new_value == null;
-  const valueField = isDelete
-    ? "0"
-    : "0x00" + createHash("sha256").update(mut.new_value!).digest().subarray(0, 31).toString("hex");
-
-  return {
-    key: keyField,
-    new_value: valueField,
-    is_delete: isDelete,
-    enabled: true,
-  };
-}
-
 /**
  * Build a mutation witness for the incremental circuit.
  * Key is truncated to TREE_DEPTH bits (20) so it fits as a valid tree index.
  * Value remains a full field element.
  */
 export function buildIncrementalMutationWitness(mut: ApiMutation): StateMutationWitness {
-  // Hash key to 20 bits: take first 3 bytes of SHA-256 and mask to 20 bits
   const keyHash = createHash("sha256").update(mut.key).digest();
   const keyVal = ((keyHash[0] << 12) | (keyHash[1] << 4) | (keyHash[2] >> 4)) & 0xFFFFF;
   const keyField = "0x" + keyVal.toString(16);
@@ -286,161 +202,6 @@ export function buildIncrementalMutationWitness(mut: ApiMutation): StateMutation
     is_delete: isDelete,
     enabled: true,
   };
-}
-
-/** Build witness for a single-block proof. */
-export async function buildSingleBlockWitness(
-  block: ApiBlock,
-  prevStateRoot: string,
-  opts?: {
-    prevProvenBlocks?: number;
-    prevGenesisRoot?: string;
-    prevProof?: string[];
-    prevVk?: string[];
-    prevKeyHash?: string;
-    prevPublicInputs?: string[];
-  },
-): Promise<CircuitWitness> {
-  const sigs: NodeSignatureWitness[] = [];
-  for (const sig of block.signatures) {
-    // Skip signatures without Schnorr fields (peers whose keys aren't available)
-    if (sig.grumpkin_x && sig.grumpkin_y && sig.schnorr_s && sig.schnorr_e) {
-      sigs.push(await buildSignatureWitness(sig));
-    }
-  }
-  const dummy = await getDummySignature();
-  while (sigs.length < MAX_VALIDATORS) sigs.push({ ...dummy });
-
-  const muts = block.mutations.map(buildMutationWitness);
-  while (muts.length < MAX_MUTATIONS) muts.push(emptyMutation());
-
-  const mutSlice = muts.slice(0, MAX_MUTATIONS);
-
-  // Compute Poseidon2 Merkle root to match circuit's computed root
-  const computedRoot = await computePoseidon2MerkleRoot(mutSlice);
-
-  return {
-    mutations: mutSlice,
-    mutation_count: block.mutations.length,
-    signatures: sigs.slice(0, MAX_VALIDATORS),
-    sig_count: sigs.filter(s => s.enabled).length,
-    prev_proven_blocks: opts?.prevProvenBlocks ?? 0,
-    prev_genesis_root: opts?.prevGenesisRoot ?? "0",
-    prev_proof: opts?.prevProof ?? new Array(PROOF_SIZE).fill("0"),
-    prev_vk: opts?.prevVk ?? new Array(VK_SIZE).fill("0"),
-    prev_key_hash: opts?.prevKeyHash ?? "0",
-    prev_public_inputs: opts?.prevPublicInputs ?? new Array(PUBLIC_INPUTS_SIZE).fill("0"),
-    prev_state_root: prevStateRoot,
-    new_state_root: computedRoot,
-    block_number: block.block_number,
-    active_nodes: block.active_nodes,
-  };
-}
-
-/**
- * Build a test witness with generated Schnorr signatures.
- * Uses random Grumpkin keys -- for benchmarking and testing only.
- */
-export async function buildTestWitness(opts?: {
-  numValidators?: number;
-  numMutations?: number;
-  blockNumber?: number;
-}): Promise<CircuitWitness> {
-  const bb = await getBb();
-  const numValidators = opts?.numValidators ?? 1;
-  const numMutations = opts?.numMutations ?? 1;
-  const blockNumber = opts?.blockNumber ?? 1;
-
-  const sigs: NodeSignatureWitness[] = [];
-  const blockMsg = Buffer.from(`block:${blockNumber}`, "utf-8");
-  const msgHash = sha256Hash(blockMsg);
-
-  for (let i = 0; i < numValidators; i++) {
-    const privateKey = new Uint8Array(32);
-    privateKey[31] = i + 1;
-
-    const { publicKey } = await bb.schnorrComputePublicKey({ privateKey });
-    const { s, e } = await bb.schnorrConstructSignature({
-      message: new Uint8Array(msgHash),
-      privateKey,
-    });
-
-    sigs.push({
-      pubkey_x: bytesToHex(publicKey.x),
-      pubkey_y: bytesToHex(publicKey.y),
-      signature: [...Array.from(s), ...Array.from(e)],
-      msg: msgHash,
-      enabled: true,
-    });
-  }
-  const dummy = await getDummySignature();
-  while (sigs.length < MAX_VALIDATORS) sigs.push({ ...dummy });
-
-  const muts: StateMutationWitness[] = [];
-  for (let i = 0; i < numMutations; i++) {
-    muts.push({
-      key: `${i + 1}`,
-      new_value: `${(i + 1) * 100}`,
-      is_delete: false,
-      enabled: true,
-    });
-  }
-  while (muts.length < MAX_MUTATIONS) muts.push(emptyMutation());
-
-  const mutSlice = muts.slice(0, MAX_MUTATIONS);
-
-  // Compute Poseidon2 Merkle root to match circuit's computed root
-  const computedRoot = await computePoseidon2MerkleRoot(mutSlice);
-
-  return {
-    mutations: mutSlice,
-    mutation_count: numMutations,
-    signatures: sigs.slice(0, MAX_VALIDATORS),
-    sig_count: numValidators,
-    prev_proven_blocks: 0,
-    prev_genesis_root: "0",
-    prev_proof: new Array(PROOF_SIZE).fill("0"),
-    prev_vk: new Array(VK_SIZE).fill("0"),
-    prev_key_hash: "0",
-    prev_public_inputs: new Array(PUBLIC_INPUTS_SIZE).fill("0"),
-    prev_state_root: "0xaa",
-    new_state_root: computedRoot,
-    block_number: blockNumber,
-    active_nodes: numValidators,
-  };
-}
-
-// =============================================================================
-// Incremental Circuit Witness (sparse Merkle tree with sibling paths)
-// =============================================================================
-
-const INCREMENTAL_MAX_MUTATIONS = 64;
-const TREE_DEPTH = 20;
-
-interface MerkleUpdateWitness {
-  key: string;
-  old_value: string;
-  new_value: string;
-  siblings: string[];   // [Field; TREE_DEPTH]
-  is_delete: boolean;
-  enabled: boolean;
-}
-
-export interface IncrementalCircuitWitness {
-  updates: MerkleUpdateWitness[];
-  mutation_count: number;
-  signatures: NodeSignatureWitness[];
-  sig_count: number;
-  prev_proven_blocks: number;
-  prev_genesis_root: string;
-  prev_proof: string[];
-  prev_vk: string[];
-  prev_key_hash: string;
-  prev_public_inputs: string[];
-  prev_state_root: string;
-  new_state_root: string;
-  block_number: number;
-  active_nodes: number;
 }
 
 export function emptyMerkleUpdate(): MerkleUpdateWitness {
@@ -472,7 +233,7 @@ export async function buildIncrementalWitness(
     prevPublicInputs?: string[];
   },
 ): Promise<IncrementalCircuitWitness> {
-  // Build signature witnesses (same as full-tree)
+  // Build signature witnesses
   const sigs: NodeSignatureWitness[] = [];
   for (const sig of block.signatures) {
     if (sig.grumpkin_x && sig.grumpkin_y && sig.schnorr_s && sig.schnorr_e) {
@@ -493,11 +254,15 @@ export async function buildIncrementalWitness(
   }));
   while (updates.length < INCREMENTAL_MAX_MUTATIONS) updates.push(emptyMerkleUpdate());
 
+  // Use Schnorr-capable node count for quorum check — nodes without Schnorr sigs
+  // can't participate in ZK verification
+  const schnorrCapableCount = sigs.filter(s => s.enabled).length;
+
   return {
     updates: updates.slice(0, INCREMENTAL_MAX_MUTATIONS),
     mutation_count: merkleUpdates.length,
     signatures: sigs.slice(0, MAX_VALIDATORS),
-    sig_count: sigs.filter(s => s.enabled).length,
+    sig_count: schnorrCapableCount,
     prev_proven_blocks: opts?.prevProvenBlocks ?? 0,
     prev_genesis_root: opts?.prevGenesisRoot ?? "0",
     prev_proof: opts?.prevProof ?? new Array(PROOF_SIZE).fill("0"),
@@ -507,14 +272,6 @@ export async function buildIncrementalWitness(
     prev_state_root: prevRoot,
     new_state_root: newRoot,
     block_number: block.block_number,
-    active_nodes: block.active_nodes,
+    active_nodes: Math.max(schnorrCapableCount, 1),
   };
-}
-
-/** Clean up Barretenberg instance. */
-export async function destroyBb(): Promise<void> {
-  if (_bb) {
-    await _bb.destroy();
-    _bb = null;
-  }
 }

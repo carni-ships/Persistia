@@ -63,6 +63,9 @@ export class PersistiaWorldV4 implements DurableObject {
   // Lightweight rate-limiter per WebSocket — uses WeakMap so closed sockets are GC'd automatically
   private _wsRateLimit: WeakMap<WebSocket, { msgCount: number; msgWindowStart: number }> = new WeakMap();
 
+  // ─── Table subscription version tracking (SpacetimeDB-style delta sync) ──
+  private _tableVersion: number = 0; // monotonic counter, incremented on every table mutation
+
   // Legacy state (backward compat when consensus off)
   currentRoot: string = "";
   latestSeq: number = 0;
@@ -541,9 +544,10 @@ export class PersistiaWorldV4 implements DurableObject {
         } catch {}
       }
 
-      // One-time: fix stale peer URLs that point to base origin without shard params
-      // (cleanup for pre-shard-routing peer records from same deployment)
-      if (this.shardName !== "global-world" && !this.env.NODE_URL) {
+      this.gossipManager.setIdentity(this.nodeIdentity);
+
+      // One-time migration: fix stale peer URLs that point to base origin without shard params
+      if (this.shardName !== "global-world" && !this.env.NODE_URL && !this.getKV("_peer_url_fixed")) {
         const selfOrigin = (() => { try { return new URL(this.nodeIdentity.url).origin; } catch { return ""; } })();
         if (selfOrigin) {
           const stalePeers = [...sql.exec(
@@ -551,21 +555,41 @@ export class PersistiaWorldV4 implements DurableObject {
             selfOrigin, this.nodeIdentity.pubkey,
           )] as any[];
           if (stalePeers.length > 0) {
-            // Remove stale peers — they'll be re-discovered via sibling seeding
             for (const p of stalePeers) {
               sql.exec("DELETE FROM gossip_peers WHERE pubkey = ?", p.pubkey);
             }
-            console.log(`Removed ${stalePeers.length} stale same-origin peers without shard params`);
-            // Re-seed siblings
+            // Re-seed siblings (identity is set, so self-filtering works)
             const siblingShards = (this.env.SHARD_NAMES || "node-1,node-2,node-3")
               .split(",").map((s: string) => s.trim()).filter((s: string) => s && s !== this.shardName);
             const siblingUrls = siblingShards.map((s: string) => `${selfOrigin}/?shard=${s}`);
             this.gossipManager.bootstrapFromSeeds(siblingUrls).catch(() => {});
           }
+          // Also remove self from peer list if accidentally added
+          sql.exec("DELETE FROM gossip_peers WHERE pubkey = ?", this.nodeIdentity.pubkey);
+          this.setKV("_peer_url_fixed", "1");
         }
       }
 
-      this.gossipManager.setIdentity(this.nodeIdentity);
+      // Ensure sibling shards are always in peer list (prevents gossip isolation after hibernation)
+      if (this.shardName !== "global-world" && !this.env.NODE_URL) {
+        const peerCount = ([...sql.exec("SELECT COUNT(*) as c FROM gossip_peers WHERE pubkey != ?", this.nodeIdentity.pubkey)][0]?.c ?? 0) as number;
+        if (peerCount < 2) {
+          const selfOrigin = (() => { try { return new URL(this.nodeIdentity.url).origin; } catch { return ""; } })();
+          if (selfOrigin) {
+            const siblingShards = (this.env.SHARD_NAMES || "node-1,node-2,node-3")
+              .split(",").map((s: string) => s.trim()).filter((s: string) => s && s !== this.shardName);
+            for (const sib of siblingShards) {
+              const sibUrl = `${selfOrigin}/?shard=${sib}`;
+              // Insert a placeholder peer — gossipSync will discover the real pubkey on first contact
+              sql.exec(
+                `INSERT OR IGNORE INTO gossip_peers (pubkey, url, last_seen, last_sync_round, failures, added_at)
+                 VALUES (?, ?, ?, 0, 0, ?)`,
+                `pending-${sib}`, sibUrl, Date.now(), Date.now(),
+              );
+            }
+          }
+        }
+      }
 
       // Service attestation manager (needs node identity for signing)
       this.attestationMgr = new ServiceAttestationManager(sql, this.nodeIdentity);
@@ -3828,7 +3852,7 @@ export class PersistiaWorldV4 implements DurableObject {
       case "/gossip/sync/hashes": {
         const afterRound = parseInt(url.searchParams.get("after_round") || "0");
         const limit = Math.min(parseInt(url.searchParams.get("limit") || "5000"), 5000);
-        const hashes = [...sql.exec(
+        const hashes = [...this.state.storage.sql.exec(
           "SELECT hash, round FROM dag_vertices WHERE round >= ? ORDER BY round ASC, hash ASC LIMIT ?",
           afterRound, limit,
         )].map((r: any) => ({ h: r.hash, r: r.round }));
@@ -3849,7 +3873,7 @@ export class PersistiaWorldV4 implements DurableObject {
           return this.json({ error: "Provide array of up to 500 hashes" }, 400);
         }
         const placeholders = requestedHashes.map(() => "?").join(",");
-        const vertices = [...sql.exec(
+        const vertices = [...this.state.storage.sql.exec(
           `SELECT hash, author, round, events_json, refs_json, signature, timestamp FROM dag_vertices WHERE hash IN (${placeholders})`,
           ...requestedHashes,
         )].map((r: any) => ({
@@ -3866,7 +3890,7 @@ export class PersistiaWorldV4 implements DurableObject {
         // Return chain weight from a given seq for fork comparison.
         // Weight = total committed rounds × avg participating validators since fork point.
         const sinceSeq = parseInt(url.searchParams.get("since_seq") || "0");
-        const commits = [...sql.exec(
+        const commits = [...this.state.storage.sql.exec(
           "SELECT round, signatures_json FROM dag_commits WHERE round >= ? ORDER BY round ASC",
           // Map seq to approximate round — commits table is indexed by round
           Math.max(0, this.lastCommittedRound - (this.finalizedSeq - sinceSeq)),
@@ -4523,6 +4547,75 @@ export class PersistiaWorldV4 implements DurableObject {
         } catch {}
         ws.send(JSON.stringify({ type: "subscribed", channels: Array.from(existing.channels) }));
       }
+      return;
+    }
+
+    // ─── SpacetimeDB-style table subscriptions ──────────────────────────
+    // Subscribe to specific tables and receive initial snapshot + row-level deltas.
+    // Usage: { type: "subscribe_table", tables: ["blocks", "inventory"], filter?: { pubkey: "..." } }
+    if (msg.type === "subscribe_table") {
+      if (Array.isArray(msg.tables)) {
+        const existing = this._getWsTags(ws);
+        const filterPubkey = msg.filter?.pubkey || existing.pubkey;
+        for (const table of msg.tables) {
+          if (["blocks", "inventory", "consensus_events", "ownership"].includes(table)) {
+            existing.channels.add(`tbl:${table}`);
+          }
+        }
+        try {
+          const tags = Array.from(existing.channels).map(ch => `ch:${ch}`);
+          if (existing.isValidator) tags.push("val:true");
+          if (existing.pubkey) tags.push(`pk:${existing.pubkey}`);
+          this.state.setTags(ws, tags);
+        } catch {}
+
+        // Send initial snapshot for each subscribed table
+        const sql = this.state.storage.sql;
+        const snapshots: Record<string, any[]> = {};
+        for (const table of msg.tables) {
+          switch (table) {
+            case "blocks":
+              snapshots.blocks = [...sql.exec("SELECT x, z, block_type, placed_by FROM blocks")];
+              break;
+            case "inventory":
+              if (filterPubkey) {
+                snapshots.inventory = [...sql.exec("SELECT item, count FROM inventory WHERE pubkey = ?", filterPubkey)];
+              } else {
+                snapshots.inventory = [...sql.exec("SELECT pubkey, item, count FROM inventory")];
+              }
+              break;
+            case "consensus_events": {
+              const limit = Math.min(msg.limit || 100, 500);
+              snapshots.consensus_events = [...sql.exec(
+                "SELECT consensus_seq, event_hash, round, finalized_at FROM consensus_events ORDER BY consensus_seq DESC LIMIT ?", limit,
+              )];
+              break;
+            }
+            case "ownership":
+              if (filterPubkey) {
+                snapshots.ownership = [...sql.exec("SELECT asset_id, metadata FROM ownership WHERE owner_pubkey = ?", filterPubkey)];
+              } else {
+                snapshots.ownership = [...sql.exec("SELECT asset_id, owner_pubkey, metadata FROM ownership LIMIT 1000")];
+              }
+              break;
+          }
+        }
+        ws.send(JSON.stringify({
+          type: "table.snapshot",
+          tables: snapshots,
+          version: this._tableVersion,
+          subscribed: msg.tables.filter((t: string) => ["blocks", "inventory", "consensus_events", "ownership"].includes(t)),
+        }));
+      }
+      return;
+    }
+
+    // ─── SpacetimeDB-style reducers ─────────────────────────────────────
+    // Typed, named entry points instead of generic /event POST.
+    // Usage: { type: "reduce", reducer: "place_block", args: { x: 5, z: 10, block_type: 1 }, request_id?: "abc" }
+    if (msg.type === "reduce") {
+      const result = await this.handleReducer(ws, msg.reducer, msg.args || {}, msg.request_id);
+      ws.send(JSON.stringify({ type: "reduce.result", reducer: msg.reducer, request_id: msg.request_id, ...result }));
       return;
     }
 
@@ -5365,6 +5458,13 @@ export class PersistiaWorldV4 implements DurableObject {
       );
     }
 
+    // Delta sync: notify table subscribers of newly finalized events
+    for (const row of consensusRows) {
+      this.emitTableDelta("consensus_events", "insert", {
+        event_hash: row[0], vertex_hash: row[1], round: row[2], finalized_at: row[3],
+      });
+    }
+
     // Insert all legacy events rows in a single multi-row VALUES statement.
     if (eventRows.length > 0) {
       const placeholders = eventRows.map(() => "(?, ?, ?, ?, ?, ?)").join(", ");
@@ -5899,6 +5999,9 @@ export class PersistiaWorldV4 implements DurableObject {
         this.addToInventory(pubkey, this.blockTypeToItem(payload.block), -1);
         this.stateTree.markDirty(`block:${payload.x},${payload.z}`, `${payload.block}:${pubkey}`);
         this.stateTree.markDirty(`inv:${pubkey}:${this.blockTypeToItem(payload.block)}`, null);
+        // Delta sync: push block + inventory changes to table subscribers
+        this.emitTableDelta("blocks", "insert", { x: payload.x, z: payload.z, block_type: payload.block, placed_by: pubkey });
+        this.emitTableDelta("inventory", "update", { pubkey, item: this.blockTypeToItem(payload.block), count: this.getItemCount(pubkey, this.blockTypeToItem(payload.block)) });
         await this.rewardGameAction(pubkey);
         break;
       case "break": {
@@ -5909,15 +6012,22 @@ export class PersistiaWorldV4 implements DurableObject {
           sql.exec("DELETE FROM blocks WHERE x = ? AND z = ?", payload.x, payload.z);
           this.addToInventory(pubkey, this.blockTypeToItem(rows[0].block_type as number), 1);
           this.stateTree.markDirty(`block:${payload.x},${payload.z}`, null);
+          // Delta sync: push block removal + inventory gain
+          this.emitTableDelta("blocks", "delete", { x: payload.x, z: payload.z });
+          const item = this.blockTypeToItem(rows[0].block_type as number);
+          this.emitTableDelta("inventory", "update", { pubkey, item, count: this.getItemCount(pubkey, item) });
         }
         await this.rewardGameAction(pubkey);
         break;
       }
       case "transfer":
         sql.exec("UPDATE ownership SET owner_pubkey = ? WHERE asset_id = ?", payload.toPubkey, payload.assetId);
+        this.emitTableDelta("ownership", "update", { asset_id: payload.assetId, owner_pubkey: payload.toPubkey });
         break;
       case "craft":
         this.applyCraft(pubkey, payload.recipe);
+        // Delta sync: push all changed inventory items
+        this.emitCraftDeltas(pubkey, payload.recipe);
         await this.rewardGameAction(pubkey);
         break;
       case "token.transfer": {
@@ -6681,7 +6791,7 @@ export class PersistiaWorldV4 implements DurableObject {
   };
 
   private validateCraftRecipe(pubkey: string, recipe: string): { ok: boolean; error?: string } {
-    const cost = PersistiaWorld.RECIPES[recipe];
+    const cost = PersistiaWorldV4.RECIPES[recipe];
     if (!cost) return { ok: false, error: `Unknown recipe: ${recipe}` };
     for (const [item, needed] of Object.entries(cost)) {
       if (this.getItemCount(pubkey, item) < needed) {
@@ -6692,10 +6802,19 @@ export class PersistiaWorldV4 implements DurableObject {
   }
 
   private applyCraft(pubkey: string, recipe: string) {
-    const cost = PersistiaWorld.RECIPES[recipe];
+    const cost = PersistiaWorldV4.RECIPES[recipe];
     if (!cost) return;
     for (const [item, needed] of Object.entries(cost)) this.addToInventory(pubkey, item, -needed);
     this.addToInventory(pubkey, recipe, 1);
+  }
+
+  private emitCraftDeltas(pubkey: string, recipe: string) {
+    const cost = PersistiaWorldV4.RECIPES[recipe];
+    if (!cost) return;
+    for (const item of Object.keys(cost)) {
+      this.emitTableDelta("inventory", "update", { pubkey, item, count: this.getItemCount(pubkey, item) });
+    }
+    this.emitTableDelta("inventory", "update", { pubkey, item: recipe, count: this.getItemCount(pubkey, recipe) });
   }
 
   private blockTypeToItem(blockType: number): string {
@@ -6704,6 +6823,117 @@ export class PersistiaWorldV4 implements DurableObject {
 
   private itemToBlockType(item: string): number {
     return { dirt: 1, stone: 2, wood: 3, grass: 4, house: 5, wall: 6, bridge: 7 }[item] || 0;
+  }
+
+  // ─── SpacetimeDB-style Reducers ──────────────────────────────────────
+  // Typed named handlers that validate args and map to event submission.
+  // Each reducer returns { ok, error?, energy_used? } and emits table deltas.
+
+  private static readonly REDUCERS: Record<string, { required: string[]; eventType: string }> = {
+    place_block:    { required: ["x", "z", "block_type"], eventType: "place" },
+    break_block:    { required: ["x", "z"], eventType: "break" },
+    transfer_token: { required: ["to", "amount"], eventType: "token.transfer" },
+    craft_item:     { required: ["recipe"], eventType: "craft" },
+    transfer_asset: { required: ["assetId", "toPubkey"], eventType: "transfer" },
+    deploy_contract:{ required: ["wasm_b64"], eventType: "contract.deploy" },
+    call_contract:  { required: ["contract", "method"], eventType: "contract.call" },
+  };
+
+  private async handleReducer(
+    ws: WebSocket,
+    reducerName: string,
+    args: Record<string, any>,
+    requestId?: string,
+  ): Promise<{ ok: boolean; error?: string; pending?: boolean; seq?: number }> {
+    const spec = PersistiaWorldV4.REDUCERS[reducerName];
+    if (!spec) {
+      return { ok: false, error: `Unknown reducer: ${reducerName}. Available: ${Object.keys(PersistiaWorldV4.REDUCERS).join(", ")}` };
+    }
+
+    // Validate required args
+    for (const key of spec.required) {
+      if (args[key] === undefined) {
+        return { ok: false, error: `Missing required arg: ${key}` };
+      }
+    }
+
+    // Extract pubkey from WS tags (must have joined first)
+    const { pubkey } = this._getWsTags(ws);
+    if (!pubkey) {
+      return { ok: false, error: "Must send 'join' with pubkey before calling reducers" };
+    }
+
+    // Map reducer args to event payload
+    let payload: any;
+    switch (reducerName) {
+      case "place_block":
+        payload = { x: args.x, z: args.z, block: args.block_type };
+        break;
+      case "break_block":
+        payload = { x: args.x, z: args.z };
+        break;
+      case "transfer_token":
+        payload = { to: args.to, amount: args.amount, denom: args.denom || "PERSIST" };
+        break;
+      case "craft_item":
+        payload = { recipe: args.recipe };
+        break;
+      default:
+        payload = args;
+    }
+
+    // Build a signed event shell (signature comes from the client's join session)
+    // For reducers, the client must provide a signature over the reducer call
+    const event: SignedEvent = {
+      type: spec.eventType,
+      payload,
+      pubkey,
+      signature: args._signature || "",
+      timestamp: Date.now(),
+    };
+
+    // If no signature provided, use the pending pool directly (trust WS auth)
+    if (!event.signature) {
+      // In reducer mode, trust the authenticated WS connection
+      const eventHash = await computeEventHash(event);
+      const ruleCheck = this.validateRules(event);
+      if (!ruleCheck.ok) return ruleCheck;
+
+      if (CONSENSUS_ENABLED && this.getActiveNodeCount() >= this.getNetworkParam("min_nodes_for_consensus", MIN_NODES_FOR_CONSENSUS)) {
+        this.state.storage.sql.exec(
+          "INSERT OR IGNORE INTO pending_events (hash, type, payload, pubkey, signature, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+          eventHash, event.type, JSON.stringify(payload), pubkey, "reducer:" + reducerName, event.timestamp,
+        );
+        this.broadcast({ type: "pending", event: { type: event.type, payload, pubkey, hash: eventHash } });
+        return { ok: true, pending: true };
+      } else {
+        return this.directApplyEvent(event, eventHash);
+      }
+    }
+
+    return this.receiveClientEvent(event);
+  }
+
+  // ─── Table Delta Emission ──────────────────────────────────────────────
+  // Push row-level changes to clients subscribed to specific tables.
+  // Called after applyEvent mutates state.
+
+  private emitTableDelta(table: string, op: "insert" | "update" | "delete", row: Record<string, any>, filterKey?: { field: string; value: any }) {
+    this._tableVersion++;
+    const delta = {
+      type: "table.delta",
+      table,
+      op,
+      row,
+      version: this._tableVersion,
+    };
+    // Send to all clients subscribed to this table
+    const sockets = this.state.getWebSockets(`ch:tbl:${table}`);
+    if (sockets.length === 0) return;
+    const str = JSON.stringify(delta);
+    for (const ws of sockets) {
+      try { ws.send(str); } catch {}
+    }
   }
 
   // ─── Broadcast ──────────────────────────────────────────────────────────

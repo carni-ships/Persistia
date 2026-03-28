@@ -1,0 +1,50 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicholasgasior/tauri/tauri-v2.0.0-beta/packages/tauri/schema.json",
+  "productName": "Persistia",
+  "version": "0.1.0",
+  "identifier": "com.persistia.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Persistia",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 600
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; connect-src 'self' http://localhost:* https://*.workers.dev wss://*.workers.dev; img-src 'self' data:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["dmg", "app"],
+    "externalBin": [
+      "bin/node",
+      "bin/bb"
+    ],
+    "resources": [
+      "resources/circuits/*",
+      "resources/prover/**/*",
+      "resources/scripts/*"
+    ],
+    "icon": [
+      "icons/icon.png"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "13.0"
+    }
+  },
+  "plugins": {
+    "shell": {
+      "open": true
+    }
+  }
+}

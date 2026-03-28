@@ -1,0 +1,13 @@
+{
+  "name": "persistia-noir-prover",
+  "version": "0.1.0",
+  "type": "module",
+  "dependencies": {
+    "zkmetal": "file:./vendor/zkmetal",
+    "@aztec/bb.js": "4.1.2",
+    "@noir-lang/noir_js": "1.0.0-beta.19",
+    "@noir-lang/types": "1.0.0-beta.19",
+    "@noir-lang/acvm_js": "1.0.0-beta.19",
+    "tsx": "^4.21.0"
+  }
+}
