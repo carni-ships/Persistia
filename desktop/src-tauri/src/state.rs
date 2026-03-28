@@ -50,11 +50,11 @@ impl Default for AppConfig {
         Self {
             node_url: "https://persistia.carnation-903.workers.dev".into(),
             shard: "node-1".into(),
-            prover_mode: "watch".into(),
-            prover_interval: 10,
+            prover_mode: "watch-incremental".into(),
+            prover_interval: 5,
             prover_workers: 6,
             prover_native: true,
-            prover_recursive: false,
+            prover_recursive: true,
             generator_agents: 3,
             generator_interval: 500,
         }

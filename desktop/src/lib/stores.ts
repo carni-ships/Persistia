@@ -21,11 +21,11 @@ export const anchorStatus = writable<AnchorStatus | null>(null);
 export const config = writable<AppConfig>({
   node_url: "https://persistia.carnation-903.workers.dev",
   shard: "node-1",
-  prover_mode: "watch",
-  prover_interval: 10,
+  prover_mode: "watch-incremental",
+  prover_interval: 5,
   prover_workers: 6,
   prover_native: true,
-  prover_recursive: false,
+  prover_recursive: true,
   generator_agents: 3,
   generator_interval: 500,
 });
