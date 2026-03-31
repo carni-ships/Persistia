@@ -46,6 +46,10 @@ import type { ServiceRequestPayload, ServiceResponsePayload } from "./gossip";
 import { ProviderRegistry, type ProviderRecord } from "./provider-registry";
 import { ProviderProxy } from "./provider-proxy";
 import { SettlementBatcher } from "./settlement";
+import { QueueManager, type DurableQueue, type MessageHandler } from "./durable-queue";
+import { VirtualFilesystem, type VFSMount } from "./vfs";
+import { TranscriptManager } from "./transcript";
+import { LLMMeteringManager } from "./llm-metering";
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -86,6 +90,10 @@ export class PersistiaWorldV4 implements DurableObject {
   providerRegistry!: ProviderRegistry;
   providerProxy!: ProviderProxy;
   settlementBatcher!: SettlementBatcher;
+  queueManager!: QueueManager;
+  vfs!: VirtualFilesystem;
+  transcriptManager!: TranscriptManager;
+  llmMetering!: LLMMeteringManager;
   shardName: string = "global-world";
   currentRound: number = 0;
   finalizedSeq: number = 0;
@@ -507,6 +515,50 @@ export class PersistiaWorldV4 implements DurableObject {
     AccountManager.initBurnTable(sql);
     AccountManager.initHoldsTable(sql);
     ProviderRegistry.initTables(sql);
+    QueueManager.initTables(sql);
+    VirtualFilesystem.initTables(sql);
+    TranscriptManager.initTables(sql);
+    LLMMeteringManager.initTables(sql);
+
+    // Durable queue manager (replaces bespoke outbox/retry patterns)
+    this.queueManager = new QueueManager(sql);
+
+    // Universal transcript (hash-chained audit trail for all interactions)
+    this.transcriptManager = new TranscriptManager(sql);
+
+    // LLM metering (token usage, cost, latency tracking)
+    this.llmMetering = new LLMMeteringManager(sql);
+
+    // Virtual filesystem (unified mount layer over R2, SQLite, KV)
+    const vfsMounts: VFSMount[] = [
+      {
+        path: "/state",
+        backend: "kv",
+        readOnly: true,
+        config: { sql, table: "consensus_state", keyColumn: "key", valueColumn: "value" },
+      },
+      {
+        path: "/chain/blocks",
+        backend: "sqlite",
+        readOnly: true,
+        config: { sql, table: "blocks", keyColumn: "block_number", valueColumn: "block_data" },
+      },
+      {
+        path: "/chain/contracts",
+        backend: "sqlite",
+        readOnly: true,
+        config: { sql, table: "contract_state", keyColumn: "key", valueColumn: "value" },
+      },
+    ];
+    // Mount R2 buckets if available
+    if (this.env.BLOB_STORE) {
+      vfsMounts.push(
+        { path: "/proofs", backend: "r2", readOnly: false, config: { bucket: this.env.BLOB_STORE, keyPrefix: "proofs/" } },
+        { path: "/snapshots", backend: "r2", readOnly: false, config: { bucket: this.env.BLOB_STORE, keyPrefix: "snapshots/" } },
+        { path: "/chunks", backend: "r2", readOnly: false, config: { bucket: this.env.BLOB_STORE, keyPrefix: "chunks/" } },
+      );
+    }
+    this.vfs = new VirtualFilesystem(vfsMounts, sql);
 
     // External provider marketplace
     this.providerRegistry = new ProviderRegistry(sql, this.accountManager);
@@ -997,6 +1049,20 @@ export class PersistiaWorldV4 implements DurableObject {
       if (url.pathname.startsWith("/providers/")) {
         return this.handleProviderRoute(req, url);
       }
+      // ─── Agent OS routes (VFS, transcript, metering, queues) ─────────────
+      if (url.pathname.startsWith("/vfs/")) {
+        return this.handleVFSRoute(req, url);
+      }
+      if (url.pathname.startsWith("/transcript/")) {
+        return this.handleTranscriptRoute(req, url);
+      }
+      if (url.pathname.startsWith("/metering/")) {
+        return this.handleMeteringRoute(req, url);
+      }
+      if (url.pathname.startsWith("/queues/")) {
+        return this.handleQueueRoute(req, url);
+      }
+
       if (url.pathname === "/app-serve") {
         return this.handleAppServe(req, url);
       }
@@ -1057,6 +1123,7 @@ export class PersistiaWorldV4 implements DurableObject {
             if (hold.ok) holdId = hold.hold_id || null;
           }
 
+          const proxyStartTime = Date.now();
           const proxyResult = await this.providerProxy.routeToProvider({
             serviceType: serviceId,
             model,
@@ -1074,6 +1141,35 @@ export class PersistiaWorldV4 implements DurableObject {
             } else if (holdId) {
               this.accountManager.releaseHold(holdId);
             }
+
+            // LLM metering: record external provider call
+            try {
+              const meterClone = response.clone();
+              const meterBody = await meterClone.json().catch(() => null);
+              const usage = LLMMeteringManager.extractUsage(meterBody);
+              const elapsed = Date.now() - proxyStartTime;
+              this.llmMetering.record({
+                timestamp: Date.now(),
+                service: serviceId,
+                model: model || "",
+                provider_id: proxyResult.provider?.provider_id || null,
+                source: "external",
+                request_id: response.headers.get("X-Attestation-Id") || "",
+                prompt_tokens: usage?.prompt_tokens || 0,
+                completion_tokens: usage?.completion_tokens || 0,
+                total_tokens: usage?.total_tokens || 0,
+                estimated_cost_persist: String(proxyResult.provider?.price || "0"),
+                actual_cost_persist: String(proxyResult.provider?.price || "0"),
+                price_per_1k_tokens: "0",
+                latency_ms: elapsed,
+                time_to_first_token_ms: null,
+                http_status: response.status,
+                error: response.ok ? null : `HTTP ${response.status}`,
+                attestation_id: response.headers.get("X-Attestation-Id") || null,
+                buyer_address: buyerAddress,
+                shard: this.shardName,
+              });
+            } catch {}
           } else {
             // No external providers — release hold and fall back to local Workers AI
             if (holdId) this.accountManager.releaseHold(holdId);
@@ -1084,18 +1180,76 @@ export class PersistiaWorldV4 implements DurableObject {
               headers: req.headers,
               body: requestBodyText,
             });
+            const localStart = Date.now();
             response = await dispatchApiRoute(
               url.pathname, localReq,
               { AI: this.env.AI, BROWSER: this.env.BROWSER },
               this.attestationMgr,
             );
+
+            // LLM metering: record local Workers AI call
+            try {
+              const meterClone = response.clone();
+              const meterBody = await meterClone.json().catch(() => null);
+              const usage = LLMMeteringManager.extractWorkersAIUsage(meterBody) || LLMMeteringManager.extractUsage(meterBody);
+              this.llmMetering.record({
+                timestamp: Date.now(),
+                service: serviceId,
+                model: model || "workers-ai",
+                provider_id: null,
+                source: "local",
+                request_id: response.headers.get("X-Attestation-Id") || "",
+                prompt_tokens: usage?.prompt_tokens || 0,
+                completion_tokens: usage?.completion_tokens || 0,
+                total_tokens: usage?.total_tokens || 0,
+                estimated_cost_persist: "0",
+                actual_cost_persist: "0",
+                price_per_1k_tokens: "0",
+                latency_ms: Date.now() - localStart,
+                time_to_first_token_ms: null,
+                http_status: response.status,
+                error: response.ok ? null : `HTTP ${response.status}`,
+                attestation_id: response.headers.get("X-Attestation-Id") || null,
+                buyer_address: buyerAddress,
+                shard: this.shardName,
+              });
+            } catch {}
           }
         } else {
+          const localStart = Date.now();
           response = await dispatchApiRoute(
             url.pathname, req,
             { AI: this.env.AI, BROWSER: this.env.BROWSER },
             this.attestationMgr,
           );
+
+          // LLM metering: record local call (no proxy available)
+          try {
+            const meterClone = response.clone();
+            const meterBody = await meterClone.json().catch(() => null);
+            const usage = LLMMeteringManager.extractWorkersAIUsage(meterBody) || LLMMeteringManager.extractUsage(meterBody);
+            this.llmMetering.record({
+              timestamp: Date.now(),
+              service: serviceId,
+              model: "workers-ai",
+              provider_id: null,
+              source: "local",
+              request_id: response.headers.get("X-Attestation-Id") || "",
+              prompt_tokens: usage?.prompt_tokens || 0,
+              completion_tokens: usage?.completion_tokens || 0,
+              total_tokens: usage?.total_tokens || 0,
+              estimated_cost_persist: "0",
+              actual_cost_persist: "0",
+              price_per_1k_tokens: "0",
+              latency_ms: Date.now() - localStart,
+              time_to_first_token_ms: null,
+              http_status: response.status,
+              error: response.ok ? null : `HTTP ${response.status}`,
+              attestation_id: response.headers.get("X-Attestation-Id") || null,
+              buyer_address: mppResult.receipt?.payer || "",
+              shard: this.shardName,
+            });
+          } catch {}
         }
 
         // If federation requested and response is OK, initiate multi-node verification
@@ -1697,6 +1851,16 @@ export class PersistiaWorldV4 implements DurableObject {
         // Fraud proof: finalize expired challenge windows + resolve timed-out challenges
         this.processFraudProofCycle();
 
+        // Process durable queues (cross-shard, proof pipeline, oracle callbacks)
+        try {
+          for (const qName of ["xshard-outbox", "xshard-inbox", "proof-pipeline", "oracle-callbacks"]) {
+            const q = this.queueManager.getQueue(qName);
+            q.recoverStalled();
+          }
+        } catch (e: any) {
+          console.warn(`Queue processing error: ${e.message}`);
+        }
+
         for (const provider of this.providerRegistry.getAllActive()) {
           if (provider.down_reported_at) {
             this.providerRegistry.resolveDownReport(provider.provider_id);
@@ -1711,6 +1875,14 @@ export class PersistiaWorldV4 implements DurableObject {
         this.alarmPrune();
         // Archive cold game world chunks to R2 (state expiry)
         this.archiveColdChunks().catch(e => console.warn(`Chunk archival error: ${e.message}`));
+        // Prune completed/dead queue messages older than 1 day
+        for (const qName of ["xshard-outbox", "xshard-inbox", "proof-pipeline", "oracle-callbacks"]) {
+          this.queueManager.getQueue(qName).prune(86_400_000);
+        }
+        // Prune ended transcript sessions older than 7 days
+        this.transcriptManager.prune(7 * 86_400_000);
+        // Prune LLM metering entries older than 7 days
+        this.llmMetering.prune(7 * 86_400_000);
       }
 
       // Every 10th cycle (offset by 5): reprobe failed peers
@@ -3673,6 +3845,178 @@ export class PersistiaWorldV4 implements DurableObject {
       output_hash: outputHash,
       attestation_id: attestation.attestation_id,
     });
+  }
+
+  // ─── Agent OS Route Handlers ─────────────────────────────────────────────
+
+  private async handleVFSRoute(req: Request, url: URL): Promise<Response> {
+    const subpath = url.pathname.replace(/^\/vfs\/?/, "");
+    const filePath = url.searchParams.get("path") || "/";
+
+    switch (subpath) {
+      case "read": {
+        const result = await this.vfs.read(filePath);
+        if (!result) return Response.json({ error: "not_found" }, { status: 404 });
+        if (result.data instanceof Uint8Array) {
+          return new Response(result.data, { headers: { "Content-Type": result.contentType } });
+        }
+        return Response.json({ data: result.data, stat: result.stat });
+      }
+      case "stat": {
+        const stat = await this.vfs.stat(filePath);
+        if (!stat) return Response.json({ error: "not_found" }, { status: 404 });
+        return Response.json(stat);
+      }
+      case "list": {
+        const limit = parseInt(url.searchParams.get("limit") || "100");
+        const cursor = url.searchParams.get("cursor") || undefined;
+        const result = await this.vfs.list(filePath, { limit, cursor });
+        return Response.json(result);
+      }
+      case "write": {
+        if (req.method !== "PUT" && req.method !== "POST") {
+          return Response.json({ error: "method_not_allowed" }, { status: 405 });
+        }
+        const body = await req.text();
+        await this.vfs.write(filePath, body);
+        return Response.json({ ok: true });
+      }
+      case "delete": {
+        if (req.method !== "DELETE" && req.method !== "POST") {
+          return Response.json({ error: "method_not_allowed" }, { status: 405 });
+        }
+        const deleted = await this.vfs.delete(filePath);
+        return Response.json({ ok: true, deleted });
+      }
+      case "mounts": {
+        return Response.json(this.vfs.getMounts().map(m => ({ path: m.path, backend: m.backend, readOnly: m.readOnly })));
+      }
+      default:
+        return Response.json({ error: "unknown_vfs_route" }, { status: 404 });
+    }
+  }
+
+  private async handleTranscriptRoute(_req: Request, url: URL): Promise<Response> {
+    const subpath = url.pathname.replace(/^\/transcript\/?/, "");
+
+    if (subpath === "sessions") {
+      const type = url.searchParams.get("type") || undefined;
+      const limit = parseInt(url.searchParams.get("limit") || "50");
+      // List recent sessions
+      const entries = this.transcriptManager.search({
+        eventType: undefined,
+        limit: 1, // just to check
+      });
+      const stats = this.transcriptManager.getStats();
+      return Response.json(stats);
+    }
+
+    if (subpath.startsWith("session/")) {
+      const sessionId = subpath.replace("session/", "").split("/")[0];
+      const action = subpath.replace(`session/${sessionId}/`, "");
+
+      if (action === sessionId || action === "") {
+        const session = this.transcriptManager.getSession(sessionId);
+        if (!session) return Response.json({ error: "not_found" }, { status: 404 });
+        return Response.json(session);
+      }
+
+      if (action === "entries") {
+        const after = url.searchParams.get("after") ? parseInt(url.searchParams.get("after")!) : undefined;
+        const limit = parseInt(url.searchParams.get("limit") || "100");
+        const eventType = url.searchParams.get("type") || undefined;
+        const entries = this.transcriptManager.getEntries(sessionId, { after, limit, eventType: eventType as any });
+        return Response.json(entries);
+      }
+
+      if (action === "verify") {
+        const result = await this.transcriptManager.verifyChain(sessionId);
+        return Response.json(result);
+      }
+    }
+
+    if (subpath === "search") {
+      const source = url.searchParams.get("source") || undefined;
+      const eventType = (url.searchParams.get("type") || undefined) as any;
+      const after = url.searchParams.get("after") ? parseInt(url.searchParams.get("after")!) : undefined;
+      const before = url.searchParams.get("before") ? parseInt(url.searchParams.get("before")!) : undefined;
+      const limit = parseInt(url.searchParams.get("limit") || "50");
+      const entries = this.transcriptManager.search({ source, eventType, after, before, limit });
+      return Response.json(entries);
+    }
+
+    if (subpath === "stats") {
+      return Response.json(this.transcriptManager.getStats());
+    }
+
+    return Response.json({ error: "unknown_transcript_route" }, { status: 404 });
+  }
+
+  private async handleMeteringRoute(_req: Request, url: URL): Promise<Response> {
+    const subpath = url.pathname.replace(/^\/metering\/?/, "");
+
+    if (subpath === "summary") {
+      const period = (url.searchParams.get("period") || "day") as "hour" | "day" | "all";
+      return Response.json(this.llmMetering.getSummary(period));
+    }
+
+    if (subpath.startsWith("provider/")) {
+      const providerId = subpath.replace("provider/", "");
+      const limit = parseInt(url.searchParams.get("limit") || "50");
+      return Response.json(this.llmMetering.getByProvider(providerId, limit));
+    }
+
+    if (subpath.startsWith("buyer/")) {
+      const address = subpath.replace("buyer/", "");
+      const limit = parseInt(url.searchParams.get("limit") || "50");
+      return Response.json(this.llmMetering.getByBuyer(address, limit));
+    }
+
+    if (subpath === "today") {
+      return Response.json(this.llmMetering.getTodayUsage());
+    }
+
+    if (subpath.startsWith("rate/")) {
+      const parts = subpath.replace("rate/", "").split("/");
+      const providerId = parts[0];
+      const model = decodeURIComponent(parts.slice(1).join("/") || "");
+      const rate = this.llmMetering.getProviderRate(providerId, model);
+      if (!rate) return Response.json({ error: "not_found" }, { status: 404 });
+      return Response.json(rate);
+    }
+
+    return Response.json({ error: "unknown_metering_route" }, { status: 404 });
+  }
+
+  private async handleQueueRoute(_req: Request, url: URL): Promise<Response> {
+    const subpath = url.pathname.replace(/^\/queues\/?/, "");
+
+    if (subpath === "" || subpath === "list") {
+      return Response.json(this.queueManager.listQueues());
+    }
+
+    if (subpath.startsWith("stats/")) {
+      const queueName = subpath.replace("stats/", "");
+      const q = this.queueManager.getQueue(queueName);
+      return Response.json(q.getStats());
+    }
+
+    if (subpath.startsWith("dead-letters/")) {
+      const queueName = subpath.replace("dead-letters/", "");
+      const limit = parseInt(url.searchParams.get("limit") || "50");
+      const q = this.queueManager.getQueue(queueName);
+      return Response.json(q.getDeadLetters(limit));
+    }
+
+    if (subpath.startsWith("redrive/")) {
+      const queueName = subpath.replace("redrive/", "");
+      const limit = parseInt(url.searchParams.get("limit") || "10");
+      const q = this.queueManager.getQueue(queueName);
+      const count = q.redriveDeadLetters(limit);
+      return Response.json({ ok: true, redriven: count });
+    }
+
+    return Response.json({ error: "unknown_queue_route" }, { status: 404 });
   }
 
   private async handleGossipRoute(req: Request, url: URL): Promise<Response> {
