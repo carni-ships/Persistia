@@ -12,13 +12,32 @@ import type {
   MirrorResult, OracleFeedConfig, FeedSource, FeedRound, OracleObservation,
   OracleObservationBatch, OracleSubscription, VRFRequest, VRFPartial,
   FeedLatest, OracleAggregation, OraclePushSubscription, OraclePushAttestation,
+  OraclePushDepositor,
 } from "./types";
+import {
+  keccak256, toBytes, toHex, encodeAbiParameters, encodePacked,
+  getContractAddress, parseAbiParameters,
+} from "viem";
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 const MAX_FEEDS = 200;
 const MAX_SUBSCRIPTIONS_PER_CONTRACT = 20;
-const MAX_PUSH_SUBSCRIPTIONS_PER_OWNER = 10;
+const MAX_PUSH_DEPOSITS_PER_DEPOSITOR = 10;
+
+// ─── Chainlink-Compatible Push Constants ──────────────────────────────────
+// transmit(int256,uint80,uint256,uint256,bytes32,bytes) selector
+const TRANSMIT_SELECTOR = keccak256(toBytes("transmit(int256,uint80,uint256,uint256,bytes32,bytes)")).slice(0, 10);
+
+// Factory addresses per destination chain (deployed via Nick's factory for deterministic addresses)
+// These are placeholders until the PersistiaOracleFactory is deployed on each chain
+const FACTORY_ADDRESSES: Record<number, `0x${string}`> = {
+  42161: "0x0000000000000000000000000000000000000000" as `0x${string}`, // Arbitrum One — TBD
+  6342:  "0x0000000000000000000000000000000000000000" as `0x${string}`, // MegaETH — TBD
+};
+
+// keccak256 of PersistiaOracleReceiver creation bytecode — TBD after compilation
+const RECEIVER_INIT_CODE_HASH = "0x0000000000000000000000000000000000000000000000000000000000000000" as `0x${string}`;
 const MAX_OBSERVATIONS_PER_BATCH = 200;
 const STALE_MULTIPLIER = 3; // feed goes stale after 3x heartbeat
 const DEFAULT_HEARTBEAT_MS = 60_000;
@@ -611,82 +630,145 @@ export class OracleNetwork {
     return rows.map(this.rowToSubscription);
   }
 
-  // ─── Cross-Chain Push Subscriptions ────────────────────────────────────
+  // ─── Cross-Chain Push Subscriptions (Chainlink-Compatible) ──────────────
+  // Subscriptions are keyed by (feed_id, dest_chain_id) — deterministic.
+  // Same oracle config = same subscription and same receiver contract address.
+  // Multiple depositors can fund a shared subscription.
+
+  static getTransmitSelector(): string { return TRANSMIT_SELECTOR; }
+
+  computeReceiverAddress(feedId: string, decimals: number, destChainId: number): string {
+    const factoryAddr = FACTORY_ADDRESSES[destChainId];
+    if (!factoryAddr || factoryAddr === "0x0000000000000000000000000000000000000000") {
+      // Deterministic address from feed params even without deployed factory
+      const hash = keccak256(encodePacked(["string", "uint8", "uint256"], [feedId, decimals, BigInt(destChainId)]));
+      return ("0x" + hash.slice(26)) as string; // last 20 bytes as address
+    }
+    const salt = keccak256(encodePacked(["string", "uint8"], [feedId, decimals]));
+    return getContractAddress({ from: factoryAddr, salt, bytecodeHash: RECEIVER_INIT_CODE_HASH, opcode: "CREATE2" });
+  }
 
   async addPushSubscription(opts: {
     feed_id: string;
-    owner: string;
+    depositor: string;
     dest_chain_id: number;
     dest_rpc_url: string;
-    receiver_contract: string;
-    callback_selector: string;
     deviation_bps?: number;
     heartbeat_ms?: number;
     deposit_wei?: string;
-  }): Promise<string> {
-    if (!this.getFeedConfig(opts.feed_id)) {
-      throw new Error(`Feed ${opts.feed_id} not found`);
-    }
-    if (!/^0x[0-9a-fA-F]{40}$/.test(opts.receiver_contract)) {
-      throw new Error("Invalid receiver contract address");
-    }
-    if (!/^0x[0-9a-fA-F]{8}$/.test(opts.callback_selector)) {
-      throw new Error("Invalid callback selector (need 4-byte hex, e.g. 0xabcd1234)");
-    }
-    if (!/^0x[0-9a-fA-F]{40}$/.test(opts.owner)) {
-      throw new Error("Invalid owner address");
-    }
+  }): Promise<{ subscription_id: string; receiver_address: string }> {
+    const feedConfig = this.getFeedConfig(opts.feed_id);
+    if (!feedConfig) throw new Error(`Feed ${opts.feed_id} not found`);
+    if (!/^0x[0-9a-fA-F]{40}$/.test(opts.depositor)) throw new Error("Invalid depositor address");
 
-    const count = [...this.sql.exec(
-      "SELECT COUNT(*) as cnt FROM oracle_push_subscriptions WHERE owner = ? AND enabled = 1",
-      opts.owner,
+    // Deterministic subscription ID
+    const subId = await sha256(`${opts.feed_id}:${opts.dest_chain_id}`);
+    const receiverAddress = this.computeReceiverAddress(opts.feed_id, feedConfig.decimals, opts.dest_chain_id);
+
+    // Check depositor limit
+    const depCount = [...this.sql.exec(
+      "SELECT COUNT(*) as cnt FROM oracle_push_depositors WHERE depositor = ?",
+      opts.depositor.toLowerCase(),
     )][0]?.cnt ?? 0;
-    if (count >= MAX_PUSH_SUBSCRIPTIONS_PER_OWNER) {
-      throw new Error(`Max ${MAX_PUSH_SUBSCRIPTIONS_PER_OWNER} push subscriptions per owner`);
+    if (depCount >= MAX_PUSH_DEPOSITS_PER_DEPOSITOR) {
+      throw new Error(`Max ${MAX_PUSH_DEPOSITS_PER_DEPOSITOR} push subscriptions per depositor`);
     }
 
     const heartbeat = Math.max(MIN_HEARTBEAT_MS, Math.min(MAX_HEARTBEAT_MS, opts.heartbeat_ms || DEFAULT_HEARTBEAT_MS));
     const deviation = Math.max(0, opts.deviation_bps ?? DEFAULT_DEVIATION_BPS);
-    const id = await sha256(`push_sub:${opts.owner}:${opts.feed_id}:${opts.receiver_contract}:${Date.now()}`);
+    const depositWei = opts.deposit_wei || "0";
 
-    this.sql.exec(
-      `INSERT INTO oracle_push_subscriptions (id, feed_id, owner, dest_chain_id, dest_rpc_url, receiver_contract, callback_selector, deviation_bps, heartbeat_ms, last_pushed_at, last_pushed_value, last_pushed_round, deposit_wei, enabled, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, 0, ?, 1, ?)`,
-      id, opts.feed_id, opts.owner.toLowerCase(), opts.dest_chain_id, opts.dest_rpc_url,
-      opts.receiver_contract.toLowerCase(), opts.callback_selector.toLowerCase(),
-      deviation, heartbeat, opts.deposit_wei || "0", Date.now(),
-    );
-    return id;
-  }
-
-  removePushSubscription(subId: string, owner: string): void {
-    const rows = [...this.sql.exec(
-      "SELECT owner FROM oracle_push_subscriptions WHERE id = ? AND enabled = 1", subId,
+    // Upsert subscription
+    const existing = [...this.sql.exec(
+      "SELECT id FROM oracle_push_subscriptions_v2 WHERE id = ?", subId,
     )] as any[];
-    if (rows.length === 0) throw new Error("Push subscription not found");
-    if (rows[0].owner !== owner.toLowerCase()) throw new Error("Not the owner");
-    this.sql.exec("UPDATE oracle_push_subscriptions SET enabled = 0 WHERE id = ?", subId);
+
+    if (existing.length === 0) {
+      this.sql.exec(
+        `INSERT INTO oracle_push_subscriptions_v2 (id, feed_id, dest_chain_id, dest_rpc_url, receiver_address, deviation_bps, heartbeat_ms, last_pushed_at, last_pushed_value, last_pushed_round, total_deposit_wei, enabled, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, 0, ?, 1, ?)`,
+        subId, opts.feed_id, opts.dest_chain_id, opts.dest_rpc_url,
+        receiverAddress, deviation, heartbeat, depositWei, Date.now(),
+      );
+    } else {
+      // Update thresholds to tightest values
+      this.sql.exec(
+        `UPDATE oracle_push_subscriptions_v2 SET
+         deviation_bps = MIN(deviation_bps, ?),
+         heartbeat_ms = MIN(heartbeat_ms, ?),
+         total_deposit_wei = CAST((CAST(total_deposit_wei AS INTEGER) + CAST(? AS INTEGER)) AS TEXT),
+         enabled = 1
+         WHERE id = ?`,
+        deviation, heartbeat, depositWei, subId,
+      );
+    }
+
+    // Upsert depositor
+    const existingDep = [...this.sql.exec(
+      "SELECT depositor FROM oracle_push_depositors WHERE subscription_id = ? AND depositor = ?",
+      subId, opts.depositor.toLowerCase(),
+    )] as any[];
+
+    if (existingDep.length === 0) {
+      this.sql.exec(
+        "INSERT INTO oracle_push_depositors (subscription_id, depositor, deposit_wei, created_at) VALUES (?, ?, ?, ?)",
+        subId, opts.depositor.toLowerCase(), depositWei, Date.now(),
+      );
+    } else {
+      this.sql.exec(
+        "UPDATE oracle_push_depositors SET deposit_wei = CAST((CAST(deposit_wei AS INTEGER) + CAST(? AS INTEGER)) AS TEXT) WHERE subscription_id = ? AND depositor = ?",
+        depositWei, subId, opts.depositor.toLowerCase(),
+      );
+    }
+
+    return { subscription_id: subId, receiver_address: receiverAddress };
   }
 
-  getPushSubscriptionsForOwner(owner: string): OraclePushSubscription[] {
+  disablePushSubscription(subId: string): void {
+    this.sql.exec("UPDATE oracle_push_subscriptions_v2 SET enabled = 0 WHERE id = ?", subId);
+  }
+
+  getPushSubscriptionsForDepositor(depositor: string): OraclePushSubscription[] {
     const rows = [...this.sql.exec(
-      "SELECT * FROM oracle_push_subscriptions WHERE owner = ? ORDER BY created_at DESC",
-      owner.toLowerCase(),
+      `SELECT s.* FROM oracle_push_subscriptions_v2 s
+       INNER JOIN oracle_push_depositors d ON d.subscription_id = s.id
+       WHERE d.depositor = ? ORDER BY s.created_at DESC`,
+      depositor.toLowerCase(),
+    )] as any[];
+    return rows.map(this.rowToPushSubscription);
+  }
+
+  getAllPushSubscriptions(): OraclePushSubscription[] {
+    const rows = [...this.sql.exec(
+      "SELECT * FROM oracle_push_subscriptions_v2 WHERE enabled = 1 ORDER BY created_at DESC",
     )] as any[];
     return rows.map(this.rowToPushSubscription);
   }
 
   getPushSubscription(subId: string): OraclePushSubscription | null {
     const rows = [...this.sql.exec(
-      "SELECT * FROM oracle_push_subscriptions WHERE id = ?", subId,
+      "SELECT * FROM oracle_push_subscriptions_v2 WHERE id = ?", subId,
     )] as any[];
     return rows.length > 0 ? this.rowToPushSubscription(rows[0]) : null;
+  }
+
+  getPushDepositors(subId: string): OraclePushDepositor[] {
+    const rows = [...this.sql.exec(
+      "SELECT * FROM oracle_push_depositors WHERE subscription_id = ? ORDER BY created_at",
+      subId,
+    )] as any[];
+    return rows.map((r: any) => ({
+      subscription_id: r.subscription_id,
+      depositor: r.depositor,
+      deposit_wei: r.deposit_wei,
+      created_at: r.created_at,
+    }));
   }
 
   getTriggeredPushSubscriptions(feedId: string, newValue: string, newValueNum: number | null): OraclePushSubscription[] {
     const now = Date.now();
     const rows = [...this.sql.exec(
-      "SELECT * FROM oracle_push_subscriptions WHERE feed_id = ? AND enabled = 1",
+      "SELECT * FROM oracle_push_subscriptions_v2 WHERE feed_id = ? AND enabled = 1",
       feedId,
     )] as any[];
 
@@ -696,7 +778,6 @@ export class OracleNetwork {
 
       // Check heartbeat interval
       if (sub.last_pushed_at > 0 && (now - sub.last_pushed_at) < sub.heartbeat_ms) {
-        // Within heartbeat window — only push if deviation exceeded
         if (sub.deviation_bps > 0 && sub.last_pushed_value !== null && newValueNum !== null) {
           const lastNum = parseFloat(sub.last_pushed_value);
           if (!isNaN(lastNum) && lastNum !== 0) {
@@ -704,7 +785,7 @@ export class OracleNetwork {
             if (devBps < sub.deviation_bps) continue;
           }
         } else {
-          continue; // no deviation data, respect heartbeat
+          continue;
         }
       }
 
@@ -722,17 +803,17 @@ export class OracleNetwork {
       observers: round.observers,
       committed_at: round.committed_at,
       dest_chain_id: sub.dest_chain_id,
-      receiver_contract: sub.receiver_contract,
-      callback_selector: sub.callback_selector,
+      receiver_address: sub.receiver_address,
     });
     const attestationHash = await sha256(payloadStr);
     const signature = await this.signPayload(attestationHash);
     const signatures = JSON.stringify([{ pubkey: this.nodePubkey, sig: signature }]);
 
+    const feedConfig = this.getFeedConfig(round.feed_id);
+    const decimals = feedConfig?.decimals ?? 8;
     const calldata = this.abiEncodePushCalldata(
-      sub.callback_selector, round.feed_id, round.round,
-      round.value, round.value_num, round.observers,
-      round.committed_at, attestationHash, signatures,
+      round.round, round.value, round.value_num, decimals,
+      round.observers, round.committed_at, attestationHash, signatures,
     );
 
     const id = await sha256(`push_att:${sub.id}:${round.round}:${Date.now()}`);
@@ -745,9 +826,8 @@ export class OracleNetwork {
       round.observers, round.committed_at, attestationHash, signatures, calldata, now,
     );
 
-    // Mark subscription as pushed
     this.sql.exec(
-      "UPDATE oracle_push_subscriptions SET last_pushed_at = ?, last_pushed_value = ?, last_pushed_round = ? WHERE id = ?",
+      "UPDATE oracle_push_subscriptions_v2 SET last_pushed_at = ?, last_pushed_value = ?, last_pushed_round = ? WHERE id = ?",
       now, round.value, round.round, sub.id,
     );
 
@@ -782,29 +862,59 @@ export class OracleNetwork {
     );
   }
 
-  depositPushFunds(subId: string, amountWei: string): void {
+  depositPushFunds(subId: string, depositor: string, amountWei: string): void {
     const sub = this.getPushSubscription(subId);
     if (!sub) throw new Error("Push subscription not found");
-    const current = BigInt(sub.deposit_wei);
+    if (!/^0x[0-9a-fA-F]{40}$/.test(depositor)) throw new Error("Invalid depositor address");
     const deposit = BigInt(amountWei);
     if (deposit <= 0n) throw new Error("Amount must be positive");
+
+    // Update total
     this.sql.exec(
-      "UPDATE oracle_push_subscriptions SET deposit_wei = ? WHERE id = ?",
-      (current + deposit).toString(), subId,
+      "UPDATE oracle_push_subscriptions_v2 SET total_deposit_wei = CAST((CAST(total_deposit_wei AS INTEGER) + ?) AS TEXT) WHERE id = ?",
+      amountWei, subId,
     );
+
+    // Upsert depositor
+    const existing = [...this.sql.exec(
+      "SELECT depositor FROM oracle_push_depositors WHERE subscription_id = ? AND depositor = ?",
+      subId, depositor.toLowerCase(),
+    )] as any[];
+
+    if (existing.length === 0) {
+      this.sql.exec(
+        "INSERT INTO oracle_push_depositors (subscription_id, depositor, deposit_wei, created_at) VALUES (?, ?, ?, ?)",
+        subId, depositor.toLowerCase(), amountWei, Date.now(),
+      );
+    } else {
+      this.sql.exec(
+        "UPDATE oracle_push_depositors SET deposit_wei = CAST((CAST(deposit_wei AS INTEGER) + ?) AS TEXT) WHERE subscription_id = ? AND depositor = ?",
+        amountWei, subId, depositor.toLowerCase(),
+      );
+    }
   }
 
-  withdrawPushFunds(subId: string, amountWei: string, owner: string): void {
+  withdrawPushFunds(subId: string, depositor: string, amountWei: string): void {
     const sub = this.getPushSubscription(subId);
     if (!sub) throw new Error("Push subscription not found");
-    if (sub.owner !== owner.toLowerCase()) throw new Error("Not the owner");
-    const current = BigInt(sub.deposit_wei);
     const withdrawal = BigInt(amountWei);
     if (withdrawal <= 0n) throw new Error("Amount must be positive");
-    if (withdrawal > current) throw new Error("Insufficient deposit balance");
+
+    // Check depositor balance
+    const depRow = [...this.sql.exec(
+      "SELECT deposit_wei FROM oracle_push_depositors WHERE subscription_id = ? AND depositor = ?",
+      subId, depositor.toLowerCase(),
+    )] as any[];
+    if (depRow.length === 0) throw new Error("Not a depositor");
+    if (BigInt(depRow[0].deposit_wei) < withdrawal) throw new Error("Insufficient deposit balance");
+
     this.sql.exec(
-      "UPDATE oracle_push_subscriptions SET deposit_wei = ? WHERE id = ?",
-      (current - withdrawal).toString(), subId,
+      "UPDATE oracle_push_depositors SET deposit_wei = CAST((CAST(deposit_wei AS INTEGER) - ?) AS TEXT) WHERE subscription_id = ? AND depositor = ?",
+      amountWei, subId, depositor.toLowerCase(),
+    );
+    this.sql.exec(
+      "UPDATE oracle_push_subscriptions_v2 SET total_deposit_wei = CAST((CAST(total_deposit_wei AS INTEGER) - ?) AS TEXT) WHERE id = ?",
+      amountWei, subId,
     );
   }
 
@@ -814,17 +924,15 @@ export class OracleNetwork {
     return {
       id: row.id,
       feed_id: row.feed_id,
-      owner: row.owner,
       dest_chain_id: row.dest_chain_id,
       dest_rpc_url: row.dest_rpc_url,
-      receiver_contract: row.receiver_contract,
-      callback_selector: row.callback_selector,
+      receiver_address: row.receiver_address,
       deviation_bps: row.deviation_bps,
       heartbeat_ms: row.heartbeat_ms,
       last_pushed_at: row.last_pushed_at,
       last_pushed_value: row.last_pushed_value,
       last_pushed_round: row.last_pushed_round,
-      deposit_wei: row.deposit_wei,
+      total_deposit_wei: row.total_deposit_wei,
       enabled: !!row.enabled,
       created_at: row.created_at,
     };
@@ -850,43 +958,30 @@ export class OracleNetwork {
   }
 
   /**
-   * Minimal ABI encoder for cross-chain push calldata.
-   * Encodes: selector + (bytes32 feedIdHash, uint256 round, int256 value,
-   *          uint256 observers, uint256 committedAt, bytes32 attestationHash, bytes signatures)
+   * ABI encoder for Chainlink-compatible transmit() calldata.
+   * transmit(int256 answer, uint80 roundId, uint256 updatedAt, uint256 observers, bytes32 attestationHash, bytes signatures)
    */
   private abiEncodePushCalldata(
-    selector: string, feedId: string, round: number,
-    value: string, valueNum: number | null, observers: number,
-    committedAt: number, attestationHash: string, signatures: string,
+    round: number, value: string, valueNum: number | null, decimals: number,
+    observers: number, committedAt: number, attestationHash: string, signatures: string,
   ): string {
-    const feedIdHash = attestationHash.slice(0, 64).padStart(64, "0"); // use first 32 bytes of sha256(feedId) conceptually; reuse attestation hash prefix as feed fingerprint
-    const roundHex = round.toString(16).padStart(64, "0");
-    // Encode value as int256 (signed) — scale to 8 decimals
-    const scaledValue = Math.round((valueNum ?? parseFloat(value) ?? 0) * 1e8);
-    let valueHex: string;
-    if (scaledValue >= 0) {
-      valueHex = scaledValue.toString(16).padStart(64, "0");
-    } else {
-      // Two's complement for negative
-      const twos = (BigInt(1) << BigInt(256)) + BigInt(scaledValue);
-      valueHex = twos.toString(16).padStart(64, "0");
-    }
-    const observersHex = observers.toString(16).padStart(64, "0");
-    const committedAtHex = committedAt.toString(16).padStart(64, "0");
-    const attHashHex = attestationHash.padStart(64, "0");
+    const scaledValue = BigInt(Math.round((valueNum ?? parseFloat(value) ?? 0) * (10 ** decimals)));
+    const attHashHex = ("0x" + attestationHash.padStart(64, "0")) as `0x${string}`;
+    const sigBytes = toHex(toBytes(signatures));
 
-    // Encode signatures as dynamic bytes
-    const sigBytes = new TextEncoder().encode(signatures);
-    const sigHex = Array.from(sigBytes).map(b => b.toString(16).padStart(2, "0")).join("");
-    // Dynamic offset: 7 * 32 bytes = 224 = 0xe0
-    const sigOffsetHex = (7 * 32).toString(16).padStart(64, "0");
-    const sigLenHex = sigBytes.length.toString(16).padStart(64, "0");
-    // Pad sig data to 32-byte boundary
-    const sigPadded = sigHex.padEnd(Math.ceil(sigHex.length / 64) * 64, "0");
+    const encoded = encodeAbiParameters(
+      parseAbiParameters("int256, uint80, uint256, uint256, bytes32, bytes"),
+      [
+        scaledValue,
+        round,
+        BigInt(Math.floor(committedAt / 1000)),
+        BigInt(observers),
+        attHashHex,
+        sigBytes,
+      ],
+    );
 
-    return selector +
-      feedIdHash + roundHex + valueHex + observersHex +
-      committedAtHex + attHashHex + sigOffsetHex + sigLenHex + sigPadded;
+    return TRANSMIT_SELECTOR.slice(2) + encoded.slice(2);
   }
 
   // ─── VRF (Verifiable Random Function) ──────────────────────────────────

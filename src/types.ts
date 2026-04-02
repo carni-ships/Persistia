@@ -200,20 +200,25 @@ export interface OracleSubscription {
 // ─── Cross-Chain Push Subscription Types ────────────────────────────────────
 
 export interface OraclePushSubscription {
-  id: string;
+  id: string;                   // deterministic: sha256(feed_id + ":" + dest_chain_id)
   feed_id: string;
-  owner: string;                // 0x wallet address
   dest_chain_id: number;
   dest_rpc_url: string;
-  receiver_contract: string;    // 0x address on destination chain
-  callback_selector: string;    // 4-byte function selector, e.g. "0xabcd1234"
+  receiver_address: string;     // deterministic CREATE2 address
   deviation_bps: number;
   heartbeat_ms: number;
   last_pushed_at: number;
   last_pushed_value: string | null;
   last_pushed_round: number;
-  deposit_wei: string;          // gas deposit ledger (string for big numbers)
+  total_deposit_wei: string;    // sum of all depositor balances
   enabled: boolean;
+  created_at: number;
+}
+
+export interface OraclePushDepositor {
+  subscription_id: string;
+  depositor: string;            // 0x wallet address
+  deposit_wei: string;
   created_at: number;
 }
 

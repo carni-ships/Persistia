@@ -557,7 +557,8 @@ export class PersistiaWorldV4 implements DurableObject {
       ["oracle_feed_demand", `CREATE TABLE oracle_feed_demand (feed_id TEXT PRIMARY KEY, read_count INTEGER NOT NULL DEFAULT 0, subscription_count INTEGER NOT NULL DEFAULT 0, last_active INTEGER NOT NULL)`],
       ["oracle_blackboard", `CREATE TABLE oracle_blackboard (id TEXT PRIMARY KEY, author TEXT NOT NULL, prefix TEXT NOT NULL, text TEXT NOT NULL, timestamp INTEGER NOT NULL, expires_at INTEGER NOT NULL); CREATE INDEX idx_bb_time ON oracle_blackboard(timestamp)`],
       ["oracle_source_stats", `CREATE TABLE oracle_source_stats (feed_id TEXT NOT NULL, source_index INTEGER NOT NULL, source_type TEXT NOT NULL, success_count INTEGER NOT NULL DEFAULT 0, failure_count INTEGER NOT NULL DEFAULT 0, total_latency_ms INTEGER NOT NULL DEFAULT 0, last_success INTEGER NOT NULL DEFAULT 0, last_failure INTEGER NOT NULL DEFAULT 0, avg_freshness_ms REAL NOT NULL DEFAULT 0, PRIMARY KEY (feed_id, source_index))`],
-      ["oracle_push_subscriptions", `CREATE TABLE oracle_push_subscriptions (id TEXT PRIMARY KEY, feed_id TEXT NOT NULL, owner TEXT NOT NULL, dest_chain_id INTEGER NOT NULL, dest_rpc_url TEXT NOT NULL, receiver_contract TEXT NOT NULL, callback_selector TEXT NOT NULL, deviation_bps INTEGER NOT NULL DEFAULT 50, heartbeat_ms INTEGER NOT NULL DEFAULT 60000, last_pushed_at INTEGER NOT NULL DEFAULT 0, last_pushed_value TEXT, last_pushed_round INTEGER NOT NULL DEFAULT 0, deposit_wei TEXT NOT NULL DEFAULT '0', enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL); CREATE INDEX idx_push_sub_feed ON oracle_push_subscriptions(feed_id, enabled); CREATE INDEX idx_push_sub_owner ON oracle_push_subscriptions(owner)`],
+      ["oracle_push_subscriptions_v2", `CREATE TABLE oracle_push_subscriptions_v2 (id TEXT PRIMARY KEY, feed_id TEXT NOT NULL, dest_chain_id INTEGER NOT NULL, dest_rpc_url TEXT NOT NULL, receiver_address TEXT NOT NULL, deviation_bps INTEGER NOT NULL DEFAULT 50, heartbeat_ms INTEGER NOT NULL DEFAULT 60000, last_pushed_at INTEGER NOT NULL DEFAULT 0, last_pushed_value TEXT, last_pushed_round INTEGER NOT NULL DEFAULT 0, total_deposit_wei TEXT NOT NULL DEFAULT '0', enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, UNIQUE(feed_id, dest_chain_id)); CREATE INDEX idx_push_sub_v2_feed ON oracle_push_subscriptions_v2(feed_id, enabled)`],
+      ["oracle_push_depositors", `CREATE TABLE oracle_push_depositors (subscription_id TEXT NOT NULL, depositor TEXT NOT NULL, deposit_wei TEXT NOT NULL DEFAULT '0', created_at INTEGER NOT NULL, PRIMARY KEY (subscription_id, depositor)); CREATE INDEX idx_push_dep_depositor ON oracle_push_depositors(depositor)`],
       ["oracle_push_attestations", `CREATE TABLE oracle_push_attestations (id TEXT PRIMARY KEY, subscription_id TEXT NOT NULL, feed_id TEXT NOT NULL, round INTEGER NOT NULL, value TEXT NOT NULL, value_num REAL, observers INTEGER NOT NULL, committed_at INTEGER NOT NULL, attestation_hash TEXT NOT NULL, signatures TEXT NOT NULL, calldata TEXT NOT NULL, created_at INTEGER NOT NULL, relayed_at INTEGER, relay_tx_hash TEXT); CREATE INDEX idx_push_att_sub ON oracle_push_attestations(subscription_id, created_at); CREATE INDEX idx_push_att_pending ON oracle_push_attestations(relayed_at)`],
     ] as const;
     for (const [name, ddl] of ponTables) {
@@ -7445,39 +7446,53 @@ export class PersistiaWorldV4 implements DurableObject {
       return this.json(result);
     }
 
-    // ── Cross-Chain Push Subscription Routes ──
+    // ── Cross-Chain Push Subscription Routes (Chainlink-Compatible) ──
 
-    // POST /oracle/push — create push subscription
-    // GET /oracle/push?owner=0x... — list push subscriptions for owner
+    // GET /oracle/push/compute-address?feed_id=...&dest_chain_id=...
+    if (path === "/oracle/push/compute-address") {
+      const feedId = url.searchParams.get("feed_id");
+      const chainId = parseInt(url.searchParams.get("dest_chain_id") || "0");
+      if (!feedId || !chainId) return this.json({ error: "feed_id and dest_chain_id required" }, 400);
+      const feedConfig = this.oracleNetwork.getFeedConfig(feedId);
+      if (!feedConfig) return this.json({ error: "Feed not found" }, 404);
+      const receiverAddress = this.oracleNetwork.computeReceiverAddress(feedId, feedConfig.decimals, chainId);
+      const transmitSelector = OracleNetwork.getTransmitSelector();
+      return this.json({ receiver_address: receiverAddress, transmit_selector: transmitSelector, decimals: feedConfig.decimals });
+    }
+
+    // POST /oracle/push — create/join push subscription
+    // GET /oracle/push?depositor=0x... — list subscriptions for depositor
+    // GET /oracle/push (no params) — list all active subscriptions
     if (path === "/oracle/push") {
       if (req.method === "POST") {
         const body = await req.json() as any;
-        if (!body.feed_id || !body.owner || !body.dest_chain_id || !body.dest_rpc_url || !body.receiver_contract || !body.callback_selector) {
-          return this.json({ error: "feed_id, owner, dest_chain_id, dest_rpc_url, receiver_contract, callback_selector required" }, 400);
+        if (!body.feed_id || !body.depositor || !body.dest_chain_id || !body.dest_rpc_url) {
+          return this.json({ error: "feed_id, depositor, dest_chain_id, dest_rpc_url required" }, 400);
         }
         try {
-          const id = await this.oracleNetwork.addPushSubscription(body);
+          const result = await this.oracleNetwork.addPushSubscription(body);
           this.oracleMesh.recordDemand(body.feed_id, "subscribe");
-          return this.json({ ok: true, subscription_id: id });
+          const transmitSelector = OracleNetwork.getTransmitSelector();
+          return this.json({ ok: true, ...result, transmit_selector: transmitSelector });
         } catch (e: any) {
           return this.json({ error: e.message }, 400);
         }
       }
-      const owner = url.searchParams.get("owner");
-      if (!owner) return this.json({ error: "owner query param required" }, 400);
-      return this.json({ subscriptions: this.oracleNetwork.getPushSubscriptionsForOwner(owner) });
+      const depositor = url.searchParams.get("depositor");
+      if (depositor) {
+        return this.json({ subscriptions: this.oracleNetwork.getPushSubscriptionsForDepositor(depositor) });
+      }
+      return this.json({ subscriptions: this.oracleNetwork.getAllPushSubscriptions() });
     }
 
-    // GET /oracle/push/:id — single push subscription + recent attestations
+    // GET /oracle/push/:id — single push subscription + depositors + recent attestations
     // DELETE /oracle/push/:id — disable push subscription
     const pushSubMatch = path.match(/^\/oracle\/push\/([^/]+)$/);
     if (pushSubMatch && !path.includes("/push-attestations")) {
       const subId = pushSubMatch[1];
       if (req.method === "DELETE") {
-        const body = await req.json() as any;
-        if (!body.owner) return this.json({ error: "owner required" }, 400);
         try {
-          this.oracleNetwork.removePushSubscription(subId, body.owner);
+          this.oracleNetwork.disablePushSubscription(subId);
           return this.json({ ok: true });
         } catch (e: any) {
           return this.json({ error: e.message }, 400);
@@ -7485,8 +7500,17 @@ export class PersistiaWorldV4 implements DurableObject {
       }
       const sub = this.oracleNetwork.getPushSubscription(subId);
       if (!sub) return this.json({ error: "Push subscription not found" }, 404);
+      const depositors = this.oracleNetwork.getPushDepositors(subId);
       const attestations = this.oracleNetwork.getPushAttestations(subId, 10);
-      return this.json({ subscription: sub, attestations });
+      const transmitSelector = OracleNetwork.getTransmitSelector();
+      return this.json({ subscription: sub, depositors, attestations, transmit_selector: transmitSelector });
+    }
+
+    // GET /oracle/push/:id/depositors — list depositors
+    const pushDepListMatch = path.match(/^\/oracle\/push\/([^/]+)\/depositors$/);
+    if (pushDepListMatch) {
+      const subId = pushDepListMatch[1];
+      return this.json({ depositors: this.oracleNetwork.getPushDepositors(subId) });
     }
 
     // POST /oracle/push/:id/deposit — add to gas deposit ledger
@@ -7494,9 +7518,9 @@ export class PersistiaWorldV4 implements DurableObject {
     if (pushDepositMatch && req.method === "POST") {
       const subId = pushDepositMatch[1];
       const body = await req.json() as any;
-      if (!body.amount_wei) return this.json({ error: "amount_wei required" }, 400);
+      if (!body.amount_wei || !body.depositor) return this.json({ error: "amount_wei and depositor required" }, 400);
       try {
-        this.oracleNetwork.depositPushFunds(subId, body.amount_wei);
+        this.oracleNetwork.depositPushFunds(subId, body.depositor, body.amount_wei);
         return this.json({ ok: true });
       } catch (e: any) {
         return this.json({ error: e.message }, 400);
@@ -7508,9 +7532,9 @@ export class PersistiaWorldV4 implements DurableObject {
     if (pushWithdrawMatch && req.method === "POST") {
       const subId = pushWithdrawMatch[1];
       const body = await req.json() as any;
-      if (!body.amount_wei || !body.owner) return this.json({ error: "amount_wei and owner required" }, 400);
+      if (!body.amount_wei || !body.depositor) return this.json({ error: "amount_wei and depositor required" }, 400);
       try {
-        this.oracleNetwork.withdrawPushFunds(subId, body.amount_wei, body.owner);
+        this.oracleNetwork.withdrawPushFunds(subId, body.depositor, body.amount_wei);
         return this.json({ ok: true });
       } catch (e: any) {
         return this.json({ error: e.message }, 400);
@@ -7531,7 +7555,6 @@ export class PersistiaWorldV4 implements DurableObject {
       const subId = pushAttLatestMatch[1];
       const att = this.oracleNetwork.getLatestPendingAttestation(subId);
       if (!att) return this.json({ error: "No pending attestation" }, 404);
-      // Include subscription info for relay
       const sub = this.oracleNetwork.getPushSubscription(subId);
       return this.json({ attestation: att, subscription: sub });
     }
