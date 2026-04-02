@@ -12,14 +12,6 @@ proofs/
 # Rust build artifacts
 contracts/zk/target/
 
-# Jolt workspace (forked upstream, too large for this repo)
-contracts/zk-jolt-workspace/
-
-# Foundry build artifacts
-contracts/zk-onchain-verifier/foundry-test/cache/
-contracts/zk-onchain-verifier/foundry-test/out/
-contracts/zk-onchain-verifier/foundry-test/broadcast/
-
 # OS files
 .DS_Store
 Thumbs.db
