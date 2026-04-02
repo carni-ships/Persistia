@@ -59,6 +59,8 @@ const STATIC_ROUTES: Record<string, string> = {
   "/wallet.html": "/wallet.html",
   "/services": "/services.html",
   "/services.html": "/services.html",
+  "/oracle": "/oracle.html",
+  "/oracle.html": "/oracle.html",
 };
 
 // ─── Worker ───────────────────────────────────────────────────────────────────

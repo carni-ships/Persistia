@@ -36,6 +36,10 @@ export const FUEL_COSTS = {
   abort: 0,            // free — you're dying anyway
   cross_contract_call: 20000,
   oracle_request: 1000,
+  oracle_read_feed: 500,       // cheaper than storage_read — optimized denormalized table
+  oracle_subscribe: 1000,
+  oracle_unsubscribe: 500,
+  oracle_request_random: 1000,
   trigger_manage: 1000,
   gas_left: 10,
   deploy_contract: 50000,  // expensive — validates, compiles, and stores a new contract

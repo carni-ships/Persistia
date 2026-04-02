@@ -102,6 +102,8 @@ export interface CallResult {
   oracle_requests?: OracleRequestEmit[];
   trigger_requests?: TriggerRequestEmit[];
   deploy_requests?: DeployRequestEmit[];
+  oracle_subscription_requests?: OracleSubscriptionEmit[];
+  vrf_requests?: VRFRequestEmit[];
   /** Contract state keys that were mutated (for incremental Merkle tracking) */
   flushed_keys?: { contract: string; key: string; deleted: boolean }[];
 }
@@ -130,6 +132,22 @@ export interface DeployRequestEmit {
   contract: string;    // same as deployer (for consistency with other emits)
 }
 
+export interface OracleSubscriptionEmit {
+  action: "subscribe" | "unsubscribe";
+  feed_id: string;
+  callback_method?: string;
+  deviation_bps?: number;
+  min_interval_ms?: number;
+  subscription_id?: string;  // for unsubscribe
+  contract: string;
+}
+
+export interface VRFRequestEmit {
+  seed: string;
+  callback_method: string;
+  contract: string;
+}
+
 // ─── Execution Context (shared across cross-contract call chain) ──────────────
 
 const MAX_CALL_DEPTH = 10;
@@ -141,6 +159,8 @@ interface ExecutionContext {
   oracleRequests: OracleRequestEmit[];
   triggerRequests: TriggerRequestEmit[];
   deployRequests: DeployRequestEmit[];
+  oracleSubscriptionRequests: OracleSubscriptionEmit[];
+  vrfRequests: VRFRequestEmit[];
   callStack: string[];   // addresses currently executing (reentrancy detection)
   readOnly: boolean;
   rootCaller: string;    // original external caller (pubkey)
@@ -154,6 +174,8 @@ function createContext(rootCaller: string, readOnly: boolean): ExecutionContext 
     oracleRequests: [],
     triggerRequests: [],
     deployRequests: [],
+    oracleSubscriptionRequests: [],
+    vrfRequests: [],
     callStack: [],
     readOnly,
     rootCaller,
@@ -468,6 +490,8 @@ export class ContractExecutor {
       oracle_requests: ctx.oracleRequests.length > 0 ? ctx.oracleRequests : undefined,
       trigger_requests: ctx.triggerRequests.length > 0 ? ctx.triggerRequests : undefined,
       deploy_requests: ctx.deployRequests.length > 0 ? ctx.deployRequests : undefined,
+      oracle_subscription_requests: ctx.oracleSubscriptionRequests.length > 0 ? ctx.oracleSubscriptionRequests : undefined,
+      vrf_requests: ctx.vrfRequests.length > 0 ? ctx.vrfRequests : undefined,
       flushed_keys: flushed && flushed.length > 0 ? flushed : undefined,
     };
   }
@@ -762,6 +786,88 @@ export class ContractExecutor {
           ? new TextDecoder().decode(jsonPathBytes) : undefined;
 
         ctx.oracleRequests.push({ url, callback_method: callbackMethod, aggregation, json_path: jsonPath, contract: address });
+      },
+
+      // ─── Oracle Network (PON) host imports ────────────────────────────
+
+      oracle_read_feed: (feedIdReg: number, resultReg: number): number => {
+        if (!deductFuel(FUEL_COSTS.oracle_read_feed)) return 0;
+        const feedIdBytes = registers.get(feedIdReg);
+        if (!feedIdBytes) return 0;
+        const feedId = new TextDecoder().decode(feedIdBytes);
+
+        // Read from oracle_feed_latest table (denormalized, O(1))
+        const rows = [...this.sql.exec(
+          "SELECT * FROM oracle_feed_latest WHERE feed_id = ?", feedId,
+        )] as any[];
+
+        if (rows.length === 0) {
+          registers.set(resultReg, new TextEncoder().encode("null"));
+          return 0;
+        }
+
+        const r = rows[0];
+        const now = Date.now();
+        const result = JSON.stringify({
+          feed_id: r.feed_id,
+          value: r.value,
+          value_num: r.value_num,
+          round: r.round,
+          observers: r.observers,
+          committed_at: r.committed_at,
+          stale: now > r.stale_at,
+        });
+        registers.set(resultReg, new TextEncoder().encode(result));
+        return 1;
+      },
+
+      oracle_subscribe: (feedIdReg: number, callbackReg: number, deviationReg: number, intervalReg: number) => {
+        if (!deductFuel(FUEL_COSTS.oracle_subscribe)) return;
+        if (ctx.readOnly) return;
+        const feedIdBytes = registers.get(feedIdReg);
+        const callbackBytes = registers.get(callbackReg);
+        if (!feedIdBytes || !callbackBytes) return;
+
+        const feedId = new TextDecoder().decode(feedIdBytes);
+        const callbackMethod = new TextDecoder().decode(callbackBytes);
+        const deviationBytes = registers.get(deviationReg);
+        const intervalBytes = registers.get(intervalReg);
+        const deviationBps = deviationBytes ? parseInt(new TextDecoder().decode(deviationBytes)) || 0 : 0;
+        const minIntervalMs = intervalBytes ? parseInt(new TextDecoder().decode(intervalBytes)) || 0 : 0;
+
+        ctx.oracleSubscriptionRequests.push({
+          action: "subscribe",
+          feed_id: feedId,
+          callback_method: callbackMethod,
+          deviation_bps: deviationBps,
+          min_interval_ms: minIntervalMs,
+          contract: address,
+        });
+      },
+
+      oracle_unsubscribe: (subIdReg: number) => {
+        if (!deductFuel(FUEL_COSTS.oracle_unsubscribe)) return;
+        if (ctx.readOnly) return;
+        const subIdBytes = registers.get(subIdReg);
+        if (!subIdBytes) return;
+        const subId = new TextDecoder().decode(subIdBytes);
+        ctx.oracleSubscriptionRequests.push({
+          action: "unsubscribe",
+          feed_id: "",
+          subscription_id: subId,
+          contract: address,
+        });
+      },
+
+      oracle_request_random: (seedReg: number, callbackReg: number) => {
+        if (!deductFuel(FUEL_COSTS.oracle_request_random)) return;
+        if (ctx.readOnly) return;
+        const seedBytes = registers.get(seedReg);
+        const callbackBytes = registers.get(callbackReg);
+        if (!seedBytes || !callbackBytes) return;
+        const seed = new TextDecoder().decode(seedBytes);
+        const callbackMethod = new TextDecoder().decode(callbackBytes);
+        ctx.vrfRequests.push({ seed, callback_method: callbackMethod, contract: address });
       },
 
       trigger_manage: (actionReg: number, dataReg: number) => {
@@ -1146,6 +1252,61 @@ export class ContractExecutor {
           callback_method: new TextDecoder().decode(callbackBytes),
           aggregation: new TextDecoder().decode(aggBytes) as AggregationStrategy,
           json_path: registers.get(jsonPathReg)?.length ? new TextDecoder().decode(registers.get(jsonPathReg)) : undefined,
+          contract: address,
+        });
+      },
+
+      oracle_read_feed: (feedIdReg: number, resultReg: number): number => {
+        if (!deductFuel(FUEL_COSTS.oracle_read_feed)) return 0;
+        const feedIdBytes = registers.get(feedIdReg);
+        if (!feedIdBytes) return 0;
+        const feedId = new TextDecoder().decode(feedIdBytes);
+        const rows = [...this.sql.exec("SELECT * FROM oracle_feed_latest WHERE feed_id = ?", feedId)] as any[];
+        if (rows.length === 0) { registers.set(resultReg, new TextEncoder().encode("null")); return 0; }
+        const r = rows[0];
+        registers.set(resultReg, new TextEncoder().encode(JSON.stringify({
+          feed_id: r.feed_id, value: r.value, value_num: r.value_num, round: r.round,
+          observers: r.observers, committed_at: r.committed_at, stale: Date.now() > r.stale_at,
+        })));
+        return 1;
+      },
+
+      oracle_subscribe: (feedIdReg: number, callbackReg: number, deviationReg: number, intervalReg: number) => {
+        if (!deductFuel(FUEL_COSTS.oracle_subscribe)) return;
+        if (ctx.readOnly) return;
+        const feedIdBytes = registers.get(feedIdReg);
+        const callbackBytes = registers.get(callbackReg);
+        if (!feedIdBytes || !callbackBytes) return;
+        const deviationBytes = registers.get(deviationReg);
+        const intervalBytes = registers.get(intervalReg);
+        ctx.oracleSubscriptionRequests.push({
+          action: "subscribe", feed_id: new TextDecoder().decode(feedIdBytes),
+          callback_method: new TextDecoder().decode(callbackBytes),
+          deviation_bps: deviationBytes ? parseInt(new TextDecoder().decode(deviationBytes)) || 0 : 0,
+          min_interval_ms: intervalBytes ? parseInt(new TextDecoder().decode(intervalBytes)) || 0 : 0,
+          contract: address,
+        });
+      },
+
+      oracle_unsubscribe: (subIdReg: number) => {
+        if (!deductFuel(FUEL_COSTS.oracle_unsubscribe)) return;
+        if (ctx.readOnly) return;
+        const subIdBytes = registers.get(subIdReg);
+        if (!subIdBytes) return;
+        ctx.oracleSubscriptionRequests.push({
+          action: "unsubscribe", feed_id: "", subscription_id: new TextDecoder().decode(subIdBytes), contract: address,
+        });
+      },
+
+      oracle_request_random: (seedReg: number, callbackReg: number) => {
+        if (!deductFuel(FUEL_COSTS.oracle_request_random)) return;
+        if (ctx.readOnly) return;
+        const seedBytes = registers.get(seedReg);
+        const callbackBytes = registers.get(callbackReg);
+        if (!seedBytes || !callbackBytes) return;
+        ctx.vrfRequests.push({
+          seed: new TextDecoder().decode(seedBytes),
+          callback_method: new TextDecoder().decode(callbackBytes),
           contract: address,
         });
       },

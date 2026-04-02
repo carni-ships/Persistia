@@ -24,7 +24,7 @@ export interface GossipPeer {
 }
 
 export interface GossipEnvelope {
-  type: "vertex" | "event" | "peer_exchange" | "sync_request" | "sync_response" | "zk_proof" | "service_request" | "service_response";
+  type: "vertex" | "event" | "peer_exchange" | "sync_request" | "sync_response" | "zk_proof" | "service_request" | "service_response" | "oracle_observation" | "feed_demand" | "blackboard" | "blackboard_sync" | "oracle_digest_sync";
   sender_pubkey: string;
   sender_url: string;
   signature: string;         // signs the payload JSON
@@ -307,15 +307,27 @@ export class GossipManager {
   async flood(envelope: GossipEnvelope, excludePubkeys: Set<string> = new Set()): Promise<number> {
     let peers = this.getHealthyPeers().filter(p => !excludePubkeys.has(p.pubkey));
 
-    // Probabilistic sampling: when many peers are available, pick a random subset.
-    // Byzantine-safe as long as sample_size ≥ 2f+1 (messages propagate via multi-hop).
+    // Reputation-weighted sampling: prefer high-reputation validators so oracle
+    // observations (and other critical messages) reach quorum contributors first.
+    // A random jitter (0–20% of max reputation) prevents deterministic cliques.
     if (peers.length > GOSSIP_SAMPLE_THRESHOLD) {
-      // Fisher-Yates partial shuffle to select GOSSIP_SAMPLE_SIZE random peers
-      for (let i = peers.length - 1; i > 0 && i >= peers.length - GOSSIP_SAMPLE_SIZE; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [peers[i], peers[j]] = [peers[j], peers[i]];
-      }
-      peers = peers.slice(peers.length - GOSSIP_SAMPLE_SIZE);
+      const reputationMap = new Map<string, number>();
+      try {
+        const rows = [...this.sql.exec(
+          "SELECT pubkey, reputation FROM validators WHERE status = 'active'",
+        )] as any[];
+        for (const r of rows) reputationMap.set(r.pubkey, r.reputation ?? 0);
+      } catch { /* validators table may not exist yet — fall back to equal weight */ }
+
+      const maxRep = Math.max(1, ...Array.from(reputationMap.values()));
+      const jitterScale = maxRep * 0.2;
+
+      peers.sort((a, b) => {
+        const repA = (reputationMap.get(a.pubkey) ?? 0) + Math.random() * jitterScale;
+        const repB = (reputationMap.get(b.pubkey) ?? 0) + Math.random() * jitterScale;
+        return repB - repA;
+      });
+      peers = peers.slice(0, GOSSIP_SAMPLE_SIZE);
     }
 
     let delivered = 0;

@@ -30,8 +30,16 @@ extern "C" {
     fn origin(reg_id: u32);
     // Get this contract's own address
     fn self_address(reg_id: u32);
-    // Oracle: request external data (async two-phase)
+    // Oracle: request external data (async two-phase, legacy)
     fn oracle_request(url_reg: u32, callback_reg: u32, aggregation_reg: u32, json_path_reg: u32);
+    // Oracle Network: read latest feed value (synchronous pull)
+    fn oracle_read_feed(feed_id_reg: u32, result_reg: u32) -> u32;
+    // Oracle Network: subscribe to feed updates (push)
+    fn oracle_subscribe(feed_id_reg: u32, callback_reg: u32, deviation_reg: u32, interval_reg: u32);
+    // Oracle Network: unsubscribe from feed updates
+    fn oracle_unsubscribe(sub_id_reg: u32);
+    // Oracle Network: request verifiable random number
+    fn oracle_request_random(seed_reg: u32, callback_reg: u32);
     // Trigger: manage cron-like scheduled calls
     fn trigger_manage(action_reg: u32, data_reg: u32);
     // Deploy: programmatically deploy a new contract from WASM bytes
@@ -179,6 +187,67 @@ pub fn request_oracle(url: &str, callback_method: &str, aggregation: &str, json_
         None => write_reg(REG_SCRATCH_4, &[]),
     }
     unsafe { oracle_request(REG_SCRATCH_1, REG_SCRATCH_2, REG_SCRATCH_3, REG_SCRATCH_4) };
+}
+
+// ─── Oracle Network (PON) API ────────────────────────────────────────────────
+
+/// Read the latest value for a price feed. Returns the JSON-encoded feed data
+/// or None if the feed doesn't exist.
+///
+/// The returned JSON has this structure:
+/// ```json
+/// {"feed_id":"BTC/USD","value":"42000.50","value_num":42000.5,
+///  "round":123,"observers":5,"committed_at":1711500000000,"stale":false}
+/// ```
+///
+/// Available feeds: BTC/USD, ETH/USD, SOL/USD, BERA/USD, AVAX/USD, LINK/USD, etc.
+pub fn read_feed(feed_id: &str) -> Option<Vec<u8>> {
+    write_reg(REG_SCRATCH_1, feed_id.as_bytes());
+    let found = unsafe { oracle_read_feed(REG_SCRATCH_1, REG_SCRATCH_2) };
+    if found == 0 {
+        return None;
+    }
+    let data = read_reg(REG_SCRATCH_2);
+    if data == b"null" {
+        return None;
+    }
+    Some(data)
+}
+
+/// Subscribe to a feed for push updates. When the feed value changes beyond
+/// the specified deviation threshold, the callback method is called with
+/// the new value as JSON input.
+///
+/// - `feed_id`: e.g., "BTC/USD"
+/// - `callback`: method name to call with updates
+/// - `deviation_bps`: minimum deviation in basis points to trigger callback (0 = every update)
+/// - `min_interval_ms`: minimum interval between callbacks in milliseconds (0 = no throttle)
+pub fn subscribe_feed(feed_id: &str, callback: &str, deviation_bps: u32, min_interval_ms: u64) {
+    use alloc::format;
+    write_reg(REG_SCRATCH_1, feed_id.as_bytes());
+    write_reg(REG_SCRATCH_2, callback.as_bytes());
+    let dev_str = format!("{}", deviation_bps);
+    write_reg(REG_SCRATCH_3, dev_str.as_bytes());
+    let interval_str = format!("{}", min_interval_ms);
+    write_reg(REG_SCRATCH_4, interval_str.as_bytes());
+    unsafe { oracle_subscribe(REG_SCRATCH_1, REG_SCRATCH_2, REG_SCRATCH_3, REG_SCRATCH_4) };
+}
+
+/// Unsubscribe from a feed subscription by ID.
+pub fn unsubscribe_feed(sub_id: &str) {
+    write_reg(REG_SCRATCH_1, sub_id.as_bytes());
+    unsafe { oracle_unsubscribe(REG_SCRATCH_1) };
+}
+
+/// Request a verifiable random number. The result is delivered asynchronously
+/// to the callback method. The VRF uses quorum-combined Schnorr signatures
+/// to produce an unpredictable, verifiable random value.
+///
+/// The callback receives JSON: `{"request_id":"...","random":"hex...","round":N}`
+pub fn request_random(seed: &[u8], callback: &str) {
+    write_reg(REG_SCRATCH_1, seed);
+    write_reg(REG_SCRATCH_2, callback.as_bytes());
+    unsafe { oracle_request_random(REG_SCRATCH_1, REG_SCRATCH_2) };
 }
 
 // ─── Trigger API ─────────────────────────────────────────────────────────────

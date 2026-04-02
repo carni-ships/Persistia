@@ -28,6 +28,9 @@ import { AccountManager, pubkeyB64ToAddress, validateAddress } from "./wallet";
 import { MPPHandler, type MPPConfig, type MPPReceipt } from "./mpp";
 import { dispatchApiRoute } from "./ai-services";
 import { ServiceAttestationManager } from "./service-attestations";
+import { OracleNetwork } from "./oracle-network";
+import { OracleMeshManager } from "./oracle-mesh";
+import type { OracleObservationBatch, FeedRound, FeedSource, BlackboardItem } from "./types";
 import {
   createChallengeWindow, generateChallengeId, validateChallengeSubmission,
   resolveWithProof, resolveTimeout, buildChallengeWitness,
@@ -94,6 +97,8 @@ export class PersistiaWorldV4 implements DurableObject {
   vfs!: VirtualFilesystem;
   transcriptManager!: TranscriptManager;
   llmMetering!: LLMMeteringManager;
+  oracleNetwork!: OracleNetwork;
+  oracleMesh!: OracleMeshManager;
   shardName: string = "global-world";
   currentRound: number = 0;
   finalizedSeq: number = 0;
@@ -206,6 +211,20 @@ export class PersistiaWorldV4 implements DurableObject {
       CREATE INDEX idx_triggers_next ON triggers(enabled, next_fire);
     `);
 
+    // Batch 3b: Oracle Network (PON) tables — feed-based proactive oracle
+    sql.exec(`
+      CREATE TABLE oracle_feeds (id TEXT PRIMARY KEY, description TEXT, decimals INTEGER NOT NULL DEFAULT 8, heartbeat_ms INTEGER NOT NULL DEFAULT 60000, deviation_bps INTEGER NOT NULL DEFAULT 50, aggregation TEXT NOT NULL DEFAULT 'weighted_median', sources TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', category TEXT DEFAULT 'price', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, current_round INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE oracle_observations (feed_id TEXT NOT NULL, round INTEGER NOT NULL, observer TEXT NOT NULL, value TEXT NOT NULL, value_num REAL, source_count INTEGER DEFAULT 1, observed_at INTEGER NOT NULL, PRIMARY KEY (feed_id, round, observer));
+      CREATE INDEX idx_obs_feed_round ON oracle_observations(feed_id, round);
+      CREATE TABLE oracle_feed_rounds (feed_id TEXT NOT NULL, round INTEGER NOT NULL, value TEXT NOT NULL, value_num REAL, observers INTEGER NOT NULL, observations_hash TEXT NOT NULL, committed_at INTEGER NOT NULL, PRIMARY KEY (feed_id, round));
+      CREATE INDEX idx_feed_rounds_time ON oracle_feed_rounds(feed_id, committed_at);
+      CREATE TABLE oracle_feed_latest (feed_id TEXT PRIMARY KEY, value TEXT NOT NULL, value_num REAL, round INTEGER NOT NULL, observers INTEGER NOT NULL, committed_at INTEGER NOT NULL, stale_at INTEGER NOT NULL);
+      CREATE TABLE oracle_subscriptions (id TEXT PRIMARY KEY, feed_id TEXT NOT NULL, contract TEXT NOT NULL, callback_method TEXT NOT NULL, deviation_bps INTEGER DEFAULT 0, min_interval_ms INTEGER DEFAULT 0, last_delivered_at INTEGER DEFAULT 0, last_delivered_value TEXT, enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL);
+      CREATE INDEX idx_sub_feed ON oracle_subscriptions(feed_id, enabled);
+      CREATE TABLE oracle_vrf_requests (id TEXT PRIMARY KEY, seed TEXT NOT NULL, contract TEXT NOT NULL, callback_method TEXT NOT NULL, round INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending', result TEXT, created_at INTEGER NOT NULL, delivered_at INTEGER);
+      CREATE TABLE oracle_vrf_partials (request_id TEXT NOT NULL, validator TEXT NOT NULL, partial_sig TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (request_id, validator));
+    `);
+
     // Batch 4: cross-shard + ZK + validator tables
     sql.exec(`
       CREATE TABLE xshard_outbox (id TEXT PRIMARY KEY, target_shard TEXT NOT NULL, message_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL, delivered_at INTEGER);
@@ -268,6 +287,76 @@ export class PersistiaWorldV4 implements DurableObject {
       sql.exec(
         "INSERT OR IGNORE INTO network_config (key, value, updated_at, updated_by) VALUES (?, ?, ?, 'genesis')",
         k, v, Date.now(),
+      );
+    }
+
+    // Seed bootstrap oracle feeds (common DeFi price pairs)
+    this.seedBootstrapFeeds(sql);
+  }
+
+  private seedBootstrapFeeds(sql: any) {
+    const now = Date.now();
+    const ARB_RPC = "https://arb1.arbitrum.io/rpc";
+    const MEGA_RPC = "https://mainnet.megaeth.com/rpc";
+    // Each feed = one source. Users pick their preferred source when consuming data.
+    // Feed ID format: "PAIR:source" (e.g., "BTC/USD:pyth", "BTC/USD:chainlink")
+    const bootstrapFeeds: { id: string; description: string; sources: FeedSource[] }[] = [
+      // ── Pyth feeds (Hermes REST API, ~400ms latency) ──
+      { id: "BTC/USD:pyth", description: "Bitcoin / USD via Pyth",
+        sources: [{ type: "pyth", endpoint: "0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43", weight: 1 }] },
+      { id: "ETH/USD:pyth", description: "Ethereum / USD via Pyth",
+        sources: [{ type: "pyth", endpoint: "0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace", weight: 1 }] },
+      { id: "SOL/USD:pyth", description: "Solana / USD via Pyth",
+        sources: [{ type: "pyth", endpoint: "0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d", weight: 1 }] },
+      { id: "AVAX/USD:pyth", description: "Avalanche / USD via Pyth",
+        sources: [{ type: "pyth", endpoint: "0x93da3352f9f1d105fdfe4971cfa80e9dd777bfc5d0f683ebb6e1294b92137bb7", weight: 1 }] },
+      { id: "LINK/USD:pyth", description: "Chainlink / USD via Pyth",
+        sources: [{ type: "pyth", endpoint: "0x8ac0c70fff57e9aefdf5edf44b51d62c2d433653cbb2cf5cc06bb115af04d221", weight: 1 }] },
+      { id: "BERA/USD:pyth", description: "Berachain / USD via Pyth",
+        sources: [{ type: "pyth", endpoint: "0x962088abcfdbdb6e30db2e340c8cf887d9efb311b1f2f17b155a63dbb6d40265", weight: 1 }] },
+      { id: "USDC/USD:pyth", description: "USDC / USD via Pyth",
+        sources: [{ type: "pyth", endpoint: "0xeaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a", weight: 1 }] },
+      { id: "USDT/USD:pyth", description: "Tether / USD via Pyth",
+        sources: [{ type: "pyth", endpoint: "0x2b89b9dc8fdf9f34709a5b106b472f0f39bb6ca9ce04b0fd7f2e971688e2e53b", weight: 1 }] },
+
+      // ── Chainlink feeds (Arbitrum One on-chain aggregators) ──
+      { id: "BTC/USD:chainlink", description: "Bitcoin / USD via Chainlink (Arbitrum)",
+        sources: [{ type: "chainlink", endpoint: "0x6ce185860a4963106506C203335A2910413708e9", weight: 1, rpc_url: ARB_RPC }] },
+      { id: "ETH/USD:chainlink", description: "Ethereum / USD via Chainlink (Arbitrum)",
+        sources: [{ type: "chainlink", endpoint: "0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612", weight: 1, rpc_url: ARB_RPC }] },
+      { id: "SOL/USD:chainlink", description: "Solana / USD via Chainlink (Arbitrum)",
+        sources: [{ type: "chainlink", endpoint: "0x24ceA4b8ce57cdA5058b924B9B9987992450590c", weight: 1, rpc_url: ARB_RPC }] },
+      { id: "AVAX/USD:chainlink", description: "Avalanche / USD via Chainlink (Arbitrum)",
+        sources: [{ type: "chainlink", endpoint: "0x8bf61728eeDCE2F32c456454d87B5d6eD6150208", weight: 1, rpc_url: ARB_RPC }] },
+      { id: "LINK/USD:chainlink", description: "Chainlink / USD via Chainlink (Arbitrum)",
+        sources: [{ type: "chainlink", endpoint: "0x86E53CF1B870786351Da77A57575e79CB55812CB", weight: 1, rpc_url: ARB_RPC }] },
+      { id: "USDC/USD:chainlink", description: "USDC / USD via Chainlink (Arbitrum)",
+        sources: [{ type: "chainlink", endpoint: "0x50834F3163758fcC1Df9973b6e91f0F0F0434aD3", weight: 1, rpc_url: ARB_RPC }] },
+      { id: "USDT/USD:chainlink", description: "Tether / USD via Chainlink (Arbitrum)",
+        sources: [{ type: "chainlink", endpoint: "0x3f3f5dF88dC9F13eac63DF89EC16ef6e7E25DdE7", weight: 1, rpc_url: ARB_RPC }] },
+
+      // ── RedStone Bolt feeds (MegaETH, ~2.4ms updates) ──
+      { id: "BTC/USD:bolt", description: "Bitcoin / USD via RedStone Bolt (MegaETH)",
+        sources: [{ type: "redstone_bolt", endpoint: "0xf0DEbDAE819b354D076b0D162e399BE013A856d3", weight: 1, rpc_url: MEGA_RPC }] },
+      { id: "ETH/USD:bolt", description: "Ethereum / USD via RedStone Bolt (MegaETH)",
+        sources: [{ type: "redstone_bolt", endpoint: "0xc555c100DB24dF36D406243642C169CC5A937f09", weight: 1, rpc_url: MEGA_RPC }] },
+      { id: "SOL/USD:bolt", description: "Solana / USD via RedStone Bolt (MegaETH)",
+        sources: [{ type: "redstone_bolt", endpoint: "0xb9D0073aCb296719C26a8BF156e4b599174fe1d5", weight: 1, rpc_url: MEGA_RPC }] },
+      { id: "USDC/USD:bolt", description: "USDC / USD via RedStone Bolt (MegaETH)",
+        sources: [{ type: "redstone_bolt", endpoint: "0x4aF6b78d92432D32E3a635E824d3A541866f7a78", weight: 1, rpc_url: MEGA_RPC }] },
+      { id: "USDT/USD:bolt", description: "Tether / USD via RedStone Bolt (MegaETH)",
+        sources: [{ type: "redstone_bolt", endpoint: "0x26FB59e5562405F42f55661f790fA1Bd2F410A3d", weight: 1, rpc_url: MEGA_RPC }] },
+      { id: "DOGE/USD:bolt", description: "Dogecoin / USD via RedStone Bolt (MegaETH)",
+        sources: [{ type: "redstone_bolt", endpoint: "0xE23eCA12D7D2ED3829499556F6dCE06642AFd990", weight: 1, rpc_url: MEGA_RPC }] },
+      { id: "HYPE/USD:bolt", description: "Hyperliquid / USD via RedStone Bolt (MegaETH)",
+        sources: [{ type: "redstone_bolt", endpoint: "0xb81131B6368b3F0a83af09dB4E39Ac23DA96C2Db", weight: 1, rpc_url: MEGA_RPC }] },
+    ];
+
+    for (const feed of bootstrapFeeds) {
+      sql.exec(
+        `INSERT OR IGNORE INTO oracle_feeds (id, description, decimals, heartbeat_ms, deviation_bps, aggregation, sources, status, category, created_at, updated_at, current_round)
+         VALUES (?, ?, 8, 60000, 50, 'median', ?, 'active', 'price', ?, ?, 0)`,
+        feed.id, feed.description, JSON.stringify(feed.sources), now, now,
       );
     }
   }
@@ -455,6 +544,69 @@ export class PersistiaWorldV4 implements DurableObject {
         sql.exec("UPDATE governance_proposal_votes SET staked_at = voted_at WHERE staked_at IS NULL");
       }
     } catch {}
+
+    // Migration: Oracle Network (PON) tables
+    const ponTables = [
+      ["oracle_feeds", `CREATE TABLE oracle_feeds (id TEXT PRIMARY KEY, description TEXT, decimals INTEGER NOT NULL DEFAULT 8, heartbeat_ms INTEGER NOT NULL DEFAULT 60000, deviation_bps INTEGER NOT NULL DEFAULT 50, aggregation TEXT NOT NULL DEFAULT 'weighted_median', sources TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', category TEXT DEFAULT 'price', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, current_round INTEGER NOT NULL DEFAULT 0)`],
+      ["oracle_observations", `CREATE TABLE oracle_observations (feed_id TEXT NOT NULL, round INTEGER NOT NULL, observer TEXT NOT NULL, value TEXT NOT NULL, value_num REAL, source_count INTEGER DEFAULT 1, observed_at INTEGER NOT NULL, PRIMARY KEY (feed_id, round, observer)); CREATE INDEX idx_obs_feed_round ON oracle_observations(feed_id, round)`],
+      ["oracle_feed_rounds", `CREATE TABLE oracle_feed_rounds (feed_id TEXT NOT NULL, round INTEGER NOT NULL, value TEXT NOT NULL, value_num REAL, observers INTEGER NOT NULL, observations_hash TEXT NOT NULL, committed_at INTEGER NOT NULL, PRIMARY KEY (feed_id, round)); CREATE INDEX idx_feed_rounds_time ON oracle_feed_rounds(feed_id, committed_at)`],
+      ["oracle_feed_latest", `CREATE TABLE oracle_feed_latest (feed_id TEXT PRIMARY KEY, value TEXT NOT NULL, value_num REAL, round INTEGER NOT NULL, observers INTEGER NOT NULL, committed_at INTEGER NOT NULL, stale_at INTEGER NOT NULL)`],
+      ["oracle_subscriptions", `CREATE TABLE oracle_subscriptions (id TEXT PRIMARY KEY, feed_id TEXT NOT NULL, contract TEXT NOT NULL, callback_method TEXT NOT NULL, deviation_bps INTEGER DEFAULT 0, min_interval_ms INTEGER DEFAULT 0, last_delivered_at INTEGER DEFAULT 0, last_delivered_value TEXT, enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL); CREATE INDEX idx_sub_feed ON oracle_subscriptions(feed_id, enabled)`],
+      ["oracle_vrf_requests", `CREATE TABLE oracle_vrf_requests (id TEXT PRIMARY KEY, seed TEXT NOT NULL, contract TEXT NOT NULL, callback_method TEXT NOT NULL, round INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending', result TEXT, created_at INTEGER NOT NULL, delivered_at INTEGER)`],
+      ["oracle_vrf_partials", `CREATE TABLE oracle_vrf_partials (request_id TEXT NOT NULL, validator TEXT NOT NULL, partial_sig TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (request_id, validator))`],
+      ["oracle_feed_demand", `CREATE TABLE oracle_feed_demand (feed_id TEXT PRIMARY KEY, read_count INTEGER NOT NULL DEFAULT 0, subscription_count INTEGER NOT NULL DEFAULT 0, last_active INTEGER NOT NULL)`],
+      ["oracle_blackboard", `CREATE TABLE oracle_blackboard (id TEXT PRIMARY KEY, author TEXT NOT NULL, prefix TEXT NOT NULL, text TEXT NOT NULL, timestamp INTEGER NOT NULL, expires_at INTEGER NOT NULL); CREATE INDEX idx_bb_time ON oracle_blackboard(timestamp)`],
+      ["oracle_source_stats", `CREATE TABLE oracle_source_stats (feed_id TEXT NOT NULL, source_index INTEGER NOT NULL, source_type TEXT NOT NULL, success_count INTEGER NOT NULL DEFAULT 0, failure_count INTEGER NOT NULL DEFAULT 0, total_latency_ms INTEGER NOT NULL DEFAULT 0, last_success INTEGER NOT NULL DEFAULT 0, last_failure INTEGER NOT NULL DEFAULT 0, avg_freshness_ms REAL NOT NULL DEFAULT 0, PRIMARY KEY (feed_id, source_index))`],
+    ] as const;
+    for (const [name, ddl] of ponTables) {
+      try {
+        const exists = [...sql.exec("SELECT name FROM sqlite_master WHERE type='table' AND name=?", name)] as any[];
+        if (exists.length === 0) sql.exec(ddl);
+      } catch {}
+    }
+    // Seed bootstrap feeds if oracle_feeds table is empty
+    try {
+      const feedCount = [...sql.exec("SELECT COUNT(*) as cnt FROM oracle_feeds")] as any[];
+      if ((feedCount[0]?.cnt ?? 0) === 0) {
+        this.seedBootstrapFeeds(sql);
+      }
+    } catch {}
+
+    // Migration v3: switch from multi-source feeds to single-source feeds
+    // Each feed now has exactly one source. Old feeds (BTC/USD with 3 sources) get replaced
+    // by BTC/USD:pyth + BTC/USD:chainlink etc. CoinGecko/Binance sources removed (no license).
+    try {
+      if (!this.getKV("_feed_single_source_v3")) {
+        // Delete old multi-source feeds and their stale data
+        const oldIds = ["BTC/USD","ETH/USD","SOL/USD","AVAX/USD","LINK/USD","BERA/USD","USDC/USD","USDT/USD"];
+        for (const id of oldIds) {
+          sql.exec("DELETE FROM oracle_feeds WHERE id = ?", id);
+          sql.exec("DELETE FROM oracle_feed_latest WHERE feed_id = ?", id);
+          sql.exec("DELETE FROM oracle_feed_rounds WHERE feed_id = ?", id);
+          sql.exec("DELETE FROM oracle_observations WHERE feed_id = ?", id);
+        }
+        // Re-seed with single-source feeds
+        this.seedBootstrapFeeds(sql);
+        this.setKV("_feed_single_source_v3", "1");
+      }
+    } catch {}
+
+    // Migration v5: switch Chainlink from Ethereum to Arbitrum + add RedStone Bolt feeds
+    try {
+      if (!this.getKV("_feed_arb_bolt_v5")) {
+        // Delete old Chainlink feeds (Ethereum mainnet) — will be re-seeded with Arbitrum
+        const clFeeds = [...sql.exec("SELECT id FROM oracle_feeds WHERE id LIKE '%:chainlink'")] as any[];
+        for (const f of clFeeds) {
+          sql.exec("DELETE FROM oracle_feeds WHERE id = ?", f.id);
+          sql.exec("DELETE FROM oracle_feed_latest WHERE feed_id = ?", f.id);
+          sql.exec("DELETE FROM oracle_feed_rounds WHERE feed_id = ?", f.id);
+          sql.exec("DELETE FROM oracle_observations WHERE feed_id = ?", f.id);
+        }
+        // Re-seed all feeds (adds Arbitrum Chainlink + Bolt, Pyth already exists via INSERT OR IGNORE)
+        this.seedBootstrapFeeds(sql);
+        this.setKV("_feed_arb_bolt_v5", "1");
+      }
+    } catch {}
   }
 
   private async loadState() {
@@ -487,6 +639,31 @@ export class PersistiaWorldV4 implements DurableObject {
     // Contract executor + trigger manager
     this.contractExecutor = new ContractExecutor(sql, this.env.BLOB_STORE);
     this.triggerManager = new TriggerManager(sql);
+
+    // Oracle Network (PON) — proactive feed-based oracle
+    const nodePubkey = this.nodeIdentity?.pubkey || "self";
+    this.oracleNetwork = new OracleNetwork({
+      sql,
+      stateTree: this.stateTree,
+      nodePubkey,
+      getActiveNodeCount: () => this.getActiveNodeCount(),
+      getQuorumSize: (n: number) => getQuorumSize(n),
+      signPayload: async (data: string) => {
+        if (!this.nodeIdentity) return "";
+        return await sha256(`${nodePubkey}:${data}`);
+      },
+    });
+    this.oracleMesh = new OracleMeshManager(sql, nodePubkey);
+
+    // Wire source stats from oracle observations into dynamic scoring
+    this.oracleNetwork.onSourceStats = (feedId, results) => {
+      for (const r of results) {
+        this.oracleMesh.recordSourceResult(
+          feedId, r.source_index, r.source_type,
+          r.success, r.latency_ms, r.freshness_ms,
+        );
+      }
+    };
 
     // Gossip + anchoring + validator registry
     this.gossipManager = new GossipManager(sql);
@@ -597,6 +774,10 @@ export class PersistiaWorldV4 implements DurableObject {
       }
 
       this.gossipManager.setIdentity(this.nodeIdentity);
+
+      // Update oracle managers with real pubkey (loadState runs before identity init)
+      if (this.oracleMesh) this.oracleMesh.setNodePubkey(this.nodeIdentity.pubkey);
+      if (this.oracleNetwork) (this.oracleNetwork as any).nodePubkey = this.nodeIdentity.pubkey;
 
       // One-time migration: fix stale peer URLs that point to base origin without shard params
       if (this.shardName !== "global-world" && !this.env.NODE_URL && !this.getKV("_peer_url_fixed")) {
@@ -1018,6 +1199,9 @@ export class PersistiaWorldV4 implements DurableObject {
       }
       if (url.pathname.startsWith("/admin/")) {
         return this.handleAdminRoute(req, url);
+      }
+      if (url.pathname.startsWith("/oracle/")) {
+        return this.handleOracleNetworkRoute(req, url);
       }
       if (url.pathname.startsWith("/contract/")) {
         return this.handleContractRoute(req, url);
@@ -1829,12 +2013,76 @@ export class PersistiaWorldV4 implements DurableObject {
         }
       }
 
+      // ── Oracle Network: observe feeds every cycle for sub-round delivery ──
+      if (CONSENSUS_ENABLED && this.oracleNetwork) {
+        try {
+          // Feed sharding: only observe feeds assigned to this validator
+          const allFeeds = this.oracleNetwork.getActiveFeedConfigs();
+          const activeValidators = this.getActivePubkeys();
+          const { tier1, tier2 } = this.oracleMesh.getAssignedFeeds(allFeeds, activeValidators);
+          const assignedFeedIds = new Set([...tier1, ...tier2]);
+
+          const batch = await this.oracleNetwork.observe(assignedFeedIds);
+          if (batch.observations.length > 0) {
+            // Gossip our observations to peers
+            const envelope = {
+              type: "oracle_observation" as const,
+              sender_pubkey: this.nodeIdentity?.pubkey || "self",
+              sender_url: this.nodeUrl,
+              signature: batch.signature,
+              payload: batch,
+              timestamp: Date.now(),
+              nonce: await sha256(`oracle_obs:${Date.now()}:${this.nodeIdentity?.pubkey}`),
+            };
+            this.gossipManager.flood(envelope, new Set()).catch(() => {});
+            // Process our own observations (may trigger commits if quorum reached)
+            const committed = this.oracleNetwork.receiveObservations(batch);
+            for (const round of committed) {
+              await this.deliverFeedUpdate(round);
+            }
+          }
+
+          // Gossip feed demand map every 3rd cycle
+          if (cycle % 3 === 0) {
+            const demandMap = this.oracleMesh.getLocalDemandMap();
+            if (demandMap.demands.length > 0) {
+              const demandEnvelope = {
+                type: "feed_demand" as const,
+                sender_pubkey: this.nodeIdentity?.pubkey || "self",
+                sender_url: this.nodeUrl,
+                signature: "",
+                payload: demandMap,
+                timestamp: Date.now(),
+                nonce: await sha256(`demand:${Date.now()}:${this.nodeIdentity?.pubkey}`),
+              };
+              this.gossipManager.flood(demandEnvelope, new Set()).catch(() => {});
+            }
+          }
+
+          // Process pending VRF requests
+          const vrfRequests = this.oracleNetwork.getPendingVRFRequests();
+          for (const req of vrfRequests) {
+            const partial = await this.oracleNetwork.generateVRFPartial(req.id);
+            if (partial) {
+              const result = await this.oracleNetwork.tryFinalizeVRF(req.id);
+              if (result) {
+                await this.deliverVRFResult(req.id, result);
+              }
+            }
+          }
+          // Update staleness
+          this.oracleNetwork.updateStaleness();
+        } catch (e: any) {
+          console.warn(`Oracle Network observe error: ${e.message}`);
+        }
+      }
+
       // ── Deferred work (every Nth cycle) ──────────────────────────────────
       // Spread non-critical operations across alarm cycles to reduce per-alarm load.
 
-      // Every 5th cycle: oracle processing + settlement + anchoring
+      // Every 5th cycle: legacy oracle processing + settlement + anchoring
       if (cycle % 5 === 0) {
-        await this.processPendingOracles();
+        await this.processPendingOracles(); // legacy request-response oracle (backward compat)
 
         if (CONSENSUS_ENABLED) {
           await this.maybeAnchorState();
@@ -1883,6 +2131,9 @@ export class PersistiaWorldV4 implements DurableObject {
         this.transcriptManager.prune(7 * 86_400_000);
         // Prune LLM metering entries older than 7 days
         this.llmMetering.prune(7 * 86_400_000);
+        // Prune oracle network data (observations, old rounds, delivered VRF)
+        if (this.oracleNetwork) this.oracleNetwork.prune();
+        if (this.oracleMesh) this.oracleMesh.prune();
       }
 
       // Every 10th cycle (offset by 5): reprobe failed peers
@@ -4122,6 +4373,67 @@ export class PersistiaWorldV4 implements DurableObject {
             }
             return this.json({ ok: true });
           }
+          case "oracle_observation": {
+            if (this.oracleNetwork) {
+              const batch = envelope.payload as OracleObservationBatch;
+              const committed = this.oracleNetwork.receiveObservations(batch);
+              for (const round of committed) {
+                await this.deliverFeedUpdate(round);
+              }
+            }
+            return this.json({ ok: true });
+          }
+          case "feed_demand": {
+            if (this.oracleMesh) {
+              this.oracleMesh.mergeDemandMap(envelope.payload);
+            }
+            return this.json({ ok: true });
+          }
+          case "blackboard": {
+            if (this.oracleMesh) {
+              const item = envelope.payload as BlackboardItem;
+              this.oracleMesh.receiveMessage(item);
+            }
+            return this.json({ ok: true });
+          }
+          case "blackboard_sync": {
+            // Digest sync: peer sends their digest, we respond with items they're missing
+            if (this.oracleMesh) {
+              const peerDigest = envelope.payload;
+              const missingIds = this.oracleMesh.getMissingIds(peerDigest);
+              if (missingIds.length > 0) {
+                // Send back items the peer is missing
+                const items = this.oracleMesh.getItemsByIds(missingIds);
+                for (const item of items) {
+                  this.oracleMesh.receiveMessage(item);
+                }
+              }
+              // Also check what WE are missing from the peer
+              const ourDigest = this.oracleMesh.getDigest();
+              const weNeed = peerDigest.item_ids?.filter((id: string) =>
+                !ourDigest.item_ids.includes(id),
+              ) || [];
+              // Request missing items via fetch (would need a follow-up, but for simplicity store digest)
+            }
+            return this.json({ ok: true, digest: this.oracleMesh?.getDigest() });
+          }
+          case "oracle_digest_sync": {
+            // Observation round digest sync for catch-up
+            if (this.oracleMesh) {
+              const peerDigest = envelope.payload.digest || [];
+              const rounds = envelope.payload.rounds || [];
+              if (peerDigest.length > 0) {
+                // Peer requesting: they sent their digest, respond with what they need
+                const missing = this.oracleMesh.getMissingRounds(peerDigest);
+                // We'd send back round data, but for gossip just ingest what they sent
+              }
+              if (rounds.length > 0) {
+                // Peer sent us rounds we were missing
+                this.oracleMesh.ingestSyncedRounds(rounds);
+              }
+            }
+            return this.json({ ok: true });
+          }
           default:
             return this.json({ error: "Unknown gossip type" }, 400);
         }
@@ -6011,6 +6323,18 @@ export class PersistiaWorldV4 implements DurableObject {
     return this._activeCache!.nodes;
   }
 
+  private getActiveValidatorsWithReputation(): { pubkey: string; reputation: number }[] {
+    try {
+      const rows = [...this.state.storage.sql.exec(
+        "SELECT pubkey, reputation FROM validators WHERE status = 'active' AND reputation >= 50",
+      )] as any[];
+      return rows.map((r: any) => ({ pubkey: r.pubkey, reputation: r.reputation ?? 100 }));
+    } catch {
+      // Fallback: use active nodes with default reputation
+      return this.getActivePubkeys().map(p => ({ pubkey: p, reputation: 100 }));
+    }
+  }
+
   private getConsensusStatus(): ConsensusStatus & Record<string, any> {
     // In single-node / direct-apply mode, report latestSeq as finalized
     const effectiveSeq = this.finalizedSeq > 0 ? this.finalizedSeq : this.latestSeq;
@@ -6435,7 +6759,7 @@ export class PersistiaWorldV4 implements DurableObject {
             this.stateTree.markDirty(stateKey, fk.deleted ? null : stateKey);
           }
         }
-        // Process any oracle/trigger/deploy requests emitted by the contract
+        // Process any oracle/trigger/deploy/subscription/vrf requests emitted by the contract
         if (result.oracle_requests) {
           await this.processOracleEmits(payload.contract, result.oracle_requests);
         }
@@ -6444,6 +6768,12 @@ export class PersistiaWorldV4 implements DurableObject {
         }
         if (result.deploy_requests) {
           await this.processDeployEmits(result.deploy_requests);
+        }
+        if (result.oracle_subscription_requests) {
+          await this.processOracleSubscriptionEmits(result.oracle_subscription_requests);
+        }
+        if (result.vrf_requests) {
+          await this.processVRFEmits(result.vrf_requests);
         }
         break;
       }
@@ -6485,6 +6815,12 @@ export class PersistiaWorldV4 implements DurableObject {
         }
         if (callResult.deploy_requests) {
           await this.processDeployEmits(callResult.deploy_requests);
+        }
+        if (callResult.oracle_subscription_requests) {
+          await this.processOracleSubscriptionEmits(callResult.oracle_subscription_requests);
+        }
+        if (callResult.vrf_requests) {
+          await this.processVRFEmits(callResult.vrf_requests);
         }
         break;
       }
@@ -6842,6 +7178,40 @@ export class PersistiaWorldV4 implements DurableObject {
   }
 
   /**
+   * Process oracle subscription/unsubscription requests emitted by a contract.
+   */
+  private async processOracleSubscriptionEmits(requests: import("./contract-executor").OracleSubscriptionEmit[]) {
+    for (const req of requests) {
+      try {
+        if (req.action === "subscribe" && req.callback_method) {
+          await this.oracleNetwork.addSubscription(
+            req.feed_id, req.contract, req.callback_method,
+            req.deviation_bps || 0, req.min_interval_ms || 0,
+          );
+        } else if (req.action === "unsubscribe" && req.subscription_id) {
+          this.oracleNetwork.removeSubscription(req.subscription_id);
+        }
+      } catch (e: any) {
+        console.warn(`Oracle subscription emit failed: ${e.message}`);
+      }
+    }
+  }
+
+  /**
+   * Process VRF requests emitted by a contract.
+   */
+  private async processVRFEmits(requests: import("./contract-executor").VRFRequestEmit[]) {
+    for (const req of requests) {
+      try {
+        await this.oracleNetwork.createVRFRequest(req.seed, req.contract, req.callback_method);
+      } catch (e: any) {
+        console.warn(`VRF request emit failed: ${e.message}`);
+      }
+    }
+    this.scheduleAlarm();
+  }
+
+  /**
    * Process trigger management requests emitted by a contract during execution.
    */
   private async processTriggerEmits(fallbackContract: string, creator: string, requests: TriggerRequestEmit[]) {
@@ -6876,6 +7246,282 @@ export class PersistiaWorldV4 implements DurableObject {
       } catch (e: any) {
         console.warn(`Contract-initiated deploy failed: ${e.message}`);
       }
+    }
+  }
+
+  // ─── Oracle Network (PON) Route Handler ──────────────────────────────────
+
+  private async handleOracleNetworkRoute(req: Request, url: URL): Promise<Response> {
+    const path = url.pathname;
+
+    // GET /oracle/feeds — list all feeds
+    // POST /oracle/feeds — register a new feed
+    if (path === "/oracle/feeds") {
+      if (req.method === "POST") {
+        const body = await req.json() as any;
+        try {
+          const id = this.oracleNetwork.registerFeed(body);
+          return this.json({ ok: true, feed_id: id });
+        } catch (e: any) {
+          return this.json({ error: e.message }, 400);
+        }
+      }
+      const feeds = this.oracleNetwork.getActiveFeedConfigs();
+      const latest = this.oracleNetwork.getAllFeedLatest();
+      const latestMap = new Map(latest.map(l => [l.feed_id, l]));
+      return this.json({
+        feeds: feeds.map(f => ({ ...f, latest: latestMap.get(f.id) || null })),
+      });
+    }
+
+    // GET /oracle/feeds/latest — all latest values only
+    if (path === "/oracle/feeds/latest") {
+      return this.json({ feeds: this.oracleNetwork.getAllFeedLatest() });
+    }
+
+
+
+    // GET /oracle/feeds/:id — single feed config + latest
+    const feedMatch = path.match(/^\/oracle\/feeds\/([^/]+)$/);
+    if (feedMatch) {
+      const feedId = decodeURIComponent(feedMatch[1]);
+      const config = this.oracleNetwork.getFeedConfig(feedId);
+      if (!config) return this.json({ error: "Feed not found" }, 404);
+      const latest = this.oracleNetwork.getFeedLatest(feedId);
+      this.oracleMesh.recordDemand(feedId, "read");
+      return this.json({ feed: config, latest });
+    }
+
+    // GET /oracle/feeds/:id/rounds?limit=N — historical rounds
+    const roundsMatch = path.match(/^\/oracle\/feeds\/([^/]+)\/rounds$/);
+    if (roundsMatch) {
+      const feedId = decodeURIComponent(roundsMatch[1]);
+      const limit = parseInt(url.searchParams.get("limit") || "50");
+      const rounds = this.oracleNetwork.getFeedHistory(feedId, limit);
+      return this.json({ rounds });
+    }
+
+    // GET /oracle/feeds/:id/latest — single feed latest value
+    const latestMatch = path.match(/^\/oracle\/feeds\/([^/]+)\/latest$/);
+    if (latestMatch) {
+      const feedId = decodeURIComponent(latestMatch[1]);
+      const latest = this.oracleNetwork.getFeedLatest(feedId);
+      if (!latest) return this.json({ error: "No data for feed" }, 404);
+      this.oracleMesh.recordDemand(feedId, "read");
+      return this.json(latest);
+    }
+
+    // POST /oracle/feeds/:id/subscribe — create push subscription
+    const subMatch = path.match(/^\/oracle\/feeds\/([^/]+)\/subscribe$/);
+    if (subMatch && req.method === "POST") {
+      const feedId = decodeURIComponent(subMatch[1]);
+      const body = await req.json() as any;
+      if (!body.contract || !body.callback_method) {
+        return this.json({ error: "contract and callback_method required" }, 400);
+      }
+      try {
+        const subId = await this.oracleNetwork.addSubscription(
+          feedId, body.contract, body.callback_method,
+          body.deviation_bps || 0, body.min_interval_ms || 0,
+        );
+        this.oracleMesh.recordDemand(feedId, "subscribe");
+        return this.json({ ok: true, subscription_id: subId });
+      } catch (e: any) {
+        return this.json({ error: e.message }, 400);
+      }
+    }
+
+    // GET /oracle/subscriptions?contract=... — list subscriptions for a contract
+    if (path === "/oracle/subscriptions") {
+      const contract = url.searchParams.get("contract");
+      if (!contract) return this.json({ error: "contract required" }, 400);
+      return this.json({ subscriptions: this.oracleNetwork.getSubscriptionsForContract(contract) });
+    }
+
+    // POST /oracle/vrf/request — request random number
+    if (path === "/oracle/vrf/request" && req.method === "POST") {
+      const body = await req.json() as any;
+      if (!body.seed || !body.contract || !body.callback_method) {
+        return this.json({ error: "seed, contract, callback_method required" }, 400);
+      }
+      const id = await this.oracleNetwork.createVRFRequest(body.seed, body.contract, body.callback_method);
+      return this.json({ ok: true, request_id: id });
+    }
+
+    // GET /oracle/vrf/:id — check VRF status
+    const vrfMatch = path.match(/^\/oracle\/vrf\/([^/]+)$/);
+    if (vrfMatch) {
+      const vrfId = vrfMatch[1];
+      const vrfReq = this.oracleNetwork.getVRFRequest(vrfId);
+      if (!vrfReq) return this.json({ error: "VRF request not found" }, 404);
+      return this.json(vrfReq);
+    }
+
+    // ── Mesh Intelligence Routes ──
+
+    // GET /oracle/demand — feed demand map (sorted by hotness)
+    if (path === "/oracle/demand") {
+      return this.json({ demands: this.oracleMesh.getFeedsByDemand() });
+    }
+
+    // GET /oracle/blackboard?q=...&limit=N — search or feed
+    // POST /oracle/blackboard — post a message
+    if (path === "/oracle/blackboard") {
+      if (req.method === "POST") {
+        const body = await req.json() as any;
+        if (!body.prefix || !body.text) {
+          return this.json({ error: "prefix and text required" }, 400);
+        }
+        const item = this.oracleMesh.postMessage(body.prefix, body.text);
+        if (!item) return this.json({ error: "Rate limited" }, 429);
+        // Gossip to peers
+        const envelope = {
+          type: "blackboard" as const,
+          sender_pubkey: this.nodeIdentity?.pubkey || "self",
+          sender_url: this.nodeUrl,
+          signature: "",
+          payload: item,
+          timestamp: Date.now(),
+          nonce: `bb-${item.id}`,
+        };
+        this.gossipManager.flood(envelope, new Set()).catch(() => {});
+        return this.json({ ok: true, item });
+      }
+      const query = url.searchParams.get("q");
+      const limit = parseInt(url.searchParams.get("limit") || "50");
+      if (query) {
+        return this.json({ messages: this.oracleMesh.searchMessages(query, limit) });
+      }
+      const sinceHours = parseFloat(url.searchParams.get("since_hours") || "24");
+      return this.json({ messages: this.oracleMesh.getRecentMessages(sinceHours * 3_600_000, limit) });
+    }
+
+    // GET /oracle/leaders — current feed leader assignments
+    if (path === "/oracle/leaders") {
+      const feeds = this.oracleNetwork.getActiveFeedConfigs();
+      const validators = this.getActiveValidatorsWithReputation();
+      const assignments = this.oracleMesh.getFeedLeaderAssignments(feeds, validators, this.currentRound);
+      return this.json({ assignments, epoch: this.currentRound });
+    }
+
+    // GET /oracle/sharding — current feed observation assignments for this node
+    if (path === "/oracle/sharding") {
+      const feeds = this.oracleNetwork.getActiveFeedConfigs();
+      const activeValidators = this.getActivePubkeys();
+      const { tier1, tier2 } = this.oracleMesh.getAssignedFeeds(feeds, activeValidators);
+      return this.json({
+        node: this.nodeIdentity?.pubkey,
+        tier1_feeds: tier1,
+        tier2_feeds: tier2,
+        total_feeds: feeds.length,
+        active_validators: activeValidators.length,
+      });
+    }
+
+    // GET /oracle/source-stats/:feedId — source reliability stats
+    const sourceStatsMatch = path.match(/^\/oracle\/source-stats\/([^/]+)$/);
+    if (sourceStatsMatch) {
+      const feedId = decodeURIComponent(sourceStatsMatch[1]);
+      const stats = this.oracleMesh.getSourceStats(feedId);
+      const weights = this.oracleMesh.computeSourceWeights(feedId);
+      return this.json({
+        feed_id: feedId,
+        sources: stats,
+        dynamic_weights: Object.fromEntries(weights),
+      });
+    }
+
+    // POST /oracle/challenge — challenge a suspicious observation
+    if (path === "/oracle/challenge" && req.method === "POST") {
+      const body = await req.json() as any;
+      if (!body.challenger || !body.feed_id || !body.round || !body.target_observer) {
+        return this.json({ error: "challenger, feed_id, round, target_observer required" }, 400);
+      }
+      const result = this.oracleNetwork.challengeObservation(
+        body.challenger, body.feed_id, body.round, body.target_observer,
+      );
+      return this.json(result);
+    }
+
+    return this.json({ error: "Unknown oracle endpoint" }, 404);
+  }
+
+  // ─── Oracle Network Feed Delivery ───────────────────────────────────────
+
+  /**
+   * Deliver a committed feed round: update state, fire subscriptions, broadcast.
+   */
+  private async deliverFeedUpdate(round: FeedRound) {
+    // Broadcast to WebSocket clients
+    this.broadcast({
+      type: "oracle.feed_update",
+      feed_id: round.feed_id,
+      round: round.round,
+      value: round.value,
+      value_num: round.value_num,
+      observers: round.observers,
+      committed_at: round.committed_at,
+    });
+
+    // Broadcast to channel subscribers
+    this.broadcastToChannel(`oracle:${round.feed_id}`, {
+      type: "oracle.feed_update",
+      feed_id: round.feed_id,
+      round: round.round,
+      value: round.value,
+      value_num: round.value_num,
+      observers: round.observers,
+    });
+
+    // Fire push subscriptions
+    const subs = this.oracleNetwork.getTriggeredSubscriptions(
+      round.feed_id, round.value, round.value_num,
+    );
+    for (const sub of subs) {
+      try {
+        const payload = JSON.stringify({
+          feed_id: round.feed_id,
+          value: round.value,
+          value_num: round.value_num,
+          round: round.round,
+          observers: round.observers,
+        });
+        const resultBytes = new TextEncoder().encode(payload);
+        await this.contractExecutor.call(
+          sub.contract, sub.callback_method, resultBytes, "oracle:feed", 1_000_000,
+        );
+        this.oracleNetwork.markSubscriptionDelivered(sub.id, round.value);
+      } catch (e: any) {
+        console.warn(`Oracle subscription delivery failed for ${sub.id}: ${e.message}`);
+      }
+    }
+  }
+
+  /**
+   * Deliver a finalized VRF result to the requesting contract.
+   */
+  private async deliverVRFResult(requestId: string, randomValue: string) {
+    const req = this.oracleNetwork.getVRFRequest(requestId);
+    if (!req) return;
+
+    try {
+      const payload = JSON.stringify({
+        request_id: requestId,
+        random: randomValue,
+        round: req.round,
+      });
+      const resultBytes = new TextEncoder().encode(payload);
+      await this.contractExecutor.call(
+        req.contract, req.callback_method, resultBytes, "oracle:vrf", 1_000_000,
+      );
+
+      this.broadcast({
+        type: "oracle.vrf_delivered",
+        request_id: requestId,
+        contract: req.contract,
+      });
+    } catch (e: any) {
+      console.warn(`VRF delivery failed for ${requestId}: ${e.message}`);
     }
   }
 
@@ -7068,6 +7714,12 @@ export class PersistiaWorldV4 implements DurableObject {
           }
           if (result.deploy_requests) {
             await this.processDeployEmits(result.deploy_requests);
+          }
+          if (result.oracle_subscription_requests) {
+            await this.processOracleSubscriptionEmits(result.oracle_subscription_requests);
+          }
+          if (result.vrf_requests) {
+            await this.processVRFEmits(result.vrf_requests);
           }
         }
 

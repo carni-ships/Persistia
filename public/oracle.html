@@ -1,0 +1,1244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Persistia Oracle Network</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&display=swap');
+
+    :root {
+      --bg: #0a0a0f;
+      --surface: #12121a;
+      --surface-2: #1a1a25;
+      --surface-3: #22222f;
+      --border: #2a2a3a;
+      --text: #e0e0e8;
+      --text-dim: #7a7a8e;
+      --accent: #6c5ce7;
+      --accent-dim: rgba(108,92,231,0.15);
+      --green: #00d2a0;
+      --green-dim: rgba(0,210,160,0.15);
+      --yellow: #ffd166;
+      --yellow-dim: rgba(255,209,102,0.15);
+      --red: #ff6b6b;
+      --red-dim: rgba(255,107,107,0.15);
+      --blue: #48bfe3;
+      --blue-dim: rgba(72,191,227,0.15);
+      --orange: #f0932b;
+      --orange-dim: rgba(240,147,43,0.15);
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 13px;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ─── Header ─────────────────────────────────────────── */
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 20px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+      height: 48px;
+      flex-shrink: 0;
+    }
+
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .logo-icon {
+      width: 28px;
+      height: 28px;
+      background: var(--accent);
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+      font-size: 14px;
+    }
+
+    .logo-text {
+      font-size: 16px;
+      font-weight: 600;
+      letter-spacing: -0.5px;
+    }
+
+    .logo-tag {
+      font-size: 9px;
+      color: var(--text-dim);
+      background: var(--surface-2);
+      padding: 2px 6px;
+      border-radius: 3px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .header-right {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--red);
+      transition: background 0.3s;
+    }
+
+    .status-dot.connected { background: var(--green); }
+
+    .status-label {
+      font-size: 11px;
+      color: var(--text-dim);
+    }
+
+    .nav-links {
+      display: flex;
+      gap: 4px;
+    }
+
+    .nav-links a {
+      color: var(--text-dim);
+      text-decoration: none;
+      font-size: 11px;
+      padding: 4px 8px;
+      border-radius: 4px;
+      transition: all 0.15s;
+    }
+
+    .nav-links a:hover { color: var(--text); background: var(--surface-2); }
+    .nav-links a.active { color: var(--accent); background: var(--accent-dim); }
+
+    /* ─── Stats Bar ──────────────────────────────────────── */
+    .stats-bar {
+      display: flex;
+      gap: 1px;
+      background: var(--border);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    .stat {
+      flex: 1;
+      background: var(--surface);
+      padding: 10px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+
+    .stat-label {
+      font-size: 9px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--text-dim);
+    }
+
+    .stat-value {
+      font-size: 18px;
+      font-weight: 600;
+    }
+
+    .stat-value.green { color: var(--green); }
+    .stat-value.yellow { color: var(--yellow); }
+    .stat-value.red { color: var(--red); }
+    .stat-value.blue { color: var(--blue); }
+
+    /* ─── Tab Bar ────────────────────────────────────────── */
+    .tab-bar {
+      display: flex;
+      gap: 0;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+      flex-shrink: 0;
+      overflow-x: auto;
+    }
+
+    .tab-btn {
+      padding: 10px 20px;
+      font-family: inherit;
+      font-size: 11px;
+      font-weight: 500;
+      color: var(--text-dim);
+      background: none;
+      border: none;
+      border-bottom: 2px solid transparent;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: all 0.15s;
+    }
+
+    .tab-btn:hover { color: var(--text); background: var(--surface-2); }
+    .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+    /* ─── Main Content ───────────────────────────────────── */
+    main {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
+
+    /* ─── Feed Grid ──────────────────────────────────────── */
+    .feed-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+      gap: 12px;
+    }
+
+    .feed-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+      transition: border-color 0.15s;
+      cursor: pointer;
+    }
+
+    .feed-card:hover { border-color: var(--accent); }
+    .feed-card.stale { border-color: var(--yellow); }
+    .feed-card.stale .feed-status { color: var(--yellow); }
+
+    .feed-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      margin-bottom: 12px;
+    }
+
+    .feed-pair { font-size: 16px; font-weight: 600; }
+
+    .feed-status {
+      font-size: 9px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      padding: 2px 6px;
+      border-radius: 3px;
+      background: var(--green-dim);
+      color: var(--green);
+    }
+
+    .feed-status.stale { background: var(--yellow-dim); color: var(--yellow); }
+    .feed-status.paused { background: var(--red-dim); color: var(--red); }
+
+    .feed-price {
+      font-size: 28px;
+      font-weight: 700;
+      margin-bottom: 4px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .feed-change { font-size: 12px; margin-bottom: 12px; }
+    .feed-change.up { color: var(--green); }
+    .feed-change.down { color: var(--red); }
+    .feed-change.flat { color: var(--text-dim); }
+
+    .feed-meta {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+      font-size: 11px;
+      color: var(--text-dim);
+      border-top: 1px solid var(--border);
+      padding-top: 10px;
+    }
+
+    .feed-meta-item { display: flex; justify-content: space-between; }
+    .feed-meta-item span:last-child { color: var(--text); font-weight: 500; }
+
+    /* ─── Source Badges ───────────────────────────────────── */
+    .feed-sources { display: flex; gap: 4px; margin-top: 8px; flex-wrap: wrap; }
+
+    .source-badge {
+      font-size: 9px;
+      padding: 2px 6px;
+      border-radius: 3px;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+      font-weight: 500;
+    }
+
+    .source-badge.pyth { background: var(--accent-dim); color: var(--accent); }
+    .source-badge.chainlink { background: var(--blue-dim); color: var(--blue); }
+    .source-badge.redstone { background: var(--red-dim); color: var(--red); }
+    .source-badge.redstone_bolt, .source-badge.bolt { background: #ff4d4d22; color: #ff4d4d; }
+    .source-badge.coingecko { background: var(--green-dim); color: var(--green); display: none; }
+    .source-badge.binance { background: var(--yellow-dim); color: var(--yellow); display: none; }
+    .source-badge.http { background: var(--surface-3); color: var(--text-dim); }
+
+    /* ─── Detail Panel ───────────────────────────────────── */
+    .detail-panel { display: none; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 20px; }
+    .detail-panel.visible { display: block; }
+
+    .detail-title {
+      font-size: 20px;
+      font-weight: 700;
+      margin-bottom: 16px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .detail-close {
+      margin-left: auto;
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+      padding: 4px 10px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 11px;
+    }
+
+    .detail-close:hover { border-color: var(--text-dim); color: var(--text); }
+
+    /* ─── Tables ─────────────────────────────────────────── */
+    .data-table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    .data-table th {
+      text-align: left;
+      font-size: 9px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--text-dim);
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border);
+      font-weight: 500;
+    }
+
+    .data-table td {
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .data-table tr:hover td { background: var(--surface-2); }
+
+    /* ─── Demand Bar ─────────────────────────────────────── */
+    .demand-bar-container { display: flex; align-items: center; gap: 8px; }
+    .demand-bar {
+      flex: 1;
+      height: 6px;
+      background: var(--surface-3);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+    .demand-bar-fill {
+      height: 100%;
+      border-radius: 3px;
+      transition: width 0.3s;
+    }
+
+    /* ─── Blackboard ─────────────────────────────────────── */
+    .bb-message {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin-bottom: 8px;
+    }
+
+    .bb-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 6px;
+    }
+
+    .bb-prefix {
+      font-size: 9px;
+      padding: 2px 6px;
+      border-radius: 3px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+    }
+
+    .bb-prefix.STATUS { background: var(--blue-dim); color: var(--blue); }
+    .bb-prefix.ALERT { background: var(--red-dim); color: var(--red); }
+    .bb-prefix.DEBUG { background: var(--surface-3); color: var(--text-dim); }
+    .bb-prefix.FINDING { background: var(--green-dim); color: var(--green); }
+    .bb-prefix.TIP { background: var(--accent-dim); color: var(--accent); }
+
+    .bb-author { font-size: 10px; color: var(--text-dim); font-family: monospace; }
+    .bb-time { font-size: 10px; color: var(--text-dim); margin-left: auto; }
+    .bb-text { font-size: 12px; line-height: 1.5; }
+
+    .bb-compose {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+
+    .bb-compose select, .bb-compose input, .bb-compose button {
+      font-family: inherit;
+      font-size: 12px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background: var(--surface-2);
+      color: var(--text);
+      padding: 6px 10px;
+    }
+
+    .bb-compose input { flex: 1; }
+    .bb-compose button {
+      background: var(--accent);
+      border-color: var(--accent);
+      cursor: pointer;
+      font-weight: 600;
+    }
+    .bb-compose button:hover { opacity: 0.85; }
+
+    /* ─── Source Stats ────────────────────────────────────── */
+    .score-bar {
+      width: 60px;
+      height: 6px;
+      background: var(--surface-3);
+      border-radius: 3px;
+      overflow: hidden;
+      display: inline-block;
+      vertical-align: middle;
+      margin-right: 6px;
+    }
+
+    .score-bar-fill {
+      height: 100%;
+      border-radius: 3px;
+    }
+
+    /* ─── Sharding ───────────────────────────────────────── */
+    .shard-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 8px;
+    }
+
+    .shard-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 10px 14px;
+    }
+
+    .shard-card .feed-id { font-weight: 600; font-size: 13px; margin-bottom: 4px; }
+
+    .tier-badge {
+      font-size: 9px;
+      padding: 1px 5px;
+      border-radius: 3px;
+      font-weight: 600;
+      text-transform: uppercase;
+    }
+
+    .tier-badge.tier1 { background: var(--green-dim); color: var(--green); }
+    .tier-badge.tier2 { background: var(--blue-dim); color: var(--blue); }
+
+    /* ─── Feed Toolbar ───────────────────────────────────── */
+    .feed-toolbar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+
+    .feed-toolbar label {
+      font-size: 11px;
+      color: var(--text-dim);
+    }
+
+    .feed-toolbar select {
+      font-family: inherit;
+      font-size: 11px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background: var(--surface-2);
+      color: var(--text);
+      padding: 4px 8px;
+    }
+
+    .group-header {
+      grid-column: 1 / -1;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-dim);
+      padding: 8px 0 4px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 4px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .group-header .source-badge { font-size: 10px; }
+
+    /* ─── Sparkline ──────────────────────────────────────── */
+    .sparkline { height: 32px; margin: 8px 0 4px; }
+    .sparkline svg { width: 100%; height: 100%; }
+    .sparkline path { fill: none; stroke: var(--accent); stroke-width: 1.5; }
+    .sparkline .area { fill: var(--accent-dim); stroke: none; }
+
+    /* ─── Loading / Empty ────────────────────────────────── */
+    .loading { display: flex; align-items: center; justify-content: center; padding: 60px; color: var(--text-dim); font-size: 12px; }
+
+    .spinner {
+      width: 16px; height: 16px;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      margin-right: 8px;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .empty { text-align: center; padding: 60px 20px; color: var(--text-dim); }
+    .empty-icon { font-size: 32px; margin-bottom: 12px; opacity: 0.5; }
+    .empty-title { font-size: 14px; font-weight: 600; margin-bottom: 4px; color: var(--text); }
+
+    /* ─── Responsive ─────────────────────────────────────── */
+    @media (max-width: 640px) {
+      .stats-bar { flex-wrap: wrap; }
+      .stat { min-width: 50%; }
+      .feed-grid { grid-template-columns: 1fr; }
+      .feed-price { font-size: 22px; }
+      .shard-grid { grid-template-columns: 1fr; }
+    }
+
+    /* ─── Flash animation ────────────────────────────────── */
+    @keyframes flash-green { 0% { background: var(--green-dim); } 100% { background: transparent; } }
+    @keyframes flash-red { 0% { background: var(--red-dim); } 100% { background: transparent; } }
+    .flash-up { animation: flash-green 0.6s ease-out; }
+    .flash-down { animation: flash-red 0.6s ease-out; }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-icon">P</div>
+    <span class="logo-text">Persistia</span>
+    <span class="logo-tag">Oracle Network</span>
+  </div>
+  <div class="nav-links">
+    <a href="/dashboard">Explorer</a>
+    <a href="/oracle" class="active">Oracle</a>
+    <a href="/wallet">Wallet</a>
+    <a href="/services">Services</a>
+  </div>
+  <div class="header-right">
+    <span class="status-label" id="ws-label">Disconnected</span>
+    <div class="status-dot" id="ws-dot"></div>
+  </div>
+</header>
+
+<div class="stats-bar">
+  <div class="stat">
+    <span class="stat-label">Active Feeds</span>
+    <span class="stat-value blue" id="stat-feeds">--</span>
+  </div>
+  <div class="stat">
+    <span class="stat-label">Total Rounds</span>
+    <span class="stat-value" id="stat-rounds">--</span>
+  </div>
+  <div class="stat">
+    <span class="stat-label">Healthy</span>
+    <span class="stat-value green" id="stat-healthy">--</span>
+  </div>
+  <div class="stat">
+    <span class="stat-label">Stale</span>
+    <span class="stat-value yellow" id="stat-stale">--</span>
+  </div>
+  <div class="stat">
+    <span class="stat-label">Last Update</span>
+    <span class="stat-value" id="stat-last-update">--</span>
+  </div>
+</div>
+
+<div class="tab-bar">
+  <button class="tab-btn active" data-tab="feeds">Price Feeds</button>
+  <button class="tab-btn" data-tab="demand">Demand Map</button>
+  <button class="tab-btn" data-tab="blackboard">Blackboard</button>
+  <button class="tab-btn" data-tab="mesh">Leaders & Sharding</button>
+  <button class="tab-btn" data-tab="sources">Source Stats</button>
+</div>
+
+<main>
+  <!-- Tab: Price Feeds -->
+  <div id="tab-feeds" class="tab-content active">
+    <div class="feed-toolbar">
+      <label>Group by:</label>
+      <select id="group-select" onchange="renderFeeds()">
+        <option value="none">None</option>
+        <option value="pair">Pair</option>
+        <option value="source">Source</option>
+        <option value="status">Status</option>
+      </select>
+    </div>
+    <div id="feed-grid" class="feed-grid">
+      <div class="loading"><div class="spinner"></div>Loading oracle feeds...</div>
+    </div>
+    <div id="detail-panel" class="detail-panel">
+      <div class="detail-title">
+        <span id="detail-pair"></span>
+        <span id="detail-status" class="feed-status"></span>
+        <button class="detail-close" onclick="closeDetail()">Close</button>
+      </div>
+      <div id="detail-content"></div>
+    </div>
+  </div>
+
+  <!-- Tab: Demand Map -->
+  <div id="tab-demand" class="tab-content">
+    <div id="demand-content">
+      <div class="loading"><div class="spinner"></div>Loading demand data...</div>
+    </div>
+  </div>
+
+  <!-- Tab: Blackboard -->
+  <div id="tab-blackboard" class="tab-content">
+    <div class="bb-compose">
+      <select id="bb-prefix">
+        <option value="STATUS">STATUS</option>
+        <option value="ALERT">ALERT</option>
+        <option value="FINDING">FINDING</option>
+        <option value="TIP">TIP</option>
+        <option value="DEBUG">DEBUG</option>
+      </select>
+      <input type="text" id="bb-text" placeholder="Post a message to the validator blackboard...">
+      <button onclick="postBlackboard()">Post</button>
+    </div>
+    <div id="bb-messages">
+      <div class="loading"><div class="spinner"></div>Loading messages...</div>
+    </div>
+  </div>
+
+  <!-- Tab: Leaders & Sharding -->
+  <div id="tab-mesh" class="tab-content">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+      <div>
+        <h3 style="font-size:14px;font-weight:600;margin-bottom:12px;color:var(--text);">Feed Leader Assignments</h3>
+        <div id="leaders-content">
+          <div class="loading"><div class="spinner"></div>Loading...</div>
+        </div>
+      </div>
+      <div>
+        <h3 style="font-size:14px;font-weight:600;margin-bottom:12px;color:var(--text);">Feed Observation Sharding</h3>
+        <div id="sharding-content">
+          <div class="loading"><div class="spinner"></div>Loading...</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tab: Source Stats -->
+  <div id="tab-sources" class="tab-content">
+    <div style="margin-bottom:12px;">
+      <select id="source-feed-select" style="font-family:inherit;font-size:12px;border:1px solid var(--border);border-radius:4px;background:var(--surface-2);color:var(--text);padding:6px 10px;">
+        <option value="">Select a feed...</option>
+      </select>
+    </div>
+    <div id="sources-content">
+      <div class="empty">Select a feed to view source reliability stats</div>
+    </div>
+  </div>
+</main>
+
+<script>
+(function() {
+  'use strict';
+
+  // ─── Config ─────────────────────────────────────────────
+  const SHARD = new URLSearchParams(location.search).get('shard') || 'node-1';
+  const BASE = location.origin;
+  const API = `${BASE}/oracle`;
+  const POLL_INTERVAL = 5000;
+  const HISTORY_LIMIT = 50;
+
+  // ─── State ──────────────────────────────────────────────
+  let feeds = [];
+  let previousPrices = {};
+  let ws = null;
+  let pollTimer = null;
+  let selectedFeed = null;
+  let currentTab = 'feeds';
+
+  // ─── API Helpers ────────────────────────────────────────
+  function shardUrl(path) {
+    return `${path}${path.includes('?') ? '&' : '?'}shard=${SHARD}`;
+  }
+
+  async function api(path) {
+    const res = await fetch(shardUrl(`${API}${path}`));
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  }
+
+  // ─── Format Helpers ─────────────────────────────────────
+  function formatPrice(value) {
+    if (value === null || value === undefined) return '--';
+    const n = typeof value === 'string' ? parseFloat(value) : value;
+    if (isNaN(n)) return '--';
+    if (Math.abs(n) >= 1000) return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    if (Math.abs(n) >= 1) return n.toFixed(4);
+    if (Math.abs(n) >= 0.001) return n.toFixed(6);
+    return n.toFixed(8);
+  }
+
+  function formatAge(ms) {
+    if (!ms || ms <= 0) return 'just now';
+    const s = Math.floor(ms / 1000);
+    if (s < 60) return `${s}s ago`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m ago`;
+    const h = Math.floor(m / 60);
+    return `${h}h ago`;
+  }
+
+  function formatTime(ts) {
+    if (!ts) return '--';
+    return new Date(ts).toLocaleTimeString('en-US', { hour12: false });
+  }
+
+  function shortPubkey(pk) {
+    if (!pk || pk.length < 12) return pk || '--';
+    return pk.slice(0, 6) + '...' + pk.slice(-4);
+  }
+
+  // ─── Sparkline SVG ──────────────────────────────────────
+  function sparkline(values) {
+    if (!values || values.length < 2) return '';
+    const min = Math.min(...values);
+    const max = Math.max(...values);
+    const range = max - min || 1;
+    const w = 100, h = 100;
+    const points = values.map((v, i) => {
+      const x = (i / (values.length - 1)) * w;
+      const y = h - ((v - min) / range) * h;
+      return `${x},${y}`;
+    });
+    const line = `M${points.join(' L')}`;
+    const area = `${line} L${w},${h} L0,${h} Z`;
+    return `<div class="sparkline"><svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
+      <path class="area" d="${area}"/><path d="${line}"/></svg></div>`;
+  }
+
+  // ─── Tab Switching ──────────────────────────────────────
+  document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+      btn.classList.add('active');
+      const tab = btn.dataset.tab;
+      document.getElementById(`tab-${tab}`).classList.add('active');
+      currentTab = tab;
+      refreshTab(tab);
+    });
+  });
+
+  function refreshTab(tab) {
+    switch (tab) {
+      case 'demand': loadDemand(); break;
+      case 'blackboard': loadBlackboard(); break;
+      case 'mesh': loadLeaders(); loadSharding(); break;
+      case 'sources': populateFeedSelect(); break;
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // TAB: PRICE FEEDS
+  // ═══════════════════════════════════════════════════════════
+
+  function renderFeedCard(feed) {
+    const latest = feed.latest;
+    const price = latest ? latest.value_num : null;
+    const prev = previousPrices[feed.id];
+    const isStale = latest ? latest.stale : false;
+    const status = isStale ? 'stale' : feed.status;
+
+    let changeClass = 'flat', changeText = '--';
+    if (price !== null && prev !== null && prev !== undefined) {
+      const pct = ((price - prev) / prev) * 100;
+      if (Math.abs(pct) > 0.001) {
+        changeClass = pct > 0 ? 'up' : 'down';
+        changeText = `${pct > 0 ? '+' : ''}${pct.toFixed(4)}%`;
+      } else { changeText = '0.00%'; }
+    }
+
+    // Parse "BTC/USD:pyth" → pair="BTC/USD", source="pyth"
+    const colonIdx = feed.id.lastIndexOf(':');
+    const pair = colonIdx > 0 ? feed.id.slice(0, colonIdx) : feed.id;
+    const sourceTag = colonIdx > 0 ? feed.id.slice(colonIdx + 1) : (feed.sources?.[0]?.type || '');
+    const sourceLabel = sourceTag === 'redstone_bolt' ? 'bolt' : sourceTag;
+
+    const statusClass = status === 'stale' ? 'stale' : status === 'paused' ? 'paused' : '';
+
+    return `
+      <div class="feed-card ${isStale ? 'stale' : ''}" data-feed="${feed.id}" onclick="selectFeed('${feed.id}')">
+        <div class="feed-header">
+          <span class="feed-pair">${pair}</span>
+          <span class="source-badge ${sourceTag}">${sourceLabel}</span>
+          <span class="feed-status ${statusClass}">${status}</span>
+        </div>
+        <div class="feed-price" id="price-${CSS.escape(feed.id)}">$${formatPrice(price)}</div>
+        <div class="feed-change ${changeClass}">${changeText}</div>
+        <div class="feed-meta">
+          <div class="feed-meta-item"><span>Round</span><span>${latest ? latest.round : '--'}</span></div>
+          <div class="feed-meta-item"><span>Observers</span><span>${latest ? latest.observers : '--'}</span></div>
+          <div class="feed-meta-item"><span>Updated</span><span>${latest ? formatAge(Date.now() - latest.committed_at) : '--'}</span></div>
+          <div class="feed-meta-item"><span>Heartbeat</span><span>${(feed.heartbeat_ms / 1000).toFixed(0)}s</span></div>
+        </div>
+      </div>`;
+  }
+
+  function renderFeeds() {
+    const grid = document.getElementById('feed-grid');
+    if (feeds.length === 0) {
+      grid.innerHTML = `<div class="empty"><div class="empty-icon">&#x25C9;</div>
+        <div class="empty-title">No Oracle Feeds</div>
+        <div>Feeds will appear here once the oracle network starts.</div></div>`;
+      return;
+    }
+
+    const groupBy = document.getElementById('group-select').value;
+    const sorted = [...feeds].sort((a, b) => {
+      if (a.status !== b.status) return a.status === 'active' ? -1 : 1;
+      return a.id.localeCompare(b.id);
+    });
+
+    if (groupBy === 'none') {
+      grid.innerHTML = sorted.map(renderFeedCard).join('');
+    } else if (groupBy === 'pair') {
+      // Group by trading pair (e.g., BTC/USD:pyth + BTC/USD:chainlink → BTC/USD)
+      const pairMap = new Map();
+      for (const f of sorted) {
+        const ci = f.id.lastIndexOf(':');
+        const pair = ci > 0 ? f.id.slice(0, ci) : f.id;
+        if (!pairMap.has(pair)) pairMap.set(pair, []);
+        pairMap.get(pair).push(f);
+      }
+      let html = '';
+      for (const [pair, groupFeeds] of [...pairMap.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+        html += `<div class="group-header"><span class="feed-pair">${pair}</span> ${groupFeeds.length} source${groupFeeds.length > 1 ? 's' : ''}</div>`;
+        html += groupFeeds.map(renderFeedCard).join('');
+      }
+      grid.innerHTML = html;
+    } else if (groupBy === 'source') {
+      // Group feeds by source type from feed ID suffix
+      const sourceMap = new Map();
+      for (const f of sorted) {
+        const ci = f.id.lastIndexOf(':');
+        const src = ci > 0 ? f.id.slice(ci + 1) : (f.sources?.[0]?.type || 'unknown');
+        if (!sourceMap.has(src)) sourceMap.set(src, []);
+        sourceMap.get(src).push(f);
+      }
+      const groups = [...sourceMap.entries()].sort((a, b) => b[1].length - a[1].length);
+      let html = '';
+      for (const [source, groupFeeds] of groups) {
+        const label = source === 'redstone_bolt' ? 'RedStone Bolt' : source.charAt(0).toUpperCase() + source.slice(1);
+        html += `<div class="group-header"><span class="source-badge ${source}">${label}</span> ${groupFeeds.length} feeds</div>`;
+        html += groupFeeds.map(renderFeedCard).join('');
+      }
+      grid.innerHTML = html;
+    } else if (groupBy === 'status') {
+      const groups = new Map();
+      for (const f of sorted) {
+        const s = (f.latest && f.latest.stale) ? 'stale' : f.status;
+        if (!groups.has(s)) groups.set(s, []);
+        groups.get(s).push(f);
+      }
+      let html = '';
+      for (const [status, groupFeeds] of groups) {
+        const cls = status === 'stale' ? 'stale' : status === 'paused' ? 'paused' : '';
+        html += `<div class="group-header"><span class="feed-status ${cls}">${status}</span> ${groupFeeds.length} feeds</div>`;
+        html += groupFeeds.map(renderFeedCard).join('');
+      }
+      grid.innerHTML = html;
+    }
+
+    updateStats();
+  }
+
+  function updateStats() {
+    const active = feeds.filter(f => f.status === 'active');
+    const staleCount = feeds.filter(f => f.latest && f.latest.stale).length;
+    const totalRounds = feeds.reduce((sum, f) => sum + (f.current_round || 0), 0);
+    document.getElementById('stat-feeds').textContent = active.length;
+    document.getElementById('stat-rounds').textContent = totalRounds.toLocaleString();
+    document.getElementById('stat-healthy').textContent = active.length - staleCount;
+    document.getElementById('stat-stale').textContent = staleCount;
+    document.getElementById('stat-last-update').textContent = formatTime(Date.now());
+  }
+
+  // Detail panel
+  window.selectFeed = async function(feedId) {
+    selectedFeed = feedId;
+    const panel = document.getElementById('detail-panel');
+    const feed = feeds.find(f => f.id === feedId);
+    if (!feed) return;
+
+    document.getElementById('detail-pair').textContent = feedId;
+    const statusEl = document.getElementById('detail-status');
+    const isStale = feed.latest && feed.latest.stale;
+    statusEl.textContent = isStale ? 'stale' : feed.status;
+    statusEl.className = `feed-status ${isStale ? 'stale' : feed.status === 'paused' ? 'paused' : ''}`;
+    document.getElementById('detail-content').innerHTML = '<div class="loading"><div class="spinner"></div>Loading rounds...</div>';
+    panel.classList.add('visible');
+
+    try {
+      const data = await api(`/feeds/${encodeURIComponent(feedId)}/rounds?limit=${HISTORY_LIMIT}`);
+      const rounds = data.rounds || [];
+      const values = rounds.map(r => r.value_num).filter(v => v !== null).reverse();
+      const chart = sparkline(values);
+
+      let html = `
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:16px;">
+          <div class="stat"><span class="stat-label">Decimals</span><span class="stat-value">${feed.decimals}</span></div>
+          <div class="stat"><span class="stat-label">Deviation</span><span class="stat-value">${feed.deviation_bps / 100}%</span></div>
+          <div class="stat"><span class="stat-label">Sources</span><span class="stat-value">${(feed.sources || []).length}</span></div>
+        </div>
+        ${chart}`;
+
+      if (rounds.length > 0) {
+        html += `<table class="data-table">
+          <thead><tr><th>Round</th><th>Value</th><th>Observers</th><th>Time</th></tr></thead>
+          <tbody>${rounds.map(r => `<tr>
+            <td>${r.round}</td><td>$${formatPrice(r.value_num)}</td>
+            <td>${r.observers}</td><td>${formatTime(r.committed_at)}</td>
+          </tr>`).join('')}</tbody></table>`;
+      } else {
+        html += '<div class="empty" style="padding:20px;">No rounds committed yet</div>';
+      }
+      document.getElementById('detail-content').innerHTML = html;
+    } catch (e) {
+      document.getElementById('detail-content').innerHTML = `<div class="empty">Failed to load: ${e.message}</div>`;
+    }
+  };
+
+  window.closeDetail = function() {
+    selectedFeed = null;
+    document.getElementById('detail-panel').classList.remove('visible');
+  };
+
+  function flashPrice(feedId, newPrice, oldPrice) {
+    const el = document.querySelector(`[data-feed="${CSS.escape(feedId)}"]`);
+    if (!el) return;
+    el.classList.remove('flash-up', 'flash-down');
+    if (newPrice > oldPrice) el.classList.add('flash-up');
+    else if (newPrice < oldPrice) el.classList.add('flash-down');
+    setTimeout(() => el.classList.remove('flash-up', 'flash-down'), 600);
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // TAB: DEMAND MAP
+  // ═══════════════════════════════════════════════════════════
+
+  async function loadDemand() {
+    const el = document.getElementById('demand-content');
+    try {
+      const data = await api('/demand');
+      const demands = data.demands || [];
+      if (demands.length === 0) {
+        el.innerHTML = '<div class="empty"><div class="empty-title">No Demand Data</div><div>Feed demand will appear as consumers read oracle prices.</div></div>';
+        return;
+      }
+
+      const maxScore = Math.max(...demands.map(d => d.read_count + d.subscription_count * 10), 1);
+
+      el.innerHTML = `<table class="data-table">
+        <thead><tr><th>Feed</th><th>Reads</th><th>Subscriptions</th><th>Demand Score</th><th>Last Active</th></tr></thead>
+        <tbody>${demands.map(d => {
+          const score = d.read_count + d.subscription_count * 10;
+          const pct = (score / maxScore) * 100;
+          const color = pct > 60 ? 'var(--green)' : pct > 30 ? 'var(--yellow)' : 'var(--text-dim)';
+          return `<tr>
+            <td style="font-weight:600;">${d.feed_id}</td>
+            <td>${d.read_count}</td>
+            <td>${d.subscription_count}</td>
+            <td>
+              <div class="demand-bar-container">
+                <div class="demand-bar"><div class="demand-bar-fill" style="width:${pct}%;background:${color};"></div></div>
+                <span style="font-size:11px;color:var(--text-dim);">${score}</span>
+              </div>
+            </td>
+            <td>${formatAge(Date.now() - d.last_active)}</td>
+          </tr>`;
+        }).join('')}</tbody></table>`;
+    } catch (e) {
+      el.innerHTML = `<div class="empty">Failed to load demand: ${e.message}</div>`;
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // TAB: BLACKBOARD
+  // ═══════════════════════════════════════════════════════════
+
+  async function loadBlackboard() {
+    const el = document.getElementById('bb-messages');
+    try {
+      const data = await api('/blackboard');
+      const messages = data.messages || [];
+      if (messages.length === 0) {
+        el.innerHTML = '<div class="empty"><div class="empty-title">No Messages</div><div>The validator blackboard is empty. Post a message above.</div></div>';
+        return;
+      }
+
+      el.innerHTML = messages.map(m => `
+        <div class="bb-message">
+          <div class="bb-header">
+            <span class="bb-prefix ${m.prefix}">${m.prefix}</span>
+            <span class="bb-author">${shortPubkey(m.author)}</span>
+            <span class="bb-time">${formatAge(Date.now() - m.timestamp)}</span>
+          </div>
+          <div class="bb-text">${escapeHtml(m.text)}</div>
+        </div>`).join('');
+    } catch (e) {
+      el.innerHTML = `<div class="empty">Failed to load: ${e.message}</div>`;
+    }
+  }
+
+  window.postBlackboard = async function() {
+    const prefix = document.getElementById('bb-prefix').value;
+    const text = document.getElementById('bb-text').value.trim();
+    if (!text) return;
+
+    try {
+      await fetch(shardUrl(`${API}/blackboard`), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prefix, text }),
+      });
+      document.getElementById('bb-text').value = '';
+      loadBlackboard();
+    } catch (e) {
+      alert('Failed to post: ' + e.message);
+    }
+  };
+
+  // Enter key to post
+  document.getElementById('bb-text').addEventListener('keydown', e => {
+    if (e.key === 'Enter') postBlackboard();
+  });
+
+  function escapeHtml(str) {
+    const div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // TAB: LEADERS & SHARDING
+  // ═══════════════════════════════════════════════════════════
+
+  async function loadLeaders() {
+    const el = document.getElementById('leaders-content');
+    try {
+      const data = await api('/leaders');
+      const assignments = data.assignments || [];
+      if (assignments.length === 0) {
+        el.innerHTML = '<div class="empty">No leader assignments</div>';
+        return;
+      }
+
+      el.innerHTML = `<table class="data-table">
+        <thead><tr><th>Feed</th><th>Leader</th><th>Epoch</th></tr></thead>
+        <tbody>${assignments.map(a => `<tr>
+          <td style="font-weight:600;">${a.feed_id}</td>
+          <td><code style="font-size:10px;">${shortPubkey(a.leader_pubkey)}</code></td>
+          <td>${a.epoch}</td>
+        </tr>`).join('')}</tbody></table>`;
+    } catch (e) {
+      el.innerHTML = `<div class="empty">Failed to load: ${e.message}</div>`;
+    }
+  }
+
+  async function loadSharding() {
+    const el = document.getElementById('sharding-content');
+    try {
+      const data = await api('/sharding');
+      const t1 = data.tier1_feeds || [];
+      const t2 = data.tier2_feeds || [];
+
+      let html = `<div style="font-size:11px;color:var(--text-dim);margin-bottom:12px;">
+        This node: <code>${shortPubkey(data.node)}</code> |
+        ${t1.length} tier-1 (all observe) + ${t2.length} tier-2 (shard) of ${data.total_feeds} feeds |
+        ${data.active_validators} validators
+      </div>`;
+
+      html += '<div class="shard-grid">';
+      for (const f of t1) {
+        html += `<div class="shard-card"><div class="feed-id">${f}</div><span class="tier-badge tier1">Tier 1 - All</span></div>`;
+      }
+      for (const f of t2) {
+        html += `<div class="shard-card"><div class="feed-id">${f}</div><span class="tier-badge tier2">Tier 2 - Shard</span></div>`;
+      }
+      html += '</div>';
+      el.innerHTML = html;
+    } catch (e) {
+      el.innerHTML = `<div class="empty">Failed to load: ${e.message}</div>`;
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // TAB: SOURCE STATS
+  // ═══════════════════════════════════════════════════════════
+
+  function populateFeedSelect() {
+    const select = document.getElementById('source-feed-select');
+    const current = select.value;
+    const opts = ['<option value="">Select a feed...</option>'];
+    for (const f of feeds) {
+      opts.push(`<option value="${f.id}" ${f.id === current ? 'selected' : ''}>${f.id}</option>`);
+    }
+    select.innerHTML = opts.join('');
+  }
+
+  document.getElementById('source-feed-select').addEventListener('change', async function() {
+    const feedId = this.value;
+    const el = document.getElementById('sources-content');
+    if (!feedId) {
+      el.innerHTML = '<div class="empty">Select a feed to view source reliability stats</div>';
+      return;
+    }
+    el.innerHTML = '<div class="loading"><div class="spinner"></div>Loading source stats...</div>';
+
+    try {
+      const data = await api(`/source-stats/${encodeURIComponent(feedId)}`);
+      const sources = data.sources || [];
+      const weights = data.dynamic_weights || {};
+
+      if (sources.length === 0) {
+        el.innerHTML = '<div class="empty">No source stats recorded yet. Stats accumulate after oracle observations.</div>';
+        return;
+      }
+
+      const feed = feeds.find(f => f.id === feedId);
+      const feedSources = feed ? (feed.sources || []) : [];
+
+      el.innerHTML = `<table class="data-table">
+        <thead><tr><th>Source</th><th>Type</th><th>Success Rate</th><th>Avg Latency</th><th>Freshness</th><th>Dynamic Weight</th></tr></thead>
+        <tbody>${sources.map(s => {
+          const total = s.success_count + s.failure_count;
+          const rate = total > 0 ? (s.success_count / total * 100) : 0;
+          const avgLatency = s.success_count > 0 ? Math.round(s.total_latency_ms / s.success_count) : 0;
+          const w = weights[s.source_index] ?? 1.0;
+          const rateColor = rate > 90 ? 'var(--green)' : rate > 70 ? 'var(--yellow)' : 'var(--red)';
+          const wColor = w > 1.5 ? 'var(--green)' : w > 0.8 ? 'var(--yellow)' : 'var(--red)';
+          const endpoint = feedSources[s.source_index] ? feedSources[s.source_index].endpoint : '';
+          const shortEndpoint = endpoint.length > 20 ? endpoint.slice(0, 20) + '...' : endpoint;
+
+          return `<tr>
+            <td><span class="source-badge ${s.source_type}">${s.source_type}</span> <span style="font-size:10px;color:var(--text-dim);">${shortEndpoint}</span></td>
+            <td>${s.source_type}</td>
+            <td>
+              <div class="score-bar"><div class="score-bar-fill" style="width:${rate}%;background:${rateColor};"></div></div>
+              <span style="color:${rateColor};font-weight:500;">${rate.toFixed(1)}%</span>
+              <span style="font-size:10px;color:var(--text-dim);">(${s.success_count}/${total})</span>
+            </td>
+            <td>${avgLatency}ms</td>
+            <td>${Math.round(s.avg_freshness_ms)}ms</td>
+            <td style="color:${wColor};font-weight:600;">${w.toFixed(2)}x</td>
+          </tr>`;
+        }).join('')}</tbody></table>`;
+    } catch (e) {
+      el.innerHTML = `<div class="empty">Failed to load: ${e.message}</div>`;
+    }
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // WEBSOCKET + POLLING
+  // ═══════════════════════════════════════════════════════════
+
+  function connectWS() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${proto}//${location.host}/ws?shard=${SHARD}`;
+    try { ws = new WebSocket(wsUrl); } catch { return; }
+
+    ws.onopen = () => {
+      document.getElementById('ws-dot').classList.add('connected');
+      document.getElementById('ws-label').textContent = 'Live';
+    };
+
+    ws.onclose = () => {
+      document.getElementById('ws-dot').classList.remove('connected');
+      document.getElementById('ws-label').textContent = 'Reconnecting...';
+      setTimeout(connectWS, 3000);
+    };
+
+    ws.onerror = () => ws.close();
+
+    ws.onmessage = (evt) => {
+      try {
+        const msg = JSON.parse(evt.data);
+        if (msg.type === 'oracle.feed_update') {
+          const feed = feeds.find(f => f.id === msg.feed_id);
+          if (feed) {
+            const oldPrice = feed.latest ? feed.latest.value_num : null;
+            feed.latest = {
+              feed_id: msg.feed_id, value: msg.value, value_num: msg.value_num,
+              round: msg.round, observers: msg.observers, committed_at: msg.committed_at, stale: false,
+            };
+            feed.current_round = msg.round;
+            if (oldPrice !== null && msg.value_num !== null) flashPrice(msg.feed_id, msg.value_num, oldPrice);
+            previousPrices[msg.feed_id] = oldPrice;
+            if (currentTab === 'feeds') renderFeeds();
+          }
+        }
+      } catch {}
+    };
+  }
+
+  async function fetchFeeds() {
+    try {
+      const data = await api('/feeds');
+      for (const f of feeds) {
+        if (f.latest && f.latest.value_num !== null) previousPrices[f.id] = f.latest.value_num;
+      }
+      feeds = (data.feeds || []).map(f => ({
+        ...f,
+        sources: typeof f.sources === 'string' ? JSON.parse(f.sources) : f.sources,
+      }));
+      if (currentTab === 'feeds') renderFeeds();
+      else updateStats();
+    } catch (e) {
+      console.warn('Feed fetch failed:', e.message);
+    }
+  }
+
+  // ─── Init ───────────────────────────────────────────────
+  async function init() {
+    await fetchFeeds();
+    connectWS();
+    pollTimer = setInterval(fetchFeeds, POLL_INTERVAL);
+  }
+
+  init();
+})();
+</script>
+</body>
+</html>
