@@ -197,6 +197,43 @@ export interface OracleSubscription {
   created_at: number;
 }
 
+// ─── Cross-Chain Push Subscription Types ────────────────────────────────────
+
+export interface OraclePushSubscription {
+  id: string;
+  feed_id: string;
+  owner: string;                // 0x wallet address
+  dest_chain_id: number;
+  dest_rpc_url: string;
+  receiver_contract: string;    // 0x address on destination chain
+  callback_selector: string;    // 4-byte function selector, e.g. "0xabcd1234"
+  deviation_bps: number;
+  heartbeat_ms: number;
+  last_pushed_at: number;
+  last_pushed_value: string | null;
+  last_pushed_round: number;
+  deposit_wei: string;          // gas deposit ledger (string for big numbers)
+  enabled: boolean;
+  created_at: number;
+}
+
+export interface OraclePushAttestation {
+  id: string;
+  subscription_id: string;
+  feed_id: string;
+  round: number;
+  value: string;
+  value_num: number | null;
+  observers: number;
+  committed_at: number;
+  attestation_hash: string;
+  signatures: string;           // JSON array of {pubkey, sig}
+  calldata: string;             // ABI-encoded, ready to submit
+  created_at: number;
+  relayed_at: number | null;
+  relay_tx_hash: string | null;
+}
+
 export interface VRFRequest {
   id: string;
   seed: string;

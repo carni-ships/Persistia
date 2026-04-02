@@ -11,13 +11,14 @@ import {
 import type {
   MirrorResult, OracleFeedConfig, FeedSource, FeedRound, OracleObservation,
   OracleObservationBatch, OracleSubscription, VRFRequest, VRFPartial,
-  FeedLatest, OracleAggregation,
+  FeedLatest, OracleAggregation, OraclePushSubscription, OraclePushAttestation,
 } from "./types";
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 const MAX_FEEDS = 200;
 const MAX_SUBSCRIPTIONS_PER_CONTRACT = 20;
+const MAX_PUSH_SUBSCRIPTIONS_PER_OWNER = 10;
 const MAX_OBSERVATIONS_PER_BATCH = 200;
 const STALE_MULTIPLIER = 3; // feed goes stale after 3x heartbeat
 const DEFAULT_HEARTBEAT_MS = 60_000;
@@ -608,6 +609,284 @@ export class OracleNetwork {
       contract,
     )];
     return rows.map(this.rowToSubscription);
+  }
+
+  // ─── Cross-Chain Push Subscriptions ────────────────────────────────────
+
+  async addPushSubscription(opts: {
+    feed_id: string;
+    owner: string;
+    dest_chain_id: number;
+    dest_rpc_url: string;
+    receiver_contract: string;
+    callback_selector: string;
+    deviation_bps?: number;
+    heartbeat_ms?: number;
+    deposit_wei?: string;
+  }): Promise<string> {
+    if (!this.getFeedConfig(opts.feed_id)) {
+      throw new Error(`Feed ${opts.feed_id} not found`);
+    }
+    if (!/^0x[0-9a-fA-F]{40}$/.test(opts.receiver_contract)) {
+      throw new Error("Invalid receiver contract address");
+    }
+    if (!/^0x[0-9a-fA-F]{8}$/.test(opts.callback_selector)) {
+      throw new Error("Invalid callback selector (need 4-byte hex, e.g. 0xabcd1234)");
+    }
+    if (!/^0x[0-9a-fA-F]{40}$/.test(opts.owner)) {
+      throw new Error("Invalid owner address");
+    }
+
+    const count = [...this.sql.exec(
+      "SELECT COUNT(*) as cnt FROM oracle_push_subscriptions WHERE owner = ? AND enabled = 1",
+      opts.owner,
+    )][0]?.cnt ?? 0;
+    if (count >= MAX_PUSH_SUBSCRIPTIONS_PER_OWNER) {
+      throw new Error(`Max ${MAX_PUSH_SUBSCRIPTIONS_PER_OWNER} push subscriptions per owner`);
+    }
+
+    const heartbeat = Math.max(MIN_HEARTBEAT_MS, Math.min(MAX_HEARTBEAT_MS, opts.heartbeat_ms || DEFAULT_HEARTBEAT_MS));
+    const deviation = Math.max(0, opts.deviation_bps ?? DEFAULT_DEVIATION_BPS);
+    const id = await sha256(`push_sub:${opts.owner}:${opts.feed_id}:${opts.receiver_contract}:${Date.now()}`);
+
+    this.sql.exec(
+      `INSERT INTO oracle_push_subscriptions (id, feed_id, owner, dest_chain_id, dest_rpc_url, receiver_contract, callback_selector, deviation_bps, heartbeat_ms, last_pushed_at, last_pushed_value, last_pushed_round, deposit_wei, enabled, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, 0, ?, 1, ?)`,
+      id, opts.feed_id, opts.owner.toLowerCase(), opts.dest_chain_id, opts.dest_rpc_url,
+      opts.receiver_contract.toLowerCase(), opts.callback_selector.toLowerCase(),
+      deviation, heartbeat, opts.deposit_wei || "0", Date.now(),
+    );
+    return id;
+  }
+
+  removePushSubscription(subId: string, owner: string): void {
+    const rows = [...this.sql.exec(
+      "SELECT owner FROM oracle_push_subscriptions WHERE id = ? AND enabled = 1", subId,
+    )] as any[];
+    if (rows.length === 0) throw new Error("Push subscription not found");
+    if (rows[0].owner !== owner.toLowerCase()) throw new Error("Not the owner");
+    this.sql.exec("UPDATE oracle_push_subscriptions SET enabled = 0 WHERE id = ?", subId);
+  }
+
+  getPushSubscriptionsForOwner(owner: string): OraclePushSubscription[] {
+    const rows = [...this.sql.exec(
+      "SELECT * FROM oracle_push_subscriptions WHERE owner = ? ORDER BY created_at DESC",
+      owner.toLowerCase(),
+    )] as any[];
+    return rows.map(this.rowToPushSubscription);
+  }
+
+  getPushSubscription(subId: string): OraclePushSubscription | null {
+    const rows = [...this.sql.exec(
+      "SELECT * FROM oracle_push_subscriptions WHERE id = ?", subId,
+    )] as any[];
+    return rows.length > 0 ? this.rowToPushSubscription(rows[0]) : null;
+  }
+
+  getTriggeredPushSubscriptions(feedId: string, newValue: string, newValueNum: number | null): OraclePushSubscription[] {
+    const now = Date.now();
+    const rows = [...this.sql.exec(
+      "SELECT * FROM oracle_push_subscriptions WHERE feed_id = ? AND enabled = 1",
+      feedId,
+    )] as any[];
+
+    const triggered: OraclePushSubscription[] = [];
+    for (const row of rows) {
+      const sub = this.rowToPushSubscription(row);
+
+      // Check heartbeat interval
+      if (sub.last_pushed_at > 0 && (now - sub.last_pushed_at) < sub.heartbeat_ms) {
+        // Within heartbeat window — only push if deviation exceeded
+        if (sub.deviation_bps > 0 && sub.last_pushed_value !== null && newValueNum !== null) {
+          const lastNum = parseFloat(sub.last_pushed_value);
+          if (!isNaN(lastNum) && lastNum !== 0) {
+            const devBps = Math.abs((newValueNum - lastNum) / lastNum) * 10_000;
+            if (devBps < sub.deviation_bps) continue;
+          }
+        } else {
+          continue; // no deviation data, respect heartbeat
+        }
+      }
+
+      triggered.push(sub);
+    }
+    return triggered;
+  }
+
+  async generatePushAttestation(sub: OraclePushSubscription, round: FeedRound): Promise<OraclePushAttestation> {
+    const payloadStr = JSON.stringify({
+      feed_id: round.feed_id,
+      round: round.round,
+      value: round.value,
+      value_num: round.value_num,
+      observers: round.observers,
+      committed_at: round.committed_at,
+      dest_chain_id: sub.dest_chain_id,
+      receiver_contract: sub.receiver_contract,
+      callback_selector: sub.callback_selector,
+    });
+    const attestationHash = await sha256(payloadStr);
+    const signature = await this.signPayload(attestationHash);
+    const signatures = JSON.stringify([{ pubkey: this.nodePubkey, sig: signature }]);
+
+    const calldata = this.abiEncodePushCalldata(
+      sub.callback_selector, round.feed_id, round.round,
+      round.value, round.value_num, round.observers,
+      round.committed_at, attestationHash, signatures,
+    );
+
+    const id = await sha256(`push_att:${sub.id}:${round.round}:${Date.now()}`);
+    const now = Date.now();
+
+    this.sql.exec(
+      `INSERT INTO oracle_push_attestations (id, subscription_id, feed_id, round, value, value_num, observers, committed_at, attestation_hash, signatures, calldata, created_at, relayed_at, relay_tx_hash)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)`,
+      id, sub.id, round.feed_id, round.round, round.value, round.value_num,
+      round.observers, round.committed_at, attestationHash, signatures, calldata, now,
+    );
+
+    // Mark subscription as pushed
+    this.sql.exec(
+      "UPDATE oracle_push_subscriptions SET last_pushed_at = ?, last_pushed_value = ?, last_pushed_round = ? WHERE id = ?",
+      now, round.value, round.round, sub.id,
+    );
+
+    return {
+      id, subscription_id: sub.id, feed_id: round.feed_id, round: round.round,
+      value: round.value, value_num: round.value_num, observers: round.observers,
+      committed_at: round.committed_at, attestation_hash: attestationHash,
+      signatures, calldata, created_at: now, relayed_at: null, relay_tx_hash: null,
+    };
+  }
+
+  getPushAttestations(subId: string, limit: number = 20): OraclePushAttestation[] {
+    const rows = [...this.sql.exec(
+      "SELECT * FROM oracle_push_attestations WHERE subscription_id = ? ORDER BY created_at DESC LIMIT ?",
+      subId, limit,
+    )] as any[];
+    return rows.map(this.rowToPushAttestation);
+  }
+
+  getLatestPendingAttestation(subId: string): OraclePushAttestation | null {
+    const rows = [...this.sql.exec(
+      "SELECT * FROM oracle_push_attestations WHERE subscription_id = ? AND relayed_at IS NULL ORDER BY created_at DESC LIMIT 1",
+      subId,
+    )] as any[];
+    return rows.length > 0 ? this.rowToPushAttestation(rows[0]) : null;
+  }
+
+  markPushRelayed(attestationId: string, txHash: string): void {
+    this.sql.exec(
+      "UPDATE oracle_push_attestations SET relayed_at = ?, relay_tx_hash = ? WHERE id = ?",
+      Date.now(), txHash, attestationId,
+    );
+  }
+
+  depositPushFunds(subId: string, amountWei: string): void {
+    const sub = this.getPushSubscription(subId);
+    if (!sub) throw new Error("Push subscription not found");
+    const current = BigInt(sub.deposit_wei);
+    const deposit = BigInt(amountWei);
+    if (deposit <= 0n) throw new Error("Amount must be positive");
+    this.sql.exec(
+      "UPDATE oracle_push_subscriptions SET deposit_wei = ? WHERE id = ?",
+      (current + deposit).toString(), subId,
+    );
+  }
+
+  withdrawPushFunds(subId: string, amountWei: string, owner: string): void {
+    const sub = this.getPushSubscription(subId);
+    if (!sub) throw new Error("Push subscription not found");
+    if (sub.owner !== owner.toLowerCase()) throw new Error("Not the owner");
+    const current = BigInt(sub.deposit_wei);
+    const withdrawal = BigInt(amountWei);
+    if (withdrawal <= 0n) throw new Error("Amount must be positive");
+    if (withdrawal > current) throw new Error("Insufficient deposit balance");
+    this.sql.exec(
+      "UPDATE oracle_push_subscriptions SET deposit_wei = ? WHERE id = ?",
+      (current - withdrawal).toString(), subId,
+    );
+  }
+
+  // ─── Push Subscription Helpers ─────────────────────────────────────────
+
+  private rowToPushSubscription(row: any): OraclePushSubscription {
+    return {
+      id: row.id,
+      feed_id: row.feed_id,
+      owner: row.owner,
+      dest_chain_id: row.dest_chain_id,
+      dest_rpc_url: row.dest_rpc_url,
+      receiver_contract: row.receiver_contract,
+      callback_selector: row.callback_selector,
+      deviation_bps: row.deviation_bps,
+      heartbeat_ms: row.heartbeat_ms,
+      last_pushed_at: row.last_pushed_at,
+      last_pushed_value: row.last_pushed_value,
+      last_pushed_round: row.last_pushed_round,
+      deposit_wei: row.deposit_wei,
+      enabled: !!row.enabled,
+      created_at: row.created_at,
+    };
+  }
+
+  private rowToPushAttestation(row: any): OraclePushAttestation {
+    return {
+      id: row.id,
+      subscription_id: row.subscription_id,
+      feed_id: row.feed_id,
+      round: row.round,
+      value: row.value,
+      value_num: row.value_num,
+      observers: row.observers,
+      committed_at: row.committed_at,
+      attestation_hash: row.attestation_hash,
+      signatures: row.signatures,
+      calldata: row.calldata,
+      created_at: row.created_at,
+      relayed_at: row.relayed_at,
+      relay_tx_hash: row.relay_tx_hash,
+    };
+  }
+
+  /**
+   * Minimal ABI encoder for cross-chain push calldata.
+   * Encodes: selector + (bytes32 feedIdHash, uint256 round, int256 value,
+   *          uint256 observers, uint256 committedAt, bytes32 attestationHash, bytes signatures)
+   */
+  private abiEncodePushCalldata(
+    selector: string, feedId: string, round: number,
+    value: string, valueNum: number | null, observers: number,
+    committedAt: number, attestationHash: string, signatures: string,
+  ): string {
+    const feedIdHash = attestationHash.slice(0, 64).padStart(64, "0"); // use first 32 bytes of sha256(feedId) conceptually; reuse attestation hash prefix as feed fingerprint
+    const roundHex = round.toString(16).padStart(64, "0");
+    // Encode value as int256 (signed) — scale to 8 decimals
+    const scaledValue = Math.round((valueNum ?? parseFloat(value) ?? 0) * 1e8);
+    let valueHex: string;
+    if (scaledValue >= 0) {
+      valueHex = scaledValue.toString(16).padStart(64, "0");
+    } else {
+      // Two's complement for negative
+      const twos = (BigInt(1) << BigInt(256)) + BigInt(scaledValue);
+      valueHex = twos.toString(16).padStart(64, "0");
+    }
+    const observersHex = observers.toString(16).padStart(64, "0");
+    const committedAtHex = committedAt.toString(16).padStart(64, "0");
+    const attHashHex = attestationHash.padStart(64, "0");
+
+    // Encode signatures as dynamic bytes
+    const sigBytes = new TextEncoder().encode(signatures);
+    const sigHex = Array.from(sigBytes).map(b => b.toString(16).padStart(2, "0")).join("");
+    // Dynamic offset: 7 * 32 bytes = 224 = 0xe0
+    const sigOffsetHex = (7 * 32).toString(16).padStart(64, "0");
+    const sigLenHex = sigBytes.length.toString(16).padStart(64, "0");
+    // Pad sig data to 32-byte boundary
+    const sigPadded = sigHex.padEnd(Math.ceil(sigHex.length / 64) * 64, "0");
+
+    return selector +
+      feedIdHash + roundHex + valueHex + observersHex +
+      committedAtHex + attHashHex + sigOffsetHex + sigLenHex + sigPadded;
   }
 
   // ─── VRF (Verifiable Random Function) ──────────────────────────────────

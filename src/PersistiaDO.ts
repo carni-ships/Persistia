@@ -557,6 +557,8 @@ export class PersistiaWorldV4 implements DurableObject {
       ["oracle_feed_demand", `CREATE TABLE oracle_feed_demand (feed_id TEXT PRIMARY KEY, read_count INTEGER NOT NULL DEFAULT 0, subscription_count INTEGER NOT NULL DEFAULT 0, last_active INTEGER NOT NULL)`],
       ["oracle_blackboard", `CREATE TABLE oracle_blackboard (id TEXT PRIMARY KEY, author TEXT NOT NULL, prefix TEXT NOT NULL, text TEXT NOT NULL, timestamp INTEGER NOT NULL, expires_at INTEGER NOT NULL); CREATE INDEX idx_bb_time ON oracle_blackboard(timestamp)`],
       ["oracle_source_stats", `CREATE TABLE oracle_source_stats (feed_id TEXT NOT NULL, source_index INTEGER NOT NULL, source_type TEXT NOT NULL, success_count INTEGER NOT NULL DEFAULT 0, failure_count INTEGER NOT NULL DEFAULT 0, total_latency_ms INTEGER NOT NULL DEFAULT 0, last_success INTEGER NOT NULL DEFAULT 0, last_failure INTEGER NOT NULL DEFAULT 0, avg_freshness_ms REAL NOT NULL DEFAULT 0, PRIMARY KEY (feed_id, source_index))`],
+      ["oracle_push_subscriptions", `CREATE TABLE oracle_push_subscriptions (id TEXT PRIMARY KEY, feed_id TEXT NOT NULL, owner TEXT NOT NULL, dest_chain_id INTEGER NOT NULL, dest_rpc_url TEXT NOT NULL, receiver_contract TEXT NOT NULL, callback_selector TEXT NOT NULL, deviation_bps INTEGER NOT NULL DEFAULT 50, heartbeat_ms INTEGER NOT NULL DEFAULT 60000, last_pushed_at INTEGER NOT NULL DEFAULT 0, last_pushed_value TEXT, last_pushed_round INTEGER NOT NULL DEFAULT 0, deposit_wei TEXT NOT NULL DEFAULT '0', enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL); CREATE INDEX idx_push_sub_feed ON oracle_push_subscriptions(feed_id, enabled); CREATE INDEX idx_push_sub_owner ON oracle_push_subscriptions(owner)`],
+      ["oracle_push_attestations", `CREATE TABLE oracle_push_attestations (id TEXT PRIMARY KEY, subscription_id TEXT NOT NULL, feed_id TEXT NOT NULL, round INTEGER NOT NULL, value TEXT NOT NULL, value_num REAL, observers INTEGER NOT NULL, committed_at INTEGER NOT NULL, attestation_hash TEXT NOT NULL, signatures TEXT NOT NULL, calldata TEXT NOT NULL, created_at INTEGER NOT NULL, relayed_at INTEGER, relay_tx_hash TEXT); CREATE INDEX idx_push_att_sub ON oracle_push_attestations(subscription_id, created_at); CREATE INDEX idx_push_att_pending ON oracle_push_attestations(relayed_at)`],
     ] as const;
     for (const [name, ddl] of ponTables) {
       try {
@@ -7443,6 +7445,111 @@ export class PersistiaWorldV4 implements DurableObject {
       return this.json(result);
     }
 
+    // ── Cross-Chain Push Subscription Routes ──
+
+    // POST /oracle/push — create push subscription
+    // GET /oracle/push?owner=0x... — list push subscriptions for owner
+    if (path === "/oracle/push") {
+      if (req.method === "POST") {
+        const body = await req.json() as any;
+        if (!body.feed_id || !body.owner || !body.dest_chain_id || !body.dest_rpc_url || !body.receiver_contract || !body.callback_selector) {
+          return this.json({ error: "feed_id, owner, dest_chain_id, dest_rpc_url, receiver_contract, callback_selector required" }, 400);
+        }
+        try {
+          const id = await this.oracleNetwork.addPushSubscription(body);
+          this.oracleMesh.recordDemand(body.feed_id, "subscribe");
+          return this.json({ ok: true, subscription_id: id });
+        } catch (e: any) {
+          return this.json({ error: e.message }, 400);
+        }
+      }
+      const owner = url.searchParams.get("owner");
+      if (!owner) return this.json({ error: "owner query param required" }, 400);
+      return this.json({ subscriptions: this.oracleNetwork.getPushSubscriptionsForOwner(owner) });
+    }
+
+    // GET /oracle/push/:id — single push subscription + recent attestations
+    // DELETE /oracle/push/:id — disable push subscription
+    const pushSubMatch = path.match(/^\/oracle\/push\/([^/]+)$/);
+    if (pushSubMatch && !path.includes("/push-attestations")) {
+      const subId = pushSubMatch[1];
+      if (req.method === "DELETE") {
+        const body = await req.json() as any;
+        if (!body.owner) return this.json({ error: "owner required" }, 400);
+        try {
+          this.oracleNetwork.removePushSubscription(subId, body.owner);
+          return this.json({ ok: true });
+        } catch (e: any) {
+          return this.json({ error: e.message }, 400);
+        }
+      }
+      const sub = this.oracleNetwork.getPushSubscription(subId);
+      if (!sub) return this.json({ error: "Push subscription not found" }, 404);
+      const attestations = this.oracleNetwork.getPushAttestations(subId, 10);
+      return this.json({ subscription: sub, attestations });
+    }
+
+    // POST /oracle/push/:id/deposit — add to gas deposit ledger
+    const pushDepositMatch = path.match(/^\/oracle\/push\/([^/]+)\/deposit$/);
+    if (pushDepositMatch && req.method === "POST") {
+      const subId = pushDepositMatch[1];
+      const body = await req.json() as any;
+      if (!body.amount_wei) return this.json({ error: "amount_wei required" }, 400);
+      try {
+        this.oracleNetwork.depositPushFunds(subId, body.amount_wei);
+        return this.json({ ok: true });
+      } catch (e: any) {
+        return this.json({ error: e.message }, 400);
+      }
+    }
+
+    // POST /oracle/push/:id/withdraw — withdraw from deposit
+    const pushWithdrawMatch = path.match(/^\/oracle\/push\/([^/]+)\/withdraw$/);
+    if (pushWithdrawMatch && req.method === "POST") {
+      const subId = pushWithdrawMatch[1];
+      const body = await req.json() as any;
+      if (!body.amount_wei || !body.owner) return this.json({ error: "amount_wei and owner required" }, 400);
+      try {
+        this.oracleNetwork.withdrawPushFunds(subId, body.amount_wei, body.owner);
+        return this.json({ ok: true });
+      } catch (e: any) {
+        return this.json({ error: e.message }, 400);
+      }
+    }
+
+    // GET /oracle/push/:id/attestations — attestation history
+    const pushAttListMatch = path.match(/^\/oracle\/push\/([^/]+)\/attestations$/);
+    if (pushAttListMatch) {
+      const subId = pushAttListMatch[1];
+      const limit = parseInt(url.searchParams.get("limit") || "20");
+      return this.json({ attestations: this.oracleNetwork.getPushAttestations(subId, limit) });
+    }
+
+    // GET /oracle/push/:id/attestations/latest — latest unrelayed attestation
+    const pushAttLatestMatch = path.match(/^\/oracle\/push\/([^/]+)\/attestations\/latest$/);
+    if (pushAttLatestMatch) {
+      const subId = pushAttLatestMatch[1];
+      const att = this.oracleNetwork.getLatestPendingAttestation(subId);
+      if (!att) return this.json({ error: "No pending attestation" }, 404);
+      // Include subscription info for relay
+      const sub = this.oracleNetwork.getPushSubscription(subId);
+      return this.json({ attestation: att, subscription: sub });
+    }
+
+    // POST /oracle/push-attestations/:id/relayed — report relay tx
+    const pushRelayedMatch = path.match(/^\/oracle\/push-attestations\/([^/]+)\/relayed$/);
+    if (pushRelayedMatch && req.method === "POST") {
+      const attId = pushRelayedMatch[1];
+      const body = await req.json() as any;
+      if (!body.tx_hash) return this.json({ error: "tx_hash required" }, 400);
+      try {
+        this.oracleNetwork.markPushRelayed(attId, body.tx_hash);
+        return this.json({ ok: true });
+      } catch (e: any) {
+        return this.json({ error: e.message }, 400);
+      }
+    }
+
     return this.json({ error: "Unknown oracle endpoint" }, 404);
   }
 
@@ -7493,6 +7600,26 @@ export class PersistiaWorldV4 implements DurableObject {
         this.oracleNetwork.markSubscriptionDelivered(sub.id, round.value);
       } catch (e: any) {
         console.warn(`Oracle subscription delivery failed for ${sub.id}: ${e.message}`);
+      }
+    }
+
+    // Fire cross-chain push attestations
+    const pushSubs = this.oracleNetwork.getTriggeredPushSubscriptions(
+      round.feed_id, round.value, round.value_num,
+    );
+    for (const pushSub of pushSubs) {
+      try {
+        const attestation = await this.oracleNetwork.generatePushAttestation(pushSub, round);
+        this.broadcast({
+          type: "oracle.push_attestation",
+          subscription_id: pushSub.id,
+          attestation_id: attestation.id,
+          feed_id: round.feed_id,
+          round: round.round,
+          value: round.value,
+        });
+      } catch (e: any) {
+        console.warn(`Push attestation failed for ${pushSub.id}: ${e.message}`);
       }
     }
   }

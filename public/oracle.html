@@ -535,6 +535,211 @@
     @keyframes flash-red { 0% { background: var(--red-dim); } 100% { background: transparent; } }
     .flash-up { animation: flash-green 0.6s ease-out; }
     .flash-down { animation: flash-red 0.6s ease-out; }
+
+    /* ─── Push Subscriptions ─────────────────────────────── */
+    .push-wallet-bar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 12px 16px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      margin-bottom: 16px;
+    }
+
+    .push-wallet-bar .wallet-addr {
+      font-size: 12px;
+      color: var(--green);
+      font-weight: 500;
+      font-family: monospace;
+    }
+
+    .push-wallet-bar button {
+      font-family: inherit;
+      font-size: 11px;
+      padding: 6px 14px;
+      border: 1px solid var(--accent);
+      border-radius: 4px;
+      background: var(--accent);
+      color: #fff;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    .push-wallet-bar button:hover { opacity: 0.85; }
+
+    .push-form {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 20px;
+      margin-bottom: 16px;
+    }
+
+    .push-form h3 {
+      font-size: 14px;
+      font-weight: 600;
+      margin-bottom: 16px;
+    }
+
+    .push-form-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+
+    .push-form-field {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .push-form-field.full { grid-column: 1 / -1; }
+
+    .push-form-field label {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--text-dim);
+    }
+
+    .push-form-field input,
+    .push-form-field select {
+      font-family: inherit;
+      font-size: 12px;
+      padding: 8px 10px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background: var(--surface-2);
+      color: var(--text);
+    }
+
+    .push-form-field input:focus,
+    .push-form-field select:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+
+    .push-form-field .hint {
+      font-size: 10px;
+      color: var(--text-dim);
+    }
+
+    .push-form-actions {
+      margin-top: 16px;
+      display: flex;
+      gap: 8px;
+    }
+
+    .push-form-actions button {
+      font-family: inherit;
+      font-size: 12px;
+      padding: 8px 20px;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+
+    .btn-accent {
+      background: var(--accent);
+      color: #fff;
+    }
+    .btn-accent:hover { opacity: 0.85; }
+    .btn-accent:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .btn-outline {
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+    }
+    .btn-outline:hover { border-color: var(--text-dim); color: var(--text); }
+
+    .push-sub-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+      margin-bottom: 8px;
+      transition: border-color 0.15s;
+    }
+    .push-sub-card:hover { border-color: var(--accent); }
+    .push-sub-card.disabled { opacity: 0.5; }
+
+    .push-sub-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+
+    .push-sub-header .feed-name { font-size: 14px; font-weight: 600; }
+
+    .chain-badge {
+      font-size: 9px;
+      padding: 2px 6px;
+      border-radius: 3px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+      background: var(--orange-dim);
+      color: var(--orange);
+    }
+
+    .push-sub-meta {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 8px;
+      font-size: 11px;
+      color: var(--text-dim);
+      margin-bottom: 10px;
+    }
+
+    .push-sub-meta .meta-item span:first-child { display: block; font-size: 9px; text-transform: uppercase; letter-spacing: 0.3px; margin-bottom: 2px; }
+    .push-sub-meta .meta-item span:last-child { color: var(--text); font-weight: 500; }
+
+    .push-sub-actions {
+      display: flex;
+      gap: 6px;
+      border-top: 1px solid var(--border);
+      padding-top: 10px;
+    }
+
+    .push-sub-actions button {
+      font-family: inherit;
+      font-size: 11px;
+      padding: 4px 12px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-weight: 500;
+      border: 1px solid var(--border);
+      background: var(--surface-2);
+      color: var(--text);
+    }
+    .push-sub-actions button:hover { border-color: var(--text-dim); }
+    .push-sub-actions button.relay-btn { background: var(--green-dim); color: var(--green); border-color: var(--green); }
+    .push-sub-actions button.relay-btn:hover { opacity: 0.85; }
+    .push-sub-actions button.disable-btn:hover { border-color: var(--red); color: var(--red); }
+
+    .push-att-table { margin-top: 8px; }
+
+    .push-no-wallet {
+      text-align: center;
+      padding: 40px 20px;
+      color: var(--text-dim);
+    }
+    .push-no-wallet .icon { font-size: 28px; margin-bottom: 8px; opacity: 0.5; }
+    .push-no-wallet .title { font-size: 14px; font-weight: 600; color: var(--text); margin-bottom: 4px; }
+
+    .push-status-msg {
+      font-size: 11px;
+      padding: 6px 10px;
+      border-radius: 4px;
+      margin-top: 8px;
+      display: none;
+    }
+    .push-status-msg.success { display: block; background: var(--green-dim); color: var(--green); }
+    .push-status-msg.error { display: block; background: var(--red-dim); color: var(--red); }
   </style>
 </head>
 <body>
@@ -586,6 +791,7 @@
   <button class="tab-btn" data-tab="blackboard">Blackboard</button>
   <button class="tab-btn" data-tab="mesh">Leaders & Sharding</button>
   <button class="tab-btn" data-tab="sources">Source Stats</button>
+  <button class="tab-btn" data-tab="push">Push Subscriptions</button>
 </div>
 
 <main>
@@ -665,6 +871,82 @@
     </div>
     <div id="sources-content">
       <div class="empty">Select a feed to view source reliability stats</div>
+    </div>
+  </div>
+
+  <!-- Tab: Push Subscriptions -->
+  <div id="tab-push" class="tab-content">
+    <div class="push-wallet-bar">
+      <span style="font-size:11px;color:var(--text-dim);">Wallet:</span>
+      <span class="wallet-addr" id="push-wallet-addr">Not connected</span>
+      <button id="push-connect-btn" onclick="connectPushWallet()">Connect Wallet</button>
+    </div>
+
+    <div id="push-no-ethereum" class="push-no-wallet" style="display:none;">
+      <div class="icon">&#x26D3;</div>
+      <div class="title">Browser Wallet Required</div>
+      <div>Install MetaMask or a compatible wallet to use cross-chain push subscriptions.</div>
+    </div>
+
+    <div id="push-main-content">
+      <div class="push-form" id="push-create-form">
+        <h3>Create Push Subscription</h3>
+        <div class="push-form-grid">
+          <div class="push-form-field">
+            <label>Feed</label>
+            <select id="push-feed-select"><option value="">Select feed...</option></select>
+          </div>
+          <div class="push-form-field">
+            <label>Destination Chain</label>
+            <select id="push-chain-select" onchange="onPushChainChange()">
+              <option value="42161">Arbitrum One</option>
+              <option value="6342">MegaETH</option>
+              <option value="custom">Custom Chain</option>
+            </select>
+          </div>
+          <div class="push-form-field" id="push-custom-chain-id-field" style="display:none;">
+            <label>Chain ID</label>
+            <input type="number" id="push-custom-chain-id" placeholder="e.g. 1">
+          </div>
+          <div class="push-form-field" id="push-custom-rpc-field" style="display:none;">
+            <label>RPC URL</label>
+            <input type="text" id="push-custom-rpc" placeholder="https://...">
+          </div>
+          <div class="push-form-field full">
+            <label>Receiver Contract Address</label>
+            <input type="text" id="push-receiver" placeholder="0x...">
+          </div>
+          <div class="push-form-field">
+            <label>Callback Selector</label>
+            <input type="text" id="push-selector" placeholder="0xabcd1234" maxlength="10">
+            <span class="hint">4-byte function selector of your receiver</span>
+          </div>
+          <div class="push-form-field">
+            <label>Deviation Threshold (bps)</label>
+            <input type="number" id="push-deviation" value="50" min="0" max="10000">
+            <span class="hint">50 = 0.5%. Push triggers when price moves beyond this.</span>
+          </div>
+          <div class="push-form-field">
+            <label>Heartbeat (seconds)</label>
+            <input type="number" id="push-heartbeat" value="60" min="10" max="86400">
+            <span class="hint">Max interval between pushes regardless of deviation.</span>
+          </div>
+          <div class="push-form-field">
+            <label>Initial Deposit (wei)</label>
+            <input type="text" id="push-deposit" value="0" placeholder="0">
+            <span class="hint">Gas credit ledger for future keeper relay support.</span>
+          </div>
+        </div>
+        <div class="push-form-actions">
+          <button class="btn-accent" id="push-create-btn" onclick="createPushSubscription()" disabled>Create Subscription</button>
+        </div>
+        <div class="push-status-msg" id="push-create-status"></div>
+      </div>
+
+      <h3 style="font-size:14px;font-weight:600;margin-bottom:12px;color:var(--text);">Active Subscriptions</h3>
+      <div id="push-subs-list">
+        <div class="empty">Connect your wallet to view push subscriptions.</div>
+      </div>
     </div>
   </div>
 </main>
@@ -767,6 +1049,7 @@
       case 'blackboard': loadBlackboard(); break;
       case 'mesh': loadLeaders(); loadSharding(); break;
       case 'sources': populateFeedSelect(); break;
+      case 'push': initPushTab(); break;
     }
   }
 
@@ -1209,6 +1492,9 @@
             if (currentTab === 'feeds') renderFeeds();
           }
         }
+        if (msg.type === 'oracle.push_attestation') {
+          if (currentTab === 'push' && connectedWallet) loadPushSubscriptions();
+        }
       } catch {}
     };
   }
@@ -1229,6 +1515,304 @@
       console.warn('Feed fetch failed:', e.message);
     }
   }
+
+  // ═══════════════════════════════════════════════════════════
+  // TAB: PUSH SUBSCRIPTIONS
+  // ═══════════════════════════════════════════════════════════
+
+  const PUSH_CHAINS = {
+    42161: { name: 'Arbitrum One', rpc: 'https://arb1.arbitrum.io/rpc', explorer: 'https://arbiscan.io' },
+    6342:  { name: 'MegaETH', rpc: 'https://rpc.megaeth.com', explorer: 'https://megaexplorer.xyz' },
+  };
+
+  let connectedWallet = null;
+
+  function initPushTab() {
+    if (typeof window.ethereum === 'undefined') {
+      document.getElementById('push-no-ethereum').style.display = 'block';
+      document.getElementById('push-main-content').style.display = 'none';
+      document.getElementById('push-connect-btn').style.display = 'none';
+      return;
+    }
+    document.getElementById('push-no-ethereum').style.display = 'none';
+    document.getElementById('push-main-content').style.display = 'block';
+    populatePushFeedSelect();
+    if (connectedWallet) {
+      loadPushSubscriptions();
+      document.getElementById('push-create-btn').disabled = false;
+    }
+  }
+
+  function populatePushFeedSelect() {
+    const select = document.getElementById('push-feed-select');
+    const current = select.value;
+    const opts = ['<option value="">Select feed...</option>'];
+    for (const f of feeds) {
+      opts.push(`<option value="${f.id}" ${f.id === current ? 'selected' : ''}>${f.id}</option>`);
+    }
+    select.innerHTML = opts.join('');
+  }
+
+  window.onPushChainChange = function() {
+    const val = document.getElementById('push-chain-select').value;
+    const isCustom = val === 'custom';
+    document.getElementById('push-custom-chain-id-field').style.display = isCustom ? '' : 'none';
+    document.getElementById('push-custom-rpc-field').style.display = isCustom ? '' : 'none';
+  };
+
+  window.connectPushWallet = async function() {
+    if (typeof window.ethereum === 'undefined') {
+      alert('No browser wallet detected. Install MetaMask.');
+      return;
+    }
+    try {
+      const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
+      if (accounts && accounts.length > 0) {
+        connectedWallet = accounts[0].toLowerCase();
+        document.getElementById('push-wallet-addr').textContent = connectedWallet.slice(0, 6) + '...' + connectedWallet.slice(-4);
+        document.getElementById('push-connect-btn').textContent = 'Connected';
+        document.getElementById('push-create-btn').disabled = false;
+        loadPushSubscriptions();
+      }
+    } catch (e) {
+      console.warn('Wallet connection failed:', e);
+    }
+  };
+
+  function showPushStatus(id, msg, type) {
+    const el = document.getElementById(id);
+    el.textContent = msg;
+    el.className = 'push-status-msg ' + type;
+    setTimeout(() => { el.className = 'push-status-msg'; }, 5000);
+  }
+
+  window.createPushSubscription = async function() {
+    if (!connectedWallet) { alert('Connect wallet first'); return; }
+
+    const feedId = document.getElementById('push-feed-select').value;
+    if (!feedId) { showPushStatus('push-create-status', 'Select a feed', 'error'); return; }
+
+    const chainSelect = document.getElementById('push-chain-select').value;
+    let chainId, rpcUrl;
+    if (chainSelect === 'custom') {
+      chainId = parseInt(document.getElementById('push-custom-chain-id').value);
+      rpcUrl = document.getElementById('push-custom-rpc').value.trim();
+      if (!chainId || !rpcUrl) { showPushStatus('push-create-status', 'Enter chain ID and RPC URL', 'error'); return; }
+    } else {
+      chainId = parseInt(chainSelect);
+      rpcUrl = PUSH_CHAINS[chainId]?.rpc || '';
+    }
+
+    const receiver = document.getElementById('push-receiver').value.trim();
+    const selector = document.getElementById('push-selector').value.trim();
+    const deviationBps = parseInt(document.getElementById('push-deviation').value) || 50;
+    const heartbeatSec = parseInt(document.getElementById('push-heartbeat').value) || 60;
+    const depositWei = document.getElementById('push-deposit').value.trim() || '0';
+
+    if (!receiver || !selector) {
+      showPushStatus('push-create-status', 'Receiver address and callback selector required', 'error');
+      return;
+    }
+
+    try {
+      const res = await fetch(shardUrl(`${API}/push`), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          feed_id: feedId,
+          owner: connectedWallet,
+          dest_chain_id: chainId,
+          dest_rpc_url: rpcUrl,
+          receiver_contract: receiver,
+          callback_selector: selector,
+          deviation_bps: deviationBps,
+          heartbeat_ms: heartbeatSec * 1000,
+          deposit_wei: depositWei,
+        }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        showPushStatus('push-create-status', `Created: ${data.subscription_id.slice(0, 12)}...`, 'success');
+        loadPushSubscriptions();
+      } else {
+        showPushStatus('push-create-status', data.error || 'Failed', 'error');
+      }
+    } catch (e) {
+      showPushStatus('push-create-status', 'Network error: ' + e.message, 'error');
+    }
+  };
+
+  async function loadPushSubscriptions() {
+    if (!connectedWallet) return;
+    const el = document.getElementById('push-subs-list');
+    try {
+      const data = await api(`/push?owner=${encodeURIComponent(connectedWallet)}`);
+      const subs = data.subscriptions || [];
+      if (subs.length === 0) {
+        el.innerHTML = '<div class="empty"><div class="empty-title">No Push Subscriptions</div><div>Create one above to start receiving oracle data on external chains.</div></div>';
+        return;
+      }
+      el.innerHTML = subs.map(renderPushSubCard).join('');
+    } catch (e) {
+      el.innerHTML = `<div class="empty">Failed to load: ${e.message}</div>`;
+    }
+  }
+
+  function renderPushSubCard(sub) {
+    const chainInfo = PUSH_CHAINS[sub.dest_chain_id] || { name: `Chain ${sub.dest_chain_id}`, explorer: '' };
+    const shortReceiver = sub.receiver_contract.slice(0, 8) + '...' + sub.receiver_contract.slice(-6);
+    const isEnabled = sub.enabled;
+
+    return `
+      <div class="push-sub-card ${isEnabled ? '' : 'disabled'}">
+        <div class="push-sub-header">
+          <span class="feed-name">${sub.feed_id}</span>
+          <span class="chain-badge">${chainInfo.name}</span>
+          <span class="feed-status ${isEnabled ? '' : 'paused'}" style="margin-left:auto;">${isEnabled ? 'active' : 'disabled'}</span>
+        </div>
+        <div class="push-sub-meta">
+          <div class="meta-item"><span>Receiver</span><span title="${sub.receiver_contract}">${shortReceiver}</span></div>
+          <div class="meta-item"><span>Deviation</span><span>${sub.deviation_bps / 100}%</span></div>
+          <div class="meta-item"><span>Heartbeat</span><span>${sub.heartbeat_ms / 1000}s</span></div>
+          <div class="meta-item"><span>Last Push</span><span>${sub.last_pushed_at > 0 ? formatAge(Date.now() - sub.last_pushed_at) : 'never'}</span></div>
+          <div class="meta-item"><span>Last Round</span><span>${sub.last_pushed_round || '--'}</span></div>
+          <div class="meta-item"><span>Deposit</span><span>${formatDeposit(sub.deposit_wei)}</span></div>
+          <div class="meta-item"><span>Selector</span><span style="font-family:monospace;">${sub.callback_selector}</span></div>
+          <div class="meta-item"><span>Created</span><span>${formatAge(Date.now() - sub.created_at)}</span></div>
+        </div>
+        <div class="push-sub-actions">
+          ${isEnabled ? `<button class="relay-btn" onclick="relayPushAttestation('${sub.id}', ${sub.dest_chain_id}, '${sub.receiver_contract}')">Relay Now</button>` : ''}
+          <button onclick="viewPushAttestations('${sub.id}')">History</button>
+          ${isEnabled ? `<button class="disable-btn" onclick="disablePushSub('${sub.id}')">Disable</button>` : ''}
+          ${isEnabled ? `<button onclick="depositPushFunds('${sub.id}')">Deposit</button>` : ''}
+        </div>
+        <div id="push-att-${sub.id}" class="push-att-table"></div>
+      </div>`;
+  }
+
+  function formatDeposit(wei) {
+    if (!wei || wei === '0') return '0';
+    try {
+      const n = BigInt(wei);
+      if (n >= 1000000000000000n) {
+        return (Number(n) / 1e18).toFixed(4) + ' ETH';
+      }
+      if (n >= 1000000000n) {
+        return (Number(n) / 1e9).toFixed(2) + ' gwei';
+      }
+      return wei + ' wei';
+    } catch { return wei; }
+  }
+
+  window.relayPushAttestation = async function(subId, destChainId, receiverContract) {
+    if (typeof window.ethereum === 'undefined') { alert('No wallet'); return; }
+
+    try {
+      const data = await api(`/push/${encodeURIComponent(subId)}/attestations/latest`);
+      if (!data.attestation) { alert('No pending attestation to relay'); return; }
+
+      const att = data.attestation;
+      const chainIdHex = '0x' + destChainId.toString(16);
+
+      // Switch chain if needed
+      try {
+        await window.ethereum.request({
+          method: 'wallet_switchEthereumChain',
+          params: [{ chainId: chainIdHex }],
+        });
+      } catch (switchErr) {
+        // Chain not added — user needs to add it manually
+        if (switchErr.code === 4902) {
+          alert(`Please add chain ${destChainId} to your wallet first.`);
+          return;
+        }
+        throw switchErr;
+      }
+
+      // Send the transaction
+      const txHash = await window.ethereum.request({
+        method: 'eth_sendTransaction',
+        params: [{
+          from: connectedWallet,
+          to: receiverContract,
+          data: '0x' + att.calldata,
+          chainId: chainIdHex,
+        }],
+      });
+
+      // Report relay back to Persistia
+      await fetch(shardUrl(`${API}/push-attestations/${encodeURIComponent(att.id)}/relayed`), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tx_hash: txHash }),
+      });
+
+      alert('Relay submitted! TX: ' + txHash.slice(0, 16) + '...');
+      loadPushSubscriptions();
+    } catch (e) {
+      alert('Relay failed: ' + (e.message || e));
+    }
+  };
+
+  window.viewPushAttestations = async function(subId) {
+    const el = document.getElementById('push-att-' + subId);
+    if (el.innerHTML) { el.innerHTML = ''; return; } // toggle
+
+    try {
+      const data = await api(`/push/${encodeURIComponent(subId)}/attestations?limit=10`);
+      const atts = data.attestations || [];
+      if (atts.length === 0) {
+        el.innerHTML = '<div style="padding:8px;font-size:11px;color:var(--text-dim);">No attestations yet.</div>';
+        return;
+      }
+      el.innerHTML = `<table class="data-table" style="margin-top:8px;">
+        <thead><tr><th>Round</th><th>Value</th><th>Observers</th><th>Created</th><th>Relayed</th></tr></thead>
+        <tbody>${atts.map(a => `<tr>
+          <td>${a.round}</td>
+          <td>$${formatPrice(a.value_num)}</td>
+          <td>${a.observers}</td>
+          <td>${formatAge(Date.now() - a.created_at)}</td>
+          <td>${a.relayed_at ? `<span style="color:var(--green);">&#x2713;</span> ${a.relay_tx_hash ? a.relay_tx_hash.slice(0, 10) + '...' : ''}` : '<span style="color:var(--text-dim);">pending</span>'}</td>
+        </tr>`).join('')}</tbody>
+      </table>`;
+    } catch (e) {
+      el.innerHTML = `<div style="padding:8px;font-size:11px;color:var(--red);">Error: ${e.message}</div>`;
+    }
+  };
+
+  window.disablePushSub = async function(subId) {
+    if (!confirm('Disable this push subscription?')) return;
+    try {
+      await fetch(shardUrl(`${API}/push/${encodeURIComponent(subId)}`), {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ owner: connectedWallet }),
+      });
+      loadPushSubscriptions();
+    } catch (e) {
+      alert('Failed: ' + e.message);
+    }
+  };
+
+  window.depositPushFunds = async function(subId) {
+    const amount = prompt('Enter deposit amount in wei:');
+    if (!amount) return;
+    try {
+      const res = await fetch(shardUrl(`${API}/push/${encodeURIComponent(subId)}/deposit`), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ amount_wei: amount }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        loadPushSubscriptions();
+      } else {
+        alert(data.error || 'Failed');
+      }
+    } catch (e) {
+      alert('Failed: ' + e.message);
+    }
+  };
 
   // ─── Init ───────────────────────────────────────────────
   async function init() {
