@@ -15,6 +15,9 @@ import { StandaloneNode, type NodeConfig } from "./node.ts";
 import * as _wallet from "../../src/wallet.ts";
 const { pubkeyB64ToAddress } = _wallet;
 
+import * as _manifest from "../../src/node-manifest.ts";
+const { buildStandaloneManifest, ManifestRegistry } = _manifest;
+
 // ─── CLI Args ────────────────────────────────────────────────────────────────
 
 function parseArgs(): NodeConfig {
@@ -115,6 +118,48 @@ async function main() {
 
   app.get("/", (_req, res) => {
     json(res, node.getStatus());
+  });
+
+  // ─── Node Manifest / Capabilities ─────────────────────────────────
+
+  const manifestRegistry = new ManifestRegistry();
+
+  // Detect platform from environment hints
+  const platform = process.env.PERSISTIA_PLATFORM || "standalone";
+  const region = process.env.PERSISTIA_REGION || undefined;
+  const ollamaUrl = process.env.OLLAMA_URL || "";
+  const ollamaModels = process.env.OLLAMA_MODELS?.split(",").filter(Boolean) || [];
+  const gpuType = process.env.GPU_TYPE || undefined;
+  const vramMb = process.env.VRAM_MB ? parseInt(process.env.VRAM_MB) : undefined;
+
+  // Build self manifest (updated after node.init() sets identity)
+  function getSelfManifest() {
+    const os = require("os");
+    return buildStandaloneManifest(
+      node.nodeIdentity?.pubkey || "",
+      config.nodeUrl,
+      {
+        platform,
+        region,
+        cpuCores: os.cpus().length,
+        ramMb: Math.round(os.totalmem() / 1024 / 1024),
+        storageGb: undefined, // could detect from disk
+        gpu: gpuType,
+        vramMb,
+        ollamaModels: ollamaModels.length > 0 ? ollamaModels : undefined,
+        canProve: os.totalmem() > 4 * 1024 * 1024 * 1024, // 4GB+ RAM
+      },
+    );
+  }
+
+  app.get("/network/capabilities", (_req, res) => {
+    const self = getSelfManifest();
+    manifestRegistry.set(self);
+    json(res, {
+      self,
+      known_peers: manifestRegistry.all().filter(m => m.pubkey !== self.pubkey),
+      network_summary: manifestRegistry.summary(),
+    });
   });
 
   // ─── Gossip Routes (/gossip/*) ───────────────────────────────────────
@@ -466,6 +511,42 @@ async function main() {
     const providers = node.providerRegistry.getByOwner(address);
     jsonSafe(res, { providers });
   });
+
+  // ─── Inference Gateway (/v1/* and /api/pool/*) ────────────────────────
+  // Standalone nodes get the same free inference pool as CF Workers.
+  // Also serves /v1/chat/completions and /v1/messages for OpenAI/Anthropic SDK compat.
+
+  const { handlePoolRoute } = require("../../src/inference-pool.ts");
+
+  app.all("/v1/*", async (req, res) => {
+    try {
+      const poolRes = await handlePoolRoute(req.path, toFetchRequest(req, config.nodeUrl), process.env);
+      const body = await poolRes.text();
+      res.status(poolRes.status).type("json").send(body);
+    } catch (e: any) {
+      json(res, { error: e.message }, 500);
+    }
+  });
+
+  app.all("/api/pool/*", async (req, res) => {
+    try {
+      const poolRes = await handlePoolRoute(req.path, toFetchRequest(req, config.nodeUrl), process.env);
+      const body = await poolRes.text();
+      res.status(poolRes.status).type("json").send(body);
+    } catch (e: any) {
+      json(res, { error: e.message }, 500);
+    }
+  });
+
+  // Helper: convert Express req → Fetch Request (for pool handler compatibility)
+  function toFetchRequest(req: express.Request, baseUrl: string): Request {
+    const url = `${baseUrl}${req.path}`;
+    const init: RequestInit = { method: req.method, headers: { "Content-Type": "application/json" } };
+    if (req.method !== "GET" && req.method !== "HEAD" && req.body) {
+      init.body = JSON.stringify(req.body);
+    }
+    return new Request(url, init);
+  }
 
   // ─── API Gateway (/api/*) ────────────────────────────────────────────
   // Standalone nodes have no local Workers AI — route everything to external providers

@@ -2,6 +2,10 @@ import { PersistiaWorldV4 } from "./PersistiaDO";
 import { PersistiaAgent } from "./persistia-agent";
 import { routeAgentRequest } from "agents";
 import { APP_SDK_JS } from "./app-sdk";
+import { routeAxon, type AxonConfig } from "./bittensor-axon";
+import { handlePoolRoute } from "./inference-pool";
+import { buildCloudflareManifest, ManifestRegistry, type NodeManifest } from "./node-manifest";
+import { handleTelegramWebhook, handleClawSetup } from "./persistia-claw";
 export { PersistiaWorldV4, PersistiaAgent };
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -61,6 +65,8 @@ const STATIC_ROUTES: Record<string, string> = {
   "/services.html": "/services.html",
   "/oracle": "/oracle.html",
   "/oracle.html": "/oracle.html",
+  "/inference": "/inference.html",
+  "/inference.html": "/inference.html",
 };
 
 // ─── Worker ───────────────────────────────────────────────────────────────────
@@ -148,6 +154,61 @@ export default {
       const headers = new Headers(request.headers);
       headers.set("X-Shard-Name", shardName);
       return stub.fetch(new Request(request.url, { method: request.method, headers, body: request.body }));
+    }
+
+    // ─── PersistiaClaw — AI Agent (/claw/*) ─────────────────────────────
+    // Privacy-first AI agent. Telegram webhook + setup endpoint.
+    // Config: TELEGRAM_BOT_TOKEN, CLAW_ENCRYPTION_SECRET, CLAW_KV (optional)
+    if (url.pathname === "/claw/telegram" && request.method === "POST") {
+      const clawRes = await handleTelegramWebhook(request, env);
+      const corsClaw = new Response(clawRes.body, clawRes);
+      for (const [k, v] of Object.entries(CORS_HEADERS)) corsClaw.headers.set(k, v);
+      return corsClaw;
+    }
+    if (url.pathname === "/claw/setup") {
+      const setupRes = await handleClawSetup(request, env);
+      const corsSetup = new Response(setupRes.body, setupRes);
+      for (const [k, v] of Object.entries(CORS_HEADERS)) corsSetup.headers.set(k, v);
+      return corsSetup;
+    }
+
+    // ─── Free Inference Gateway (/v1/* and /api/pool/*) ─────────────────
+    // OpenAI-compatible multi-provider inference — a free OpenRouter.
+    // /v1/chat/completions, /v1/models → OpenAI SDK drop-in
+    // /api/pool/status, /api/pool/models, /api/pool/chat → native API
+    if (url.pathname.startsWith("/v1/") || url.pathname.startsWith("/api/pool")) {
+      const poolResponse = await handlePoolRoute(url.pathname, request, env);
+      const corsPool = new Response(poolResponse.body, poolResponse);
+      for (const [k, v] of Object.entries(CORS_HEADERS)) corsPool.headers.set(k, v);
+      return corsPool;
+    }
+
+    // ─── Bittensor Axon Bridge (/axon/*) ──────────────────────────────
+    // Implements Bittensor miner protocol — receives validator queries,
+    // forwards inference to Persistia AI services, earns TAO emissions.
+    // Configure via env vars: BT_HOTKEY, BT_HOTKEY_PRIVATE, BT_NETUID
+    if (url.pathname.startsWith("/axon")) {
+      const shard = url.searchParams.get("shard") || "node-1";
+      const persistiaUrl = `${url.origin}/?shard=${shard}`;
+      const axonConfig: AxonConfig = {
+        hotkey: env.BT_HOTKEY || "",
+        hotkey_private: env.BT_HOTKEY_PRIVATE || "",
+        netuid: parseInt(env.BT_NETUID || "1"),
+        persistia_url: persistiaUrl,
+        coldkey: env.BT_COLDKEY || "",
+        timeout_ms: 25_000, // 25s — leave 5s buffer within CF 30s limit
+      };
+      if (!axonConfig.hotkey) {
+        return corsResponse(JSON.stringify({
+          error: "Bittensor axon not configured",
+          hint: "Set BT_HOTKEY, BT_HOTKEY_PRIVATE, BT_NETUID env vars in wrangler.toml",
+        }), 503);
+      }
+      const axonResponse = await routeAxon(request, url, axonConfig);
+      // Add CORS headers
+      const corsAxon = new Response(axonResponse.body, axonResponse);
+      for (const [k, v] of Object.entries(CORS_HEADERS)) corsAxon.headers.set(k, v);
+      return corsAxon;
     }
 
     // ─── List shards ────────────────────────────────────────────────────
@@ -250,6 +311,43 @@ export default {
           anchor_bootstrap: "/anchor/bootstrap",
           snapshot_latest: "/snapshot/latest",
           snapshot_download: "/snapshot/download",
+        },
+      }));
+    }
+
+    // ─── Node Manifest / Capabilities ──────────────────────────────────
+    // Returns this node's capability manifest + network-wide summary.
+    // Enables heterogeneous routing: CF Workers, Oracle VMs, AWS, etc.
+    if (url.pathname === "/network/capabilities") {
+      const { InferencePool } = await import("./inference-pool");
+      const pool = new InferencePool(env);
+      const poolModels = pool.availableModels();
+
+      const manifest = buildCloudflareManifest("", url.origin, {
+        hasAI: !!env.AI,
+        hasBrowser: !!env.BROWSER,
+        hasR2: !!env.BLOB_STORE,
+        hasQueue: !!env.RELAY_QUEUE,
+        inferencePoolModels: poolModels,
+      });
+
+      // Query the DO for node pubkey
+      const shardName = url.searchParams.get("shard") || "node-1";
+      try {
+        const doId = env.PERSISTIA_WORLD.idFromName(shardName);
+        const doStub = env.PERSISTIA_WORLD.get(doId);
+        const doRes = await doStub.fetch(new Request(url.origin));
+        const doInfo = await doRes.json() as any;
+        manifest.pubkey = doInfo.node_pubkey || "";
+      } catch {}
+
+      return corsResponse(JSON.stringify({
+        self: manifest,
+        network_hint: {
+          description: "Persistia supports heterogeneous nodes — CF Workers, Oracle Cloud ARM, AWS, Azure, bare metal, Docker, serverless",
+          supported_runtimes: ["cloudflare-worker", "standalone-express", "docker", "serverless"],
+          join_as_standalone: "See standalone/ directory — Express+SQLite node for any VM",
+          join_endpoint: "/join",
         },
       }));
     }

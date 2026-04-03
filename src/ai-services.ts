@@ -4,6 +4,7 @@
 // Every paid call produces a signed attestation (commit-reveal + hash chain).
 
 import type { ServiceAttestationManager, ServiceAttestation } from "./service-attestations";
+import { InferencePool } from "./inference-pool";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -567,13 +568,39 @@ export async function dispatchApiRoute(
     }, 404);
   }
 
-  // Neuron budget check — reject if daily quota exhausted (free-tier protection)
+  // Neuron budget check — if exhausted, cascade LLM/code to inference pool
   const budget = checkNeuronBudget(service);
   if (!budget.ok) {
+    if (service === "llm" || service === "code") {
+      // Fall back to free inference pool
+      try {
+        let body: any;
+        try { body = await request.clone().json(); } catch { return jsonResponse({ error: "Invalid JSON body" }, 400); }
+        const pool = new InferencePool(env);
+        const result = await pool.chat(body.messages || [], {
+          model: body.model?.includes("llama") ? "llama-3.3-70b" : body.model?.includes("deepseek") ? "deepseek-r1" : "llama-3.3-70b",
+          max_tokens: body.max_tokens,
+        });
+        return jsonResponse({
+          model: result.model,
+          provider: result.provider,
+          source: "inference-pool",
+          result: { response: result.content },
+          usage: result.usage,
+          latency_ms: result.latency_ms,
+        });
+      } catch (poolErr: any) {
+        return jsonResponse({
+          error: "Daily AI neuron budget exhausted and inference pool unavailable",
+          detail: poolErr.message,
+          remaining: budget.remaining,
+        }, 429);
+      }
+    }
     return jsonResponse({
       error: "Daily AI neuron budget exhausted",
       remaining: budget.remaining,
-      hint: "Use federated service providers or wait until tomorrow",
+      hint: "Use /api/pool/chat for LLM inference via free external providers",
     }, 429);
   }
 

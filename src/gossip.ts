@@ -11,6 +11,7 @@
 
 import { sha256 } from "./consensus";
 import { signData, verifyNodeSignature, type NodeIdentity } from "./node-identity";
+import { BinaryEnvelope, bytesToBase64, base64ToBytes } from "./binary-wire";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -24,7 +25,7 @@ export interface GossipPeer {
 }
 
 export interface GossipEnvelope {
-  type: "vertex" | "event" | "peer_exchange" | "sync_request" | "sync_response" | "zk_proof" | "service_request" | "service_response" | "oracle_observation" | "feed_demand" | "blackboard" | "blackboard_sync" | "oracle_digest_sync";
+  type: "vertex" | "event" | "peer_exchange" | "sync_request" | "sync_response" | "zk_proof" | "service_request" | "service_response" | "oracle_observation" | "feed_demand" | "blackboard" | "blackboard_sync" | "oracle_digest_sync" | "shred";
   sender_pubkey: string;
   sender_url: string;
   signature: string;         // signs the payload JSON
@@ -60,7 +61,8 @@ export interface ServiceResponsePayload {
 }
 
 export interface PeerExchangePayload {
-  peers: { pubkey: string; url: string; grumpkin_x?: string; grumpkin_y?: string }[];
+  peers: { pubkey: string; url: string; grumpkin_x?: string; grumpkin_y?: string; manifest?: any }[];
+  sender_manifest?: any;  // NodeManifest of the sending node
 }
 
 export interface SyncRequestPayload {
@@ -88,6 +90,15 @@ export interface SyncResponsePayload {
     finalized_root: string;
     last_committed_round: number;
   };
+  // Proof of History — latest tick for ordering verification
+  poh_latest?: {
+    round: number;
+    vertex_hash: string;
+    timestamp: number;
+    poh_hash: string;
+    prev_poh_hash: string;
+    seq: number;
+  } | null;
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -106,7 +117,7 @@ const GOSSIP_SAMPLE_SIZE = 8;       // number of peers to sample (≥ quorum for
  * Handles peer URLs that contain query parameters (e.g. ?shard=node-1)
  * by inserting the path before the query string.
  */
-function buildPeerUrl(baseUrl: string, path: string, extraParams?: Record<string, string>): string {
+export function buildPeerUrl(baseUrl: string, path: string, extraParams?: Record<string, string>): string {
   try {
     const u = new URL(baseUrl);
     // Append path, merging with any existing path
@@ -131,6 +142,7 @@ export class GossipManager {
   private identity: NodeIdentity | null = null;
   private seenNonces: Set<string> = new Set();
   private syncCycleCount: number = 0;
+  private preferBinary: boolean = false;
 
   constructor(sql: any) {
     this.sql = sql;
@@ -138,6 +150,10 @@ export class GossipManager {
 
   setIdentity(identity: NodeIdentity) {
     this.identity = identity;
+  }
+
+  setPreferBinary(prefer: boolean) {
+    this.preferBinary = prefer;
   }
 
   // ─── Peer Management ────────────────────────────────────────────────────
@@ -331,7 +347,11 @@ export class GossipManager {
     }
 
     let delivered = 0;
-    const body = compactEnvelope(envelope); // compact wire format (~35% smaller)
+    const useBinary = this.preferBinary;
+    const body = useBinary
+      ? compactEnvelopeBinary(envelope) as any   // binary wire format (~40-60% smaller)
+      : compactEnvelope(envelope);               // compact JSON wire format (~35% smaller)
+    const contentType = useBinary ? "application/octet-stream" : "application/json";
 
     // Process peers in batches of FLOOD_CONCURRENCY
     for (let i = 0; i < peers.length; i += FLOOD_CONCURRENCY) {
@@ -340,7 +360,7 @@ export class GossipManager {
         try {
           const res = await fetchWithTimeout(buildPeerUrl(peer.url, "/gossip/push"), {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": contentType },
             body,
           }, GOSSIP_TIMEOUT_MS);
 
@@ -642,7 +662,15 @@ export function compactEnvelope(env: GossipEnvelope): string {
   return JSON.stringify(obj);
 }
 
-export function expandEnvelope(data: string | any): GossipEnvelope {
+export function expandEnvelope(data: string | any | Uint8Array | ArrayBuffer): GossipEnvelope {
+  // Binary format detection
+  if (data instanceof Uint8Array || data instanceof ArrayBuffer) {
+    const buf = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
+    if (buf.length >= 75 && buf[0] === 0x01) { // WIRE_VERSION check
+      return BinaryEnvelope.decode(buf);
+    }
+  }
+  // Existing JSON path
   const obj = typeof data === "string" ? JSON.parse(data) : data;
   // If already has full keys, return as-is
   if (obj.type && obj.sender_pubkey) return obj as GossipEnvelope;
@@ -654,6 +682,10 @@ export function expandEnvelope(data: string | any): GossipEnvelope {
     else expanded[short] = val; // pass through unknown keys
   }
   return expanded as GossipEnvelope;
+}
+
+export function compactEnvelopeBinary(env: GossipEnvelope): Uint8Array {
+  return BinaryEnvelope.encode(env);
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
